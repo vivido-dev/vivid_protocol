@@ -1,0 +1,14 @@
+[package]
+name = "vivid_protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Apache-2.0"
+description = "Wire types and deterministic codecs for the Vivid terminal media protocol"
+readme = "README.md"
+documentation = "https://docs.rs/vivid_protocol"
+keywords = ["terminal", "graphics", "media", "protocol", "cbor"]
+categories = ["encoding", "multimedia", "network-programming"]
+include = ["Cargo.toml", "README.md", "src/**/*.rs"]
+
+[dependencies]
