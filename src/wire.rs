@@ -4,7 +4,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{DEFAULT_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use super::{DEFAULT_MAX_RECORD_BODY, FRAMING_MAJOR, FRAMING_MINOR, HARD_MAX_RECORD_BODY};
 
 pub const PREFACE_SIZE: usize = 16;
 pub const HEADER_SIZE: usize = 24;
@@ -48,7 +48,7 @@ pub struct Preface {
     pub minor: u8,
     pub kind: ConnectionKind,
     pub flags: u8,
-    pub maximum_record_body: u32,
+    pub initiator_tx_body_limit: u32,
 }
 
 impl Preface {
@@ -71,8 +71,8 @@ impl Preface {
                 "Vivid preface reserved flags are nonzero",
             ));
         }
-        let maximum_record_body = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
-        if maximum_record_body == 0 || maximum_record_body > HARD_MAX_RECORD_BODY {
+        let initiator_tx_body_limit = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        if initiator_tx_body_limit == 0 || initiator_tx_body_limit > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Vivid maximum record size",
@@ -83,7 +83,7 @@ impl Preface {
             minor: bytes[5],
             kind: ConnectionKind::try_from(bytes[6])?,
             flags: bytes[7],
-            maximum_record_body,
+            initiator_tx_body_limit,
         })
     }
 }
@@ -97,10 +97,10 @@ pub enum Endpoint {
 impl Endpoint {
     pub fn parse(value: &str) -> io::Result<Self> {
         if let Some(path) = value.strip_prefix("unix:") {
-            if path.is_empty() {
+            if path.is_empty() || !Path::new(path).is_absolute() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "empty Unix endpoint",
+                    "Unix endpoint is empty or not absolute",
                 ));
             }
             return Ok(Self::Unix(PathBuf::from(path)));
@@ -120,7 +120,14 @@ impl Endpoint {
                 format!("unsupported Vivid endpoint scheme in {value:?}"),
             ));
         }
-        Ok(Self::Unix(PathBuf::from(value)))
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unix endpoint is not absolute",
+            ));
+        }
+        Ok(Self::Unix(path))
     }
 
     fn connect(&self) -> io::Result<Box<dyn ReadWrite>> {
@@ -168,7 +175,8 @@ pub struct Connection {
     io: ConnectionIo,
     send_sequence: u64,
     receive_sequence: u64,
-    max_record_body: u32,
+    send_body_limit: u32,
+    receive_body_limit: u32,
 }
 
 impl Connection {
@@ -196,7 +204,16 @@ impl Connection {
             io,
             send_sequence: 0,
             receive_sequence: 0,
-            max_record_body: DEFAULT_MAX_RECORD_BODY,
+            send_body_limit: if kind == ConnectionKind::Control {
+                super::CONTROL_MAX_RECORD_BODY
+            } else {
+                DEFAULT_MAX_RECORD_BODY
+            },
+            receive_body_limit: if kind == ConnectionKind::Control {
+                super::CONTROL_MAX_RECORD_BODY
+            } else {
+                DEFAULT_MAX_RECORD_BODY
+            },
         })
     }
 
@@ -215,7 +232,7 @@ impl Connection {
         }
         let body_length = u32::try_from(body.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record body exceeds u32"))?;
-        if body_length > self.max_record_body || body_length > HARD_MAX_RECORD_BODY {
+        if body_length > self.send_body_limit || body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("record body of {body_length} bytes exceeds negotiated maximum"),
@@ -237,6 +254,28 @@ impl Connection {
         flush_io(&mut self.io)
     }
 
+    pub fn set_send_body_limit(&mut self, maximum: u32) -> io::Result<()> {
+        if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid record-body limit",
+            ));
+        }
+        self.send_body_limit = maximum;
+        Ok(())
+    }
+
+    pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
+        if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid record-body limit",
+            ));
+        }
+        self.receive_body_limit = maximum;
+        Ok(())
+    }
+
     pub fn read_record(&mut self) -> io::Result<Record> {
         let ConnectionIo::Live(stream) = &mut self.io else {
             return Err(io::Error::new(
@@ -254,7 +293,8 @@ impl Connection {
                 "presenter record has nonzero reserved flags",
             ));
         }
-        if header.body_length > self.max_record_body || header.body_length > HARD_MAX_RECORD_BODY {
+        if header.body_length > self.receive_body_limit || header.body_length > HARD_MAX_RECORD_BODY
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "presenter record exceeds configured maximum",
@@ -283,6 +323,19 @@ impl Connection {
             sequence: header.sequence,
             body,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectionalLimits {
+    pub peer_limit: u32,
+    pub profile_limit: u32,
+    pub hard_limit: u32,
+}
+
+impl DirectionalLimits {
+    pub fn effective(self) -> u32 {
+        self.peer_limit.min(self.profile_limit).min(self.hard_limit)
     }
 }
 
@@ -344,8 +397,8 @@ impl RecordHeader {
 pub fn encode_preface(kind: ConnectionKind, maximum: u32) -> [u8; PREFACE_SIZE] {
     let mut bytes = [0_u8; PREFACE_SIZE];
     bytes[0..4].copy_from_slice(MAGIC);
-    bytes[4] = PROTOCOL_MAJOR;
-    bytes[5] = PROTOCOL_MINOR;
+    bytes[4] = FRAMING_MAJOR;
+    bytes[5] = FRAMING_MINOR;
     bytes[6] = kind as u8;
     bytes[7] = 0;
     bytes[8..12].copy_from_slice(&maximum.to_be_bytes());

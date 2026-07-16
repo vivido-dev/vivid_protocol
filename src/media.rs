@@ -1,8 +1,11 @@
-use std::io;
+use std::io::{self, Cursor, Read};
+
+use crate::HARD_MAX_RECORD_BODY;
 
 pub const VIDEO_PACKET_KEY: u32 = 1 << 0;
 pub const VIDEO_PACKET_DELTA: u32 = 1 << 1;
 pub const RASTER_FRAME_FULL: u32 = 1 << 0;
+pub const RASTER_FRAME_ZSTD: u32 = 1 << 1;
 
 const VIDEO_PACKET_PREFIX_SIZE: usize = 48;
 const RASTER_FRAME_PREFIX_SIZE: usize = 48;
@@ -28,7 +31,84 @@ pub struct ParsedRasterFrame<'a> {
     pub duration_us: u64,
     pub width: u32,
     pub height: u32,
-    pub rgba: &'a [u8],
+    pub compressed: bool,
+    pub pixels: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeError {
+    Overflow,
+    TooLarge,
+    Empty,
+}
+
+impl std::fmt::Display for SizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for SizeError {}
+
+pub fn rgba8_pixel_len(width: u32, height: u32) -> Result<u32, SizeError> {
+    if width == 0 || height == 0 {
+        return Err(SizeError::Empty);
+    }
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(SizeError::Overflow)
+        .and_then(|bytes| u32::try_from(bytes).map_err(|_| SizeError::TooLarge))
+}
+
+pub fn rgba8_raw_frame_body_len(width: u32, height: u32) -> Result<u32, SizeError> {
+    let bytes = u64::from(rgba8_pixel_len(width, height)?)
+        .checked_add((RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE) as u64)
+        .ok_or(SizeError::Overflow)?;
+    let bytes = u32::try_from(bytes).map_err(|_| SizeError::TooLarge)?;
+    if bytes > HARD_MAX_RECORD_BODY {
+        Err(SizeError::TooLarge)
+    } else {
+        Ok(bytes)
+    }
+}
+
+pub fn video_body_len(max_access_unit_bytes: u32) -> Result<u32, SizeError> {
+    if max_access_unit_bytes == 0 {
+        return Err(SizeError::Empty);
+    }
+    let bytes = max_access_unit_bytes
+        .checked_add(VIDEO_PACKET_PREFIX_SIZE as u32)
+        .ok_or(SizeError::Overflow)?;
+    if bytes > HARD_MAX_RECORD_BODY {
+        Err(SizeError::TooLarge)
+    } else {
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MediaSequence {
+    last_id: u64,
+    last_epoch: u32,
+}
+
+impl MediaSequence {
+    pub fn accept(&mut self, id: u64, epoch: u32) -> io::Result<()> {
+        if id == 0 || id <= self.last_id {
+            return Err(invalid("media ID is zero or not strictly increasing"));
+        }
+        if epoch < self.last_epoch {
+            return Err(invalid("media epoch moved backward"));
+        }
+        self.last_id = id;
+        self.last_epoch = epoch;
+        Ok(())
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.last_epoch
+    }
 }
 
 pub struct VideoPacket<'a> {
@@ -72,15 +152,20 @@ pub fn raster_frame_body(
     height: u32,
     rgba: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let expected_length = usize::try_from(width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raster dimensions overflow"))?;
+    raster_frame_body_with_compression(epoch, frame_id, width, height, rgba, false)
+}
+
+pub fn raster_frame_body_with_compression(
+    epoch: u32,
+    frame_id: u64,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    compress: bool,
+) -> io::Result<Vec<u8>> {
+    let expected_length = rgba8_pixel_len(width, height)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        as usize;
     if rgba.len() != expected_length {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -90,16 +175,27 @@ pub fn raster_frame_body(
             ),
         ));
     }
-    let data_length = u32::try_from(rgba.len()).map_err(|_| {
+    let compressed;
+    let pixels = if compress {
+        compressed = zstd::bulk::compress(rgba, 1)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        compressed.as_slice()
+    } else {
+        rgba
+    };
+    let data_length = u32::try_from(pixels.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "raster frame exceeds u32 length",
         )
     })?;
 
-    let mut body = Vec::with_capacity(RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE + rgba.len());
+    let mut body = Vec::with_capacity(RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE + pixels.len());
     push_u32(&mut body, epoch);
-    push_u32(&mut body, RASTER_FRAME_FULL);
+    push_u32(
+        &mut body,
+        RASTER_FRAME_FULL | if compress { RASTER_FRAME_ZSTD } else { 0 },
+    );
     push_u64(&mut body, frame_id);
     push_u64(&mut body, 0); // no base frame
     push_i64(&mut body, 0); // PTS
@@ -113,7 +209,7 @@ pub fn raster_frame_body(
     push_u32(&mut body, height);
     push_u32(&mut body, 0); // data offset from rectangle-data area
     push_u32(&mut body, data_length);
-    body.extend_from_slice(rgba);
+    body.extend_from_slice(pixels);
     Ok(body)
 }
 
@@ -152,7 +248,9 @@ pub fn parse_full_raster_frame(body: &[u8]) -> io::Result<ParsedRasterFrame<'_>>
             "raster frame is shorter than one full-frame rectangle",
         ));
     }
-    if read_u32(body, 4)? != RASTER_FRAME_FULL
+    let flags = read_u32(body, 4)?;
+    if flags & RASTER_FRAME_FULL == 0
+        || flags & !(RASTER_FRAME_FULL | RASTER_FRAME_ZSTD) != 0
         || read_u64(body, 16)? != 0
         || read_u32(body, 40)? != 1
         || read_u32(body, 44)? != 0
@@ -170,11 +268,11 @@ pub fn parse_full_raster_frame(body: &[u8]) -> io::Result<ParsedRasterFrame<'_>>
             "raster frame is not a complete origin-aligned frame",
         ));
     }
-    let expected_length = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| invalid("raster dimensions overflow"))?;
-    if data_length != expected_length || body.len() != header_length + data_length {
+    let expected_length =
+        rgba8_pixel_len(width, height).map_err(|_| invalid("raster dimensions overflow"))? as usize;
+    let compressed = flags & RASTER_FRAME_ZSTD != 0;
+    if (!compressed && data_length != expected_length) || body.len() != header_length + data_length
+    {
         return Err(invalid("raster RGBA byte length does not match dimensions"));
     }
     Ok(ParsedRasterFrame {
@@ -184,8 +282,199 @@ pub fn parse_full_raster_frame(body: &[u8]) -> io::Result<ParsedRasterFrame<'_>>
         duration_us: read_u64(body, 32)?,
         width,
         height,
-        rgba: &body[header_length..],
+        compressed,
+        pixels: &body[header_length..],
     })
+}
+
+pub fn decode_raster_pixels(frame: ParsedRasterFrame<'_>) -> io::Result<Vec<u8>> {
+    let expected = rgba8_pixel_len(frame.width, frame.height)
+        .map_err(|_| invalid("raster dimensions overflow"))? as usize;
+    if !frame.compressed {
+        return Ok(frame.pixels.to_vec());
+    }
+    if frame.pixels.len() < 4
+        || u32::from_le_bytes(frame.pixels[..4].try_into().unwrap()) == 0x184d2a50
+    {
+        return Err(invalid("zstd skippable frames are forbidden"));
+    }
+    if zstd_safe::get_dict_id_from_frame(frame.pixels).is_some()
+        || zstd_safe::find_frame_compressed_size(frame.pixels).ok() != Some(frame.pixels.len())
+    {
+        return Err(invalid(
+            "zstd dictionaries and trailing frames are forbidden",
+        ));
+    }
+    let cursor = Cursor::new(frame.pixels);
+    let mut decoder = zstd::stream::read::Decoder::new(cursor)
+        .map_err(|_| invalid("invalid zstd frame"))?
+        .single_frame();
+    let mut output = Vec::with_capacity(expected);
+    decoder
+        .by_ref()
+        .take((expected + 1) as u64)
+        .read_to_end(&mut output)?;
+    let cursor = decoder.finish();
+    if output.len() != expected || cursor.get_ref().position() as usize != frame.pixels.len() {
+        return Err(invalid(
+            "zstd raster has wrong output size or trailing data",
+        ));
+    }
+    Ok(output)
+}
+
+pub fn is_portable_packetization(codec: &str, packetization: &str) -> bool {
+    matches!(
+        (codec, packetization),
+        ("h264", "h264-annexb-au-v1")
+            | ("hevc", "hevc-annexb-au-v1")
+            | ("vp9", "vp9-frame-v1")
+            | ("av1", "av1-low-overhead-tu-v1")
+    )
+}
+
+pub fn validate_portable_packetization(
+    codec: &str,
+    packetization: &str,
+    data: &[u8],
+) -> io::Result<()> {
+    if data.is_empty() {
+        return Err(invalid("portable access unit is empty"));
+    }
+    if !is_portable_packetization(codec, packetization) {
+        return Err(invalid("unsupported portable codec/packetization pair"));
+    }
+    match (codec, packetization) {
+        ("h264", "h264-annexb-au-v1") | ("hevc", "hevc-annexb-au-v1") => {
+            if !(data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])) {
+                return Err(invalid("H.264/HEVC access unit is not Annex B"));
+            }
+        }
+        ("vp9", "vp9-frame-v1") => {}
+        ("av1", "av1-low-overhead-tu-v1") => {
+            if data[0] & 0x80 != 0 {
+                return Err(invalid("AV1 OBU forbidden bit is set"));
+            }
+        }
+        _ => unreachable!("pair was checked above"),
+    }
+    Ok(())
+}
+
+/// Determine random-access status from the portable codec syntax rather than container metadata.
+pub fn access_unit_is_key(codec: &str, data: &[u8]) -> io::Result<bool> {
+    if data.is_empty() {
+        return Err(invalid("portable access unit is empty"));
+    }
+    match codec {
+        "h264" => Ok(annex_b_nal_headers(data)?.any(|header| header & 0x1f == 5)),
+        "hevc" => {
+            Ok(annex_b_nal_headers(data)?.any(|header| matches!((header >> 1) & 0x3f, 16..=21)))
+        }
+        "vp9" => {
+            let mut bits = BitReader::new(data);
+            if bits.read(2)? != 2 {
+                return Err(invalid("VP9 frame marker is invalid"));
+            }
+            let profile = bits.read(1)? | (bits.read(1)? << 1);
+            if profile == 3 && bits.read(1)? != 0 {
+                return Err(invalid("VP9 reserved profile bit is set"));
+            }
+            if bits.read(1)? != 0 {
+                return Ok(false);
+            }
+            Ok(bits.read(1)? == 0)
+        }
+        "av1" => av1_frame_is_key(data),
+        _ => Err(invalid("unsupported portable codec")),
+    }
+}
+
+fn annex_b_nal_headers(data: &[u8]) -> io::Result<impl Iterator<Item = u8> + '_> {
+    if !(data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])) {
+        return Err(invalid("access unit is not Annex B"));
+    }
+    Ok((0..data.len()).filter_map(move |index| {
+        let header = if data.get(index..index + 3) == Some(&[0, 0, 1]) {
+            index + 3
+        } else if data.get(index..index + 4) == Some(&[0, 0, 0, 1]) {
+            index + 4
+        } else {
+            return None;
+        };
+        data.get(header).copied()
+    }))
+}
+
+fn av1_frame_is_key(data: &[u8]) -> io::Result<bool> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let header = *data
+            .get(offset)
+            .ok_or_else(|| invalid("truncated AV1 OBU"))?;
+        offset += 1;
+        if header & 0x81 != 0 || header & 0x02 == 0 {
+            return Err(invalid("invalid AV1 low-overhead OBU header"));
+        }
+        let obu_type = (header >> 3) & 0x0f;
+        if header & 0x04 != 0 {
+            offset = offset
+                .checked_add(1)
+                .filter(|value| *value <= data.len())
+                .ok_or_else(|| invalid("truncated AV1 OBU extension"))?;
+        }
+        let (size, length_bytes) = read_leb128(&data[offset..])?;
+        offset += length_bytes;
+        let end = offset
+            .checked_add(size)
+            .filter(|value| *value <= data.len())
+            .ok_or_else(|| invalid("AV1 OBU exceeds access unit"))?;
+        if matches!(obu_type, 3 | 6) {
+            let mut bits = BitReader::new(&data[offset..end]);
+            let show_existing_frame = bits.read(1)?;
+            if show_existing_frame != 0 {
+                return Ok(false);
+            }
+            return Ok(bits.read(2)? == 0);
+        }
+        offset = end;
+    }
+    Err(invalid("AV1 access unit has no frame header"))
+}
+
+fn read_leb128(data: &[u8]) -> io::Result<(usize, usize)> {
+    let mut value = 0_usize;
+    for (index, byte) in data.iter().copied().take(8).enumerate() {
+        value |= usize::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok((value, index + 1));
+        }
+    }
+    Err(invalid("invalid AV1 OBU length"))
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit: 0 }
+    }
+
+    fn read(&mut self, count: usize) -> io::Result<u8> {
+        let mut value = 0_u8;
+        for _ in 0..count {
+            let byte = *self
+                .data
+                .get(self.bit / 8)
+                .ok_or_else(|| invalid("truncated codec header"))?;
+            value = (value << 1) | ((byte >> (7 - self.bit % 8)) & 1);
+            self.bit += 1;
+        }
+        Ok(value)
+    }
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> io::Result<u32> {
@@ -258,7 +547,37 @@ mod tests {
         assert_eq!(&body[72..], &[0; 8]);
         let parsed = parse_full_raster_frame(&body).unwrap();
         assert_eq!((parsed.width, parsed.height), (2, 1));
-        assert_eq!(parsed.rgba, &[0; 8]);
+        assert_eq!(parsed.pixels, &[0; 8]);
+    }
+
+    #[test]
+    fn raster_body_limits_are_exact() {
+        assert!(rgba8_raw_frame_body_len(4095, 4095).is_ok());
+        assert_eq!(
+            rgba8_raw_frame_body_len(4096, 4096),
+            Err(SizeError::TooLarge)
+        );
+        assert!(rgba8_raw_frame_body_len(8192, 1).is_ok());
+    }
+
+    #[test]
+    fn zstd_raster_round_trip() {
+        let pixels = vec![7; 64];
+        let body = raster_frame_body_with_compression(1, 1, 4, 4, &pixels, true).unwrap();
+        let parsed = parse_full_raster_frame(&body).unwrap();
+        assert!(parsed.compressed);
+        assert_eq!(decode_raster_pixels(parsed).unwrap(), pixels);
+    }
+
+    #[test]
+    fn zstd_rejects_concatenated_frames() {
+        let pixels = vec![7; 64];
+        let mut body = raster_frame_body_with_compression(1, 1, 4, 4, &pixels, true).unwrap();
+        body.extend_from_slice(&zstd::bulk::compress(&pixels, 1).unwrap());
+        let compressed_length = u32::try_from(body.len() - 72).unwrap();
+        body[68..72].copy_from_slice(&compressed_length.to_be_bytes());
+        let parsed = parse_full_raster_frame(&body).unwrap();
+        assert!(decode_raster_pixels(parsed).is_err());
     }
 
     #[test]
@@ -277,7 +596,18 @@ mod tests {
         assert!(parse_video_packet(&packet).is_err());
 
         let mut raster = raster_frame_body(1, 1, 1, 1, &[0; 4]).unwrap();
-        raster[4..8].copy_from_slice(&(RASTER_FRAME_FULL | 2).to_be_bytes());
+        raster[4..8].copy_from_slice(&(RASTER_FRAME_FULL | 4).to_be_bytes());
         assert!(parse_full_raster_frame(&raster).is_err());
+    }
+
+    #[test]
+    fn portable_key_status_comes_from_codec_syntax() {
+        assert!(access_unit_is_key("h264", &[0, 0, 0, 1, 0x65]).unwrap());
+        assert!(!access_unit_is_key("h264", &[0, 0, 1, 0x41]).unwrap());
+        assert!(access_unit_is_key("hevc", &[0, 0, 1, 19 << 1]).unwrap());
+        assert!(access_unit_is_key("vp9", &[0x80]).unwrap());
+        assert!(!access_unit_is_key("vp9", &[0x84]).unwrap());
+        assert!(access_unit_is_key("av1", &[0x32, 0x01, 0x00]).unwrap());
+        assert!(!access_unit_is_key("av1", &[0x32, 0x01, 0x20]).unwrap());
     }
 }

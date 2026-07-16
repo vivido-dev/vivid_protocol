@@ -1,16 +1,18 @@
 # Vivid Protocol
 
-Vivid Protocol provides the shared wire-format implementation for the Vivid terminal media
-protocol. It is intended for terminal presenters, media producers, conformance tools, and protocol
-tracers that need to exchange Vivid records without depending on a renderer or terminal emulator.
+`vivid_protocol` is the shared wire implementation for the Vivid 1.1 terminal-media protocol. It
+is used by Vivi, Vivido, conformance tools, and protocol tracers without depending on a renderer.
 
-The crate currently provides:
+The protocol selected by `HELLO`/`WELCOME` is 1.1 only. The 16-byte connection preface deliberately
+remains framing version 1.0, as required by the 1.1 specification.
 
-- Vivid connection prefaces, record headers, ordered framing, endpoint parsing, and limits;
-- deterministic CBOR encoding with strict bounded decoding;
-- the Vivid 1.0 opcode, feature, error, and configuration registries;
-- control-message encoders and parsers;
-- full-frame RGBA raster and encoded-video packet layouts.
+The crate provides:
+
+- directional connection limits, ordered record framing, endpoint parsing, and the 64 MiB ceiling;
+- deterministic, bounded CBOR and typed 1.1 control-message schemas;
+- raw/zstd RGBA raster, straight or premultiplied alpha, and PNG/JPEG image bodies;
+- portable H.264/HEVC/VP9/AV1 access-unit validation and media sequence checking;
+- authenticated marker-v2 anchors using base64url and HMAC-SHA256.
 
 ```toml
 [dependencies]
@@ -26,15 +28,13 @@ assert_eq!(preface.kind, ConnectionKind::Control);
 # Ok::<(), std::io::Error>(())
 ```
 
-The public modules are organized by protocol plane:
+Public modules:
 
-- `wire` — connections, prefaces, headers, sequencing, and record framing;
-- `cbor` — deterministic control-value encoding and bounded decoding;
-- `messages` — numeric registries plus control-message schemas;
-- `media` — raster-frame and video-packet binary layouts.
-
-The crate follows the Vivid protocol version exposed by `PROTOCOL_MAJOR` and `PROTOCOL_MINOR`.
-Before Vivid 1.0 stabilizes, `0.x` releases may make breaking API or wire-profile corrections.
+- `wire` — prefaces, records, directional limits, sequencing, and transports;
+- `cbor` — deterministic encoding and strict bounded decoding;
+- `messages` — the Vivid 1.1 registry and control schemas;
+- `media` — raster, image, and portable-video binary contracts;
+- `anchor` — token decoding, session-key derivation, and marker-v2 authentication.
 
 ## License
 

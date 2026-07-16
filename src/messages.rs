@@ -1,4 +1,4 @@
-//! Normative Vivid 1.0 numeric registry and deterministic control schemas.
+//! Normative Vivid 1.1 numeric registry and deterministic control schemas.
 
 #![allow(dead_code)]
 
@@ -68,13 +68,28 @@ pub const VIDEO_FRAGMENT: u16 = 0x8002;
 pub const RASTER_FRAME: u16 = 0x8003;
 pub const BLOB_CHUNK: u16 = 0x8004;
 pub const BUFFER_SUBMIT: u16 = 0x8005;
+pub const IMAGE_DATA: u16 = 0x8006;
 
 pub const FEATURE_RASTER_RGBA8: u64 = 1;
-pub const FEATURE_VIDEO_FFMPEG_PACKET_V0: u64 = 2;
+pub const FEATURE_RETIRED_VIDEO_FFMPEG_PACKET_V0: u64 = 2;
 pub const FEATURE_SCENE_TRANSACTIONS: u64 = 3;
 pub const FEATURE_GRID_CELL_NODES: u64 = 4;
 pub const FEATURE_CREDIT_FLOW_CONTROL: u64 = 5;
-pub const FEATURE_TEXT_ANCHORS: u64 = 6;
+pub const FEATURE_RETIRED_TEXT_ANCHORS_V1: u64 = 6;
+pub const FEATURE_ENCODED_IMAGE_V1: u64 = 7;
+pub const FEATURE_RASTER_ZSTD_V1: u64 = 8;
+pub const FEATURE_RASTER_PREMULTIPLIED_ALPHA: u64 = 9;
+pub const FEATURE_VISIBILITY_EVENTS_V1: u64 = 10;
+pub const FEATURE_VIDEO_ACCESS_UNIT_V1: u64 = 11;
+pub const FEATURE_VIDEO_CONTROL_V1: u64 = 12;
+pub const FEATURE_TEXT_ANCHORS_V2: u64 = 13;
+
+pub const PROFILE_RASTER_RGBA8: &str = "raster-rgba8-full-v1";
+pub const PROFILE_RASTER_ZSTD: &str = "raster-zstd-full-v1";
+pub const PROFILE_IMAGE_PNG_JPEG: &str = "image-png-jpeg-v1";
+pub const PROFILE_VIDEO_ACCESS_UNIT: &str = "video-access-unit-v1";
+pub const PROFILE_TEXT_ANCHOR_V2: &str = "text-anchor-cell-v2";
+pub const PROFILE_VISIBILITY: &str = "visibility-source-v1";
 
 pub const ERROR_AUTH_FAILED: u64 = 1;
 pub const ERROR_UNSUPPORTED_VERSION: u64 = 2;
@@ -99,9 +114,15 @@ pub const ERROR_TIMEOUT: u64 = 20;
 
 pub const PIXEL_FORMAT_RGBA8: u64 = 1;
 pub const ALPHA_STRAIGHT: u64 = 1;
+pub const ALPHA_PREMULTIPLIED: u64 = 2;
 pub const RASTER_FULL_FRAME: u64 = 0;
 pub const COMPRESSION_NONE: u64 = 0;
+pub const COMPRESSION_RAW_OR_ZSTD: u64 = 1;
 pub const RETENTION_NONE: u64 = 0;
+pub const RETENTION_DECODED_SOURCE: u64 = 1;
+pub const IMAGE_PNG: u64 = 1;
+pub const IMAGE_JPEG: u64 = 2;
+pub const COLOR_SPACE_SRGB: u64 = 1;
 pub const COORDINATE_GRID_CELL: u64 = 1;
 pub const COORDINATE_ANCHOR_CELL: u64 = 3;
 pub const FIT_CONTAIN: u64 = 2;
@@ -120,6 +141,11 @@ pub struct Welcome {
     pub display_generation: u64,
     pub grid_columns: u64,
     pub grid_rows: u64,
+    pub maximum_control_body: u32,
+    pub accepted_profiles: Vec<String>,
+    pub selected_major: u64,
+    pub selected_minor: u64,
+    pub accepted_features: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +166,7 @@ pub struct SourceReady {
     pub byte_credits: u64,
     pub packet_credits: u64,
     pub fragment_credits: u64,
+    pub max_media_body: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +193,13 @@ pub struct VideoSourceConfig<'a> {
     pub profile: i32,
     pub level: i32,
     pub bitrate: i64,
+    pub color_primaries: u64,
+    pub transfer: u64,
+    pub matrix: u64,
+    pub range: u64,
+    pub sar_num: u32,
+    pub sar_den: u32,
+    pub max_access_unit_bytes: u32,
 }
 
 pub struct NodeConfig {
@@ -193,7 +227,9 @@ pub struct Hello {
     pub maximum_minor: u64,
     pub token: String,
     pub producer: String,
+    pub producer_version: String,
     pub required_features: Vec<u64>,
+    pub optional_features: Vec<u64>,
     pub maximum_record_body: u32,
 }
 
@@ -202,6 +238,18 @@ pub struct RasterSourceConfig {
     pub source_id: u64,
     pub width: u32,
     pub height: u32,
+    pub alpha_mode: u64,
+    pub compression_mode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageSourceConfig {
+    pub source_id: u64,
+    pub encoding: u64,
+    pub width: u32,
+    pub height: u32,
+    pub encoded_length: u32,
+    pub sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +263,35 @@ pub struct ParsedVideoSourceConfig {
     pub profile: i32,
     pub level: i32,
     pub bitrate: u64,
+    pub color_primaries: u64,
+    pub transfer: u64,
+    pub matrix: u64,
+    pub range: u64,
+    pub sar_num: u32,
+    pub sar_den: u32,
+    pub max_access_unit_bytes: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Visibility {
+    pub visible: bool,
+    pub reasons: u64,
+    pub display_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeedKeyframe {
+    pub source_id: u64,
+    pub minimum_epoch: u32,
+    pub reason: u64,
+    pub last_packet_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLost {
+    pub source_id: u64,
+    pub code: u64,
+    pub diagnostic: String,
 }
 
 #[derive(Debug, Clone)]
@@ -236,9 +313,9 @@ pub fn hello(request_id: u64, token: &str) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
         encoder.map(10);
         key_u64(encoder, 0, 1);
-        key_u64(encoder, 1, 0);
+        key_u64(encoder, 1, 1);
         key_u64(encoder, 2, 1);
-        key_u64(encoder, 3, 0);
+        key_u64(encoder, 3, 1);
         encoder.u64(4);
         encoder.text(token);
         encoder.u64(5);
@@ -246,32 +323,72 @@ pub fn hello(request_id: u64, token: &str) -> Vec<u8> {
         encoder.u64(6);
         encoder.text(env!("CARGO_PKG_VERSION"));
         encoder.u64(7);
-        encoder.array(1);
-        encoder.u64(FEATURE_TEXT_ANCHORS);
+        encoder.array(5);
+        encoder.u64(FEATURE_RASTER_RGBA8);
+        encoder.u64(FEATURE_SCENE_TRANSACTIONS);
+        encoder.u64(FEATURE_GRID_CELL_NODES);
+        encoder.u64(FEATURE_CREDIT_FLOW_CONTROL);
+        encoder.u64(FEATURE_TEXT_ANCHORS_V2);
         encoder.u64(8);
-        encoder.array(0);
+        encoder.array(6);
+        encoder.u64(FEATURE_ENCODED_IMAGE_V1);
+        encoder.u64(FEATURE_RASTER_ZSTD_V1);
+        encoder.u64(FEATURE_RASTER_PREMULTIPLIED_ALPHA);
+        encoder.u64(FEATURE_VISIBILITY_EVENTS_V1);
+        encoder.u64(FEATURE_VIDEO_ACCESS_UNIT_V1);
+        encoder.u64(FEATURE_VIDEO_CONTROL_V1);
         key_u64(encoder, 9, u64::from(super::CONTROL_MAX_RECORD_BODY));
     })
 }
 
 pub fn create_raster(request_id: u64, source_id: u64, width: u32, height: u32) -> Vec<u8> {
+    create_raster_config(
+        request_id,
+        &RasterSourceConfig {
+            source_id,
+            width,
+            height,
+            alpha_mode: ALPHA_STRAIGHT,
+            compression_mode: COMPRESSION_RAW_OR_ZSTD,
+        },
+    )
+}
+
+pub fn create_raster_config(request_id: u64, config: &RasterSourceConfig) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
         encoder.map(9);
-        key_u64(encoder, 0, source_id);
-        key_u64(encoder, 1, u64::from(width));
-        key_u64(encoder, 2, u64::from(height));
+        key_u64(encoder, 0, config.source_id);
+        key_u64(encoder, 1, u64::from(config.width));
+        key_u64(encoder, 2, u64::from(config.height));
         key_u64(encoder, 3, PIXEL_FORMAT_RGBA8);
-        key_u64(encoder, 4, ALPHA_STRAIGHT);
+        key_u64(encoder, 4, config.alpha_mode);
         key_u64(encoder, 5, RASTER_FULL_FRAME);
         key_u64(encoder, 6, 1);
-        key_u64(encoder, 7, COMPRESSION_NONE);
+        key_u64(encoder, 7, config.compression_mode);
         key_u64(encoder, 8, RETENTION_NONE);
+    })
+}
+
+pub fn create_image(request_id: u64, config: &ImageSourceConfig) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(if config.sha256.is_some() { 8 } else { 7 });
+        key_u64(encoder, 0, config.source_id);
+        key_u64(encoder, 1, config.encoding);
+        key_u64(encoder, 2, u64::from(config.width));
+        key_u64(encoder, 3, u64::from(config.height));
+        key_u64(encoder, 4, u64::from(config.encoded_length));
+        if let Some(hash) = config.sha256 {
+            encoder.u64(5);
+            encoder.bytes(&hash);
+        }
+        key_u64(encoder, 6, COLOR_SPACE_SRGB);
+        key_u64(encoder, 7, RETENTION_DECODED_SOURCE);
     })
 }
 
 pub fn create_video(request_id: u64, config: &VideoSourceConfig<'_>) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(14);
+        encoder.map(21);
         key_u64(encoder, 0, config.source_id);
         encoder.u64(1);
         encoder.text(config.codec);
@@ -290,6 +407,13 @@ pub fn create_video(request_id: u64, config: &VideoSourceConfig<'_>) -> Vec<u8> 
         key_u64(encoder, 12, 16); // maximum reorder depth
         encoder.u64(13);
         encoder.text("source-timebase-us");
+        key_u64(encoder, 14, config.color_primaries);
+        key_u64(encoder, 15, config.transfer);
+        key_u64(encoder, 16, config.matrix);
+        key_u64(encoder, 17, config.range);
+        key_u64(encoder, 18, u64::from(config.sar_num));
+        key_u64(encoder, 19, u64::from(config.sar_den));
+        key_u64(encoder, 20, u64::from(config.max_access_unit_bytes));
     })
 }
 
@@ -323,6 +447,16 @@ pub fn begin_transaction(request_id: u64, transaction_id: u64) -> Vec<u8> {
 }
 
 pub fn create_node(request_id: u64, transaction_id: u64, node: NodeConfig) -> Vec<u8> {
+    create_node_at(request_id, transaction_id, node, 0, 0)
+}
+
+pub fn create_node_at(
+    request_id: u64,
+    transaction_id: u64,
+    node: NodeConfig,
+    x: i64,
+    y: i64,
+) -> Vec<u8> {
     envelope(request_id, Some(transaction_id), None, |encoder| {
         encoder.map(if node.anchor_id.is_some() { 15 } else { 14 });
         key_u64(encoder, 0, node.node_id);
@@ -337,8 +471,8 @@ pub fn create_node(request_id: u64, transaction_id: u64, node: NodeConfig) -> Ve
                 COORDINATE_GRID_CELL
             },
         );
-        key_i64(encoder, 4, 0);
-        key_i64(encoder, 5, 0);
+        key_i64(encoder, 4, x);
+        key_i64(encoder, 5, y);
         key_i64(encoder, 6, fixed_cells(node.columns));
         key_i64(encoder, 7, fixed_cells(node.rows));
         key_u64(encoder, 8, FIT_CONTAIN);
@@ -442,9 +576,10 @@ pub fn welcome(
     session_tag: &[u8; 16],
     root_context_id: u64,
     display: DisplayChanged,
+    accepted_features: &[u64],
 ) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(13);
+        encoder.map(16);
         key_u64(encoder, 0, session_id);
         encoder.u64(1);
         encoder.bytes(session_tag);
@@ -459,10 +594,20 @@ pub fn welcome(
         key_u64(encoder, 10, u64::from(display.cell_height));
         key_u64(encoder, 11, u64::from(super::CONTROL_MAX_RECORD_BODY));
         encoder.u64(12);
-        encoder.array(3);
-        encoder.text("raster-rgba8");
-        encoder.text("video-ffmpeg-packet-v0");
-        encoder.text("text-anchor-cell-v1");
+        encoder.array(6);
+        encoder.text(PROFILE_IMAGE_PNG_JPEG);
+        encoder.text(PROFILE_RASTER_RGBA8);
+        encoder.text(PROFILE_RASTER_ZSTD);
+        encoder.text(PROFILE_TEXT_ANCHOR_V2);
+        encoder.text(PROFILE_VIDEO_ACCESS_UNIT);
+        encoder.text(PROFILE_VISIBILITY);
+        key_u64(encoder, 13, 1);
+        key_u64(encoder, 14, 1);
+        encoder.u64(15);
+        encoder.array(accepted_features.len());
+        for feature in accepted_features {
+            encoder.u64(*feature);
+        }
     })
 }
 
@@ -479,15 +624,75 @@ pub fn display_changed(request_id: u64, display: DisplayChanged) -> Vec<u8> {
     })
 }
 
-pub fn source_ready(request_id: u64, source_id: u64, ticket: &[u8], credits: Credits) -> Vec<u8> {
+pub fn source_ready(
+    request_id: u64,
+    source_id: u64,
+    ticket: &[u8],
+    credits: Credits,
+    max_media_body: u32,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(5);
+        encoder.map(6);
         key_u64(encoder, 0, source_id);
         encoder.u64(1);
         encoder.bytes(ticket);
         key_u64(encoder, 2, credits.bytes);
         key_u64(encoder, 3, credits.packets);
         key_u64(encoder, 4, credits.fragments);
+        key_u64(encoder, 5, u64::from(max_media_body));
+    })
+}
+
+pub fn pause(request_id: u64, source_id: u64) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(1);
+        key_u64(encoder, 0, source_id);
+    })
+}
+
+pub fn flush(request_id: u64, source_id: u64, epoch: u32) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(2);
+        key_u64(encoder, 0, source_id);
+        key_u64(encoder, 1, u64::from(epoch));
+    })
+}
+
+pub fn visibility(source_id: u64, visible: bool, reasons: u64, generation: u64) -> Vec<u8> {
+    let _ = source_id;
+    envelope(0, None, None, |encoder| {
+        encoder.map(3);
+        encoder.u64(0);
+        encoder.bool(visible);
+        key_u64(encoder, 1, reasons);
+        key_u64(encoder, 2, generation);
+    })
+}
+
+pub fn need_keyframe(
+    source_id: u64,
+    minimum_epoch: u32,
+    reason: u64,
+    last_packet_id: Option<u64>,
+) -> Vec<u8> {
+    envelope(0, None, None, |encoder| {
+        encoder.map(if last_packet_id.is_some() { 4 } else { 3 });
+        key_u64(encoder, 0, source_id);
+        key_u64(encoder, 1, u64::from(minimum_epoch));
+        key_u64(encoder, 2, reason);
+        if let Some(id) = last_packet_id {
+            key_u64(encoder, 3, id);
+        }
+    })
+}
+
+pub fn source_lost(source_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
+    envelope(0, None, None, |encoder| {
+        encoder.map(3);
+        key_u64(encoder, 0, source_id);
+        key_u64(encoder, 1, code);
+        encoder.u64(2);
+        encoder.text(truncate_utf8(diagnostic, 4096));
     })
 }
 
@@ -503,7 +708,7 @@ pub fn error(request_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
         encoder.u64(4);
         encoder.bool(false);
         encoder.u64(5);
-        encoder.text(diagnostic);
+        encoder.text(truncate_utf8(diagnostic, 4096));
     })
 }
 
@@ -518,6 +723,17 @@ pub fn credit(bytes: u64, packets: u64, fragments: u64) -> Vec<u8> {
 
 pub fn decode_control(body: &[u8]) -> io::Result<ControlEnvelope> {
     let value = cbor::decode(body).map_err(invalid_data)?;
+    if !matches!(value, Value::Map(_)) {
+        return Err(invalid("control envelope is not a map"));
+    }
+    let payload = value
+        .map_value(3)
+        .cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing control payload"))?;
+    if !matches!(payload, Value::Map(_)) {
+        return Err(invalid("control payload is not a map"));
+    }
+    reject_unknown_fields(&value, &[0, 1, 2, 3])?;
     Ok(ControlEnvelope {
         request_id: required_u64(&value, 0, "request ID")?,
         transaction_id: value
@@ -539,16 +755,14 @@ pub fn decode_control(body: &[u8]) -> io::Result<ControlEnvelope> {
                 })
             })
             .transpose()?,
-        payload: value
-            .map_value(3)
-            .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing control payload"))?,
+        payload,
     })
 }
 
 pub fn parse_hello(body: &[u8]) -> io::Result<(u64, Hello)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])?;
     let maximum_record_body = u32::try_from(required_u64(payload, 9, "maximum record body")?)
         .map_err(|_| {
             io::Error::new(
@@ -556,49 +770,58 @@ pub fn parse_hello(body: &[u8]) -> io::Result<(u64, Hello)> {
                 "maximum record body exceeds u32",
             )
         })?;
-    Ok((
-        envelope.request_id,
-        Hello {
-            minimum_major: required_u64(payload, 0, "minimum major version")?,
-            minimum_minor: required_u64(payload, 1, "minimum minor version")?,
-            maximum_major: required_u64(payload, 2, "maximum major version")?,
-            maximum_minor: required_u64(payload, 3, "maximum minor version")?,
-            token: required_text(payload, 4, "authentication token")?.to_owned(),
-            producer: required_text(payload, 5, "producer name")?.to_owned(),
-            required_features: payload
-                .map_value(7)
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "missing required features")
-                })?
-                .iter()
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .ok_or_else(|| invalid("feature ID is not unsigned"))
-                })
-                .collect::<io::Result<Vec<_>>>()?,
-            maximum_record_body,
-        },
-    ))
+    let hello = Hello {
+        minimum_major: required_u64(payload, 0, "minimum major version")?,
+        minimum_minor: required_u64(payload, 1, "minimum minor version")?,
+        maximum_major: required_u64(payload, 2, "maximum major version")?,
+        maximum_minor: required_u64(payload, 3, "maximum minor version")?,
+        token: required_text(payload, 4, "authentication token")?.to_owned(),
+        producer: bounded_text(payload, 5, "producer name", 256)?.to_owned(),
+        producer_version: bounded_text(payload, 6, "producer version", 128)?.to_owned(),
+        required_features: feature_array(payload, 7, "required features")?,
+        optional_features: feature_array(payload, 8, "optional features")?,
+        maximum_record_body,
+    };
+    if (hello.minimum_major, hello.minimum_minor) > (hello.maximum_major, hello.maximum_minor) {
+        return Err(invalid("HELLO protocol range is reversed"));
+    }
+    if hello.token.len() != 64 || !hello.token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid(
+            "HELLO token is not exactly 64 hexadecimal characters",
+        ));
+    }
+    if hello
+        .required_features
+        .iter()
+        .any(|feature| hello.optional_features.binary_search(feature).is_ok())
+    {
+        return Err(invalid("HELLO required and optional feature sets overlap"));
+    }
+    Ok((envelope.request_id, hello))
 }
 
 pub fn parse_create_raster(body: &[u8]) -> io::Result<(ControlEnvelope, RasterSourceConfig)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8])?;
     let config = RasterSourceConfig {
         source_id: required_u64(payload, 0, "source ID")?,
         width: required_u32(payload, 1, "raster width")?,
         height: required_u32(payload, 2, "raster height")?,
+        alpha_mode: required_u64(payload, 4, "alpha mode")?,
+        compression_mode: required_u64(payload, 7, "compression")?,
     };
     if config.source_id == 0 {
         return Err(invalid("raster source ID is zero"));
     }
     if required_u64(payload, 3, "pixel format")? != PIXEL_FORMAT_RGBA8
-        || required_u64(payload, 4, "alpha mode")? != ALPHA_STRAIGHT
+        || !matches!(config.alpha_mode, ALPHA_STRAIGHT | ALPHA_PREMULTIPLIED)
         || required_u64(payload, 5, "raster mode")? != RASTER_FULL_FRAME
         || required_u64(payload, 6, "rectangle limit")? != 1
-        || required_u64(payload, 7, "compression")? != COMPRESSION_NONE
+        || !matches!(
+            config.compression_mode,
+            COMPRESSION_NONE | COMPRESSION_RAW_OR_ZSTD
+        )
         || required_u64(payload, 8, "retention")? != RETENTION_NONE
     {
         return Err(invalid("unsupported raster configuration"));
@@ -609,9 +832,53 @@ pub fn parse_create_raster(body: &[u8]) -> io::Result<(ControlEnvelope, RasterSo
     Ok((envelope, config))
 }
 
+pub fn parse_create_image(body: &[u8]) -> io::Result<(ControlEnvelope, ImageSourceConfig)> {
+    let envelope = decode_control(body)?;
+    let payload = &envelope.payload;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7])?;
+    let hash = payload
+        .map_value(5)
+        .map(|value| {
+            let bytes = value
+                .as_bytes()
+                .ok_or_else(|| invalid("image hash is not bytes"))?;
+            bytes
+                .try_into()
+                .map_err(|_| invalid("image hash is not 32 bytes"))
+        })
+        .transpose()?;
+    let config = ImageSourceConfig {
+        source_id: required_u64(payload, 0, "source ID")?,
+        encoding: required_u64(payload, 1, "image encoding")?,
+        width: required_u32(payload, 2, "image width")?,
+        height: required_u32(payload, 3, "image height")?,
+        encoded_length: required_u32(payload, 4, "encoded image length")?,
+        sha256: hash,
+    };
+    if config.source_id == 0
+        || !matches!(config.encoding, IMAGE_PNG | IMAGE_JPEG)
+        || config.width == 0
+        || config.height == 0
+        || config.width > 8192
+        || config.height > 8192
+        || config.encoded_length == 0
+        || required_u64(payload, 6, "color space")? != COLOR_SPACE_SRGB
+        || required_u64(payload, 7, "retention")? != RETENTION_DECODED_SOURCE
+    {
+        return Err(invalid("unsupported encoded-image configuration"));
+    }
+    Ok((envelope, config))
+}
+
 pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVideoSourceConfig)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
+    reject_unknown_fields(
+        payload,
+        &[
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        ],
+    )?;
     let profile = required_i64(payload, 6, "video profile")?;
     let level = required_i64(payload, 7, "video level")?;
     let config = ParsedVideoSourceConfig {
@@ -624,6 +891,13 @@ pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVid
         profile: i32::try_from(profile).map_err(|_| invalid("video profile exceeds i32"))?,
         level: i32::try_from(level).map_err(|_| invalid("video level exceeds i32"))?,
         bitrate: required_u64(payload, 11, "video bitrate")?,
+        color_primaries: required_u64(payload, 14, "color primaries")?,
+        transfer: required_u64(payload, 15, "transfer characteristic")?,
+        matrix: required_u64(payload, 16, "matrix coefficients")?,
+        range: required_u64(payload, 17, "signal range")?,
+        sar_num: required_u32(payload, 18, "sample aspect ratio numerator")?,
+        sar_den: required_u32(payload, 19, "sample aspect ratio denominator")?,
+        max_access_unit_bytes: required_u32(payload, 20, "maximum access-unit bytes")?,
     };
     if config.width == 0 || config.height == 0 || config.width > 8192 || config.height > 8192 {
         return Err(invalid("video dimensions are outside Vivid v1 limits"));
@@ -633,6 +907,13 @@ pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVid
         || required_u64(payload, 10, "retention mode")? != RETENTION_NONE
         || required_u64(payload, 12, "reorder depth")? > 64
         || required_text(payload, 13, "timeline name")? != "source-timebase-us"
+        || config.sar_num == 0
+        || config.sar_den == 0
+        || config.max_access_unit_bytes == 0
+        || !matches!(config.color_primaries, 1..=4)
+        || !matches!(config.transfer, 1..=2)
+        || !matches!(config.matrix, 0..=3)
+        || !matches!(config.range, 1..=2)
     {
         return Err(invalid("unsupported video configuration"));
     }
@@ -709,14 +990,33 @@ pub fn parse_attach_channel(body: &[u8]) -> io::Result<Vec<u8>> {
 
 pub fn parse_welcome(body: &[u8]) -> io::Result<Welcome> {
     let (_, payload) = decode_envelope(body)?;
-    Ok(Welcome {
+    reject_unknown_fields(
+        &payload,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    )?;
+    let welcome = Welcome {
         session_id: required_u64(&payload, 0, "session ID")?,
         session_tag: required_bytes(&payload, 1, "session tag")?.to_vec(),
         root_context_id: required_u64(&payload, 2, "root context ID")?,
         display_generation: required_u64(&payload, 4, "display generation")?,
         grid_columns: required_u64(&payload, 7, "grid columns")?,
         grid_rows: required_u64(&payload, 8, "grid rows")?,
-    })
+        maximum_control_body: required_u32(&payload, 11, "maximum control body")?,
+        accepted_profiles: text_array(&payload, 12, "accepted profiles")?,
+        selected_major: required_u64(&payload, 13, "selected protocol major")?,
+        selected_minor: required_u64(&payload, 14, "selected protocol minor")?,
+        accepted_features: feature_array(&payload, 15, "accepted features")?,
+    };
+    if welcome.session_id == 0
+        || welcome.root_context_id == 0
+        || welcome.session_tag.len() != 16
+        || welcome.maximum_control_body == 0
+        || welcome.maximum_control_body > super::CONTROL_MAX_RECORD_BODY
+        || (welcome.selected_major, welcome.selected_minor) != (1, 1)
+    {
+        return Err(invalid("WELCOME contains an invalid mandatory 1.1 field"));
+    }
+    Ok(welcome)
 }
 
 pub fn parse_display_changed(body: &[u8]) -> io::Result<DisplayChanged> {
@@ -734,12 +1034,63 @@ pub fn parse_display_changed(body: &[u8]) -> io::Result<DisplayChanged> {
 
 pub fn parse_source_ready(body: &[u8]) -> io::Result<SourceReady> {
     let (_, payload) = decode_envelope(body)?;
-    Ok(SourceReady {
+    reject_unknown_fields(&payload, &[0, 1, 2, 3, 4, 5])?;
+    let ready = SourceReady {
         source_id: required_u64(&payload, 0, "source ID")?,
         media_ticket: required_bytes(&payload, 1, "media ticket")?.to_vec(),
         byte_credits: required_u64(&payload, 2, "byte credits")?,
         packet_credits: required_u64(&payload, 3, "packet credits")?,
         fragment_credits: payload.map_value(4).and_then(Value::as_u64).unwrap_or(0),
+        max_media_body: required_u32(&payload, 5, "maximum media body")?,
+    };
+    if ready.source_id == 0
+        || ready.media_ticket.len() != 32
+        || ready.max_media_body == 0
+        || ready.max_media_body > super::HARD_MAX_RECORD_BODY
+        || ready.byte_credits < u64::from(ready.max_media_body)
+        || ready.packet_credits == 0
+    {
+        return Err(invalid("SOURCE_READY contains invalid limits or credits"));
+    }
+    Ok(ready)
+}
+
+pub fn parse_visibility(body: &[u8]) -> io::Result<Visibility> {
+    let (_, payload) = decode_envelope(body)?;
+    Ok(Visibility {
+        visible: payload
+            .map_value(0)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid("missing visibility state"))?,
+        reasons: required_u64(&payload, 1, "visibility reasons")?,
+        display_generation: required_u64(&payload, 2, "visibility generation")?,
+    })
+}
+
+pub fn parse_need_keyframe(body: &[u8]) -> io::Result<NeedKeyframe> {
+    let (_, payload) = decode_envelope(body)?;
+    Ok(NeedKeyframe {
+        source_id: required_u64(&payload, 0, "source ID")?,
+        minimum_epoch: required_u32(&payload, 1, "minimum epoch")?,
+        reason: required_u64(&payload, 2, "keyframe reason")?,
+        last_packet_id: payload
+            .map_value(3)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| invalid("last packet ID is not unsigned"))
+            })
+            .transpose()?,
+    })
+}
+
+pub fn parse_source_lost(body: &[u8]) -> io::Result<SourceLost> {
+    let (_, payload) = decode_envelope(body)?;
+    reject_unknown_fields(&payload, &[0, 1, 2])?;
+    Ok(SourceLost {
+        source_id: required_u64(&payload, 0, "source ID")?,
+        code: required_u64(&payload, 1, "source-loss code")?,
+        diagnostic: bounded_text(&payload, 2, "source-loss diagnostic", 4096)?.to_owned(),
     })
 }
 
@@ -761,12 +1112,17 @@ pub fn parse_error(body: &[u8]) -> io::Result<String> {
 }
 
 pub fn parse_error_reply(body: &[u8]) -> io::Result<ErrorReply> {
-    let (_, payload) = decode_envelope(body)?;
+    let (envelope_request_id, payload) = decode_envelope(body)?;
+    reject_unknown_fields(&payload, &[0, 1, 4, 5])?;
     let code = required_u64(&payload, 0, "error code")?;
     let request_id = required_u64(&payload, 1, "failed request ID")?;
+    if request_id != envelope_request_id {
+        return Err(invalid("ERROR request IDs do not match"));
+    }
     let diagnostic = payload
         .map_value(5)
-        .and_then(Value::as_text)
+        .map(|_| bounded_text(&payload, 5, "error diagnostic", 4096))
+        .transpose()?
         .unwrap_or("no diagnostic");
     Ok(ErrorReply {
         code,
@@ -837,6 +1193,7 @@ pub fn name(record_type: u16) -> &'static str {
         RASTER_FRAME => "RASTER_FRAME",
         BLOB_CHUNK => "BLOB_CHUNK",
         BUFFER_SUBMIT => "BUFFER_SUBMIT",
+        IMAGE_DATA => "IMAGE_DATA",
         _ => "UNKNOWN",
     }
 }
@@ -875,6 +1232,16 @@ fn required_u64(value: &Value, key: u64, description: &str) -> io::Result<u64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {description}")))
 }
 
+fn reject_unknown_fields(value: &Value, allowed: &[u64]) -> io::Result<()> {
+    let Value::Map(entries) = value else {
+        return Err(invalid("schema value is not a map"));
+    };
+    if entries.iter().any(|(key, _)| !allowed.contains(key)) {
+        return Err(invalid("schema contains a reserved field"));
+    }
+    Ok(())
+}
+
 fn required_bytes<'a>(value: &'a Value, key: u64, description: &str) -> io::Result<&'a [u8]> {
     value
         .map_value(key)
@@ -887,6 +1254,73 @@ fn required_text<'a>(value: &'a Value, key: u64, description: &str) -> io::Resul
         .map_value(key)
         .and_then(Value::as_text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {description}")))
+}
+
+fn bounded_text<'a>(
+    value: &'a Value,
+    key: u64,
+    description: &str,
+    maximum: usize,
+) -> io::Result<&'a str> {
+    let text = required_text(value, key, description)?;
+    if text.len() > maximum {
+        return Err(invalid("text field exceeds its schema limit"));
+    }
+    Ok(text)
+}
+
+fn feature_array(value: &Value, key: u64, description: &str) -> io::Result<Vec<u64>> {
+    let array = value
+        .map_value(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("missing {description}"))
+        })?;
+    let mut output = Vec::with_capacity(array.len());
+    for item in array {
+        let feature = item
+            .as_u64()
+            .ok_or_else(|| invalid("feature ID is not unsigned"))?;
+        if output.last().is_some_and(|previous| *previous >= feature) {
+            return Err(invalid("feature IDs are not strictly increasing"));
+        }
+        output.push(feature);
+    }
+    Ok(output)
+}
+
+fn text_array(value: &Value, key: u64, description: &str) -> io::Result<Vec<String>> {
+    let array = value
+        .map_value(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("missing {description}"))
+        })?;
+    let mut output = Vec::with_capacity(array.len());
+    for item in array {
+        let text = item
+            .as_text()
+            .ok_or_else(|| invalid("profile name is not text"))?;
+        if output
+            .last()
+            .is_some_and(|previous: &String| previous.as_str() >= text)
+        {
+            return Err(invalid("profile names are not strictly sorted"));
+        }
+        output.push(text.to_owned());
+    }
+    Ok(output)
+}
+
+fn truncate_utf8(value: &str, maximum: usize) -> &str {
+    if value.len() <= maximum {
+        return value;
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn required_i64(value: &Value, key: u64, description: &str) -> io::Result<i64> {
@@ -999,5 +1433,91 @@ mod tests {
             parse_anchor_event(&anchor_event(0x1020_3040)).unwrap(),
             0x1020_3040
         );
+    }
+
+    #[test]
+    fn welcome_and_source_ready_require_protocol_1_1_fields() {
+        let display = DisplayChanged {
+            display_generation: 3,
+            viewport_width: 800,
+            viewport_height: 600,
+            grid_columns: 80,
+            grid_rows: 24,
+            cell_width: 10,
+            cell_height: 25,
+        };
+        let features = [
+            FEATURE_RASTER_RGBA8,
+            FEATURE_SCENE_TRANSACTIONS,
+            FEATURE_GRID_CELL_NODES,
+            FEATURE_CREDIT_FLOW_CONTROL,
+            FEATURE_TEXT_ANCHORS_V2,
+        ];
+        let parsed = parse_welcome(&welcome(7, 9, &[1; 16], 10, display, &features)).unwrap();
+        assert_eq!((parsed.selected_major, parsed.selected_minor), (1, 1));
+        assert_eq!(
+            parsed.maximum_control_body,
+            super::super::CONTROL_MAX_RECORD_BODY
+        );
+        assert!(
+            parsed
+                .accepted_features
+                .binary_search(&FEATURE_TEXT_ANCHORS_V2)
+                .is_ok()
+        );
+        assert!(
+            !parsed
+                .accepted_features
+                .contains(&FEATURE_RETIRED_VIDEO_FFMPEG_PACKET_V0)
+        );
+        assert!(
+            !parsed
+                .accepted_features
+                .contains(&FEATURE_RETIRED_TEXT_ANCHORS_V1)
+        );
+
+        let ready = parse_source_ready(&source_ready(
+            8,
+            11,
+            &[2; 32],
+            Credits {
+                bytes: 4 << 20,
+                packets: 32,
+                fragments: 0,
+            },
+            1234,
+        ))
+        .unwrap();
+        assert_eq!(ready.max_media_body, 1234);
+        assert_eq!(ready.source_id, 11);
+    }
+
+    #[test]
+    fn image_visibility_and_keyframe_messages_round_trip() {
+        let image = ImageSourceConfig {
+            source_id: 4,
+            encoding: IMAGE_PNG,
+            width: 320,
+            height: 200,
+            encoded_length: 99,
+            sha256: Some([7; 32]),
+        };
+        let (_, parsed) = parse_create_image(&create_image(1, &image)).unwrap();
+        assert_eq!(parsed.source_id, image.source_id);
+        assert_eq!(parsed.sha256, image.sha256);
+
+        let parsed = parse_visibility(&visibility(4, false, 3, 8)).unwrap();
+        assert!(!parsed.visible);
+        assert_eq!((parsed.reasons, parsed.display_generation), (3, 8));
+
+        let parsed =
+            parse_need_keyframe(&need_keyframe(4, 7, ERROR_DEVICE_LOST, Some(18))).unwrap();
+        assert_eq!((parsed.source_id, parsed.minimum_epoch), (4, 7));
+        assert_eq!(parsed.last_packet_id, Some(18));
+
+        let parsed = parse_source_lost(&source_lost(4, ERROR_HASH_MISMATCH, "bad hash")).unwrap();
+        assert_eq!(parsed.source_id, 4);
+        assert_eq!(parsed.code, ERROR_HASH_MISMATCH);
+        assert_eq!(parsed.diagnostic, "bad hash");
     }
 }
