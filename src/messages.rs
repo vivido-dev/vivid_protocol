@@ -25,6 +25,9 @@ pub const SOURCE_READY: u16 = 0x0105;
 pub const RECONFIGURE_SOURCE: u16 = 0x0106;
 pub const DESTROY_SOURCE: u16 = 0x0107;
 pub const SOURCE_LOST: u16 = 0x0108;
+pub const PROBE_AUDIO_CONFIG: u16 = 0x0109;
+pub const AUDIO_SUPPORT: u16 = 0x010a;
+pub const CREATE_AUDIO: u16 = 0x010b;
 
 pub const BEGIN_TXN: u16 = 0x0200;
 pub const CREATE_NODE: u16 = 0x0201;
@@ -69,6 +72,7 @@ pub const RASTER_FRAME: u16 = 0x8003;
 pub const BLOB_CHUNK: u16 = 0x8004;
 pub const BUFFER_SUBMIT: u16 = 0x8005;
 pub const IMAGE_DATA: u16 = 0x8006;
+pub const AUDIO_PACKET: u16 = 0x8007;
 
 pub const FEATURE_RASTER_RGBA8: u64 = 1;
 pub const FEATURE_RETIRED_VIDEO_FFMPEG_PACKET_V0: u64 = 2;
@@ -83,6 +87,7 @@ pub const FEATURE_VISIBILITY_EVENTS_V1: u64 = 10;
 pub const FEATURE_VIDEO_ACCESS_UNIT_V1: u64 = 11;
 pub const FEATURE_VIDEO_CONTROL_V1: u64 = 12;
 pub const FEATURE_TEXT_ANCHORS_V2: u64 = 13;
+pub const FEATURE_AUDIO_ACCESS_UNIT_V1: u64 = 14;
 
 pub const PROFILE_RASTER_RGBA8: &str = "raster-rgba8-full-v1";
 pub const PROFILE_RASTER_ZSTD: &str = "raster-zstd-full-v1";
@@ -90,6 +95,10 @@ pub const PROFILE_IMAGE_PNG_JPEG: &str = "image-png-jpeg-v1";
 pub const PROFILE_VIDEO_ACCESS_UNIT: &str = "video-access-unit-v1";
 pub const PROFILE_TEXT_ANCHOR_V2: &str = "text-anchor-cell-v2";
 pub const PROFILE_VISIBILITY: &str = "visibility-source-v1";
+pub const PROFILE_AUDIO_ACCESS_UNIT: &str = "audio-access-unit-v1";
+
+pub const MAX_AUDIO_EXTRADATA: usize = 64 * 1024;
+pub const MAX_AUDIO_ACCESS_UNIT_BYTES: u32 = 1024 * 1024;
 
 pub const ERROR_AUTH_FAILED: u64 = 1;
 pub const ERROR_UNSUPPORTED_VERSION: u64 = 2;
@@ -202,6 +211,19 @@ pub struct VideoSourceConfig<'a> {
     pub max_access_unit_bytes: u32,
 }
 
+pub struct AudioSourceConfig<'a> {
+    pub source_id: u64,
+    pub linked_video_source_id: Option<u64>,
+    pub codec: &'a str,
+    pub packetization: &'a str,
+    pub extradata: &'a [u8],
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub channel_mask: u64,
+    pub bitrate: i64,
+    pub max_access_unit_bytes: u32,
+}
+
 pub struct NodeConfig {
     pub node_id: u64,
     pub source_id: u64,
@@ -272,6 +294,20 @@ pub struct ParsedVideoSourceConfig {
     pub max_access_unit_bytes: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedAudioSourceConfig {
+    pub source_id: u64,
+    pub linked_video_source_id: Option<u64>,
+    pub codec: String,
+    pub packetization: String,
+    pub extradata: Vec<u8>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub channel_mask: u64,
+    pub bitrate: u64,
+    pub max_access_unit_bytes: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Visibility {
     pub visible: bool,
@@ -330,13 +366,14 @@ pub fn hello(request_id: u64, token: &str) -> Vec<u8> {
         encoder.u64(FEATURE_CREDIT_FLOW_CONTROL);
         encoder.u64(FEATURE_TEXT_ANCHORS_V2);
         encoder.u64(8);
-        encoder.array(6);
+        encoder.array(7);
         encoder.u64(FEATURE_ENCODED_IMAGE_V1);
         encoder.u64(FEATURE_RASTER_ZSTD_V1);
         encoder.u64(FEATURE_RASTER_PREMULTIPLIED_ALPHA);
         encoder.u64(FEATURE_VISIBILITY_EVENTS_V1);
         encoder.u64(FEATURE_VIDEO_ACCESS_UNIT_V1);
         encoder.u64(FEATURE_VIDEO_CONTROL_V1);
+        encoder.u64(FEATURE_AUDIO_ACCESS_UNIT_V1);
         key_u64(encoder, 9, u64::from(super::CONTROL_MAX_RECORD_BODY));
     })
 }
@@ -419,6 +456,39 @@ pub fn create_video(request_id: u64, config: &VideoSourceConfig<'_>) -> Vec<u8> 
 
 pub fn probe_video_config(request_id: u64, config: &VideoSourceConfig<'_>) -> Vec<u8> {
     create_video(request_id, config)
+}
+
+pub fn create_audio(request_id: u64, config: &AudioSourceConfig<'_>) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(11);
+        key_u64(encoder, 0, config.source_id);
+        key_u64(encoder, 1, config.linked_video_source_id.unwrap_or(0));
+        encoder.u64(2);
+        encoder.text(config.codec);
+        encoder.u64(3);
+        encoder.text(config.packetization);
+        encoder.u64(4);
+        encoder.bytes(config.extradata);
+        key_u64(encoder, 5, u64::from(config.sample_rate));
+        key_u64(encoder, 6, u64::from(config.channels));
+        key_u64(encoder, 7, config.channel_mask);
+        key_i64(encoder, 8, config.bitrate.max(0));
+        key_u64(encoder, 9, u64::from(config.max_access_unit_bytes));
+        encoder.u64(10);
+        encoder.text("source-timebase-us");
+    })
+}
+
+pub fn probe_audio_config(request_id: u64, config: &AudioSourceConfig<'_>) -> Vec<u8> {
+    create_audio(request_id, config)
+}
+
+pub fn audio_support(request_id: u64, supported: bool, decoder: &str) -> Vec<u8> {
+    video_support(request_id, supported, decoder)
+}
+
+pub fn parse_audio_support(body: &[u8]) -> io::Result<bool> {
+    parse_video_support(body)
 }
 
 pub fn video_support(request_id: u64, supported: bool, decoder: &str) -> Vec<u8> {
@@ -556,6 +626,13 @@ pub fn eos(request_id: u64, source_id: u64, epoch: u32) -> Vec<u8> {
     })
 }
 
+pub fn drain(request_id: u64, source_id: u64) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(1);
+        key_u64(encoder, 0, source_id);
+    })
+}
+
 pub fn goodbye(request_id: u64) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
         encoder.map(0);
@@ -594,7 +671,8 @@ pub fn welcome(
         key_u64(encoder, 10, u64::from(display.cell_height));
         key_u64(encoder, 11, u64::from(super::CONTROL_MAX_RECORD_BODY));
         encoder.u64(12);
-        encoder.array(6);
+        encoder.array(7);
+        encoder.text(PROFILE_AUDIO_ACCESS_UNIT);
         encoder.text(PROFILE_IMAGE_PNG_JPEG);
         encoder.text(PROFILE_RASTER_RGBA8);
         encoder.text(PROFILE_RASTER_ZSTD);
@@ -920,6 +998,56 @@ pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVid
     Ok((envelope, config))
 }
 
+pub fn parse_create_audio(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedAudioSourceConfig)> {
+    let envelope = decode_control(body)?;
+    let payload = &envelope.payload;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
+    let channels = required_u32(payload, 6, "audio channel count")?;
+    let linked = required_u64(payload, 1, "linked video source ID")?;
+    let config = ParsedAudioSourceConfig {
+        source_id: required_u64(payload, 0, "source ID")?,
+        linked_video_source_id: (linked != 0).then_some(linked),
+        codec: bounded_text(payload, 2, "audio codec", 64)?.to_owned(),
+        packetization: bounded_text(payload, 3, "audio packetization", 64)?.to_owned(),
+        extradata: required_bytes(payload, 4, "audio extradata")?.to_vec(),
+        sample_rate: required_u32(payload, 5, "audio sample rate")?,
+        channels: u16::try_from(channels)
+            .map_err(|_| invalid("audio channel count exceeds u16"))?,
+        channel_mask: required_u64(payload, 7, "audio channel mask")?,
+        bitrate: required_u64(payload, 8, "audio bitrate")?,
+        max_access_unit_bytes: required_u32(payload, 9, "maximum audio access-unit bytes")?,
+    };
+    if config.linked_video_source_id == Some(config.source_id) {
+        return Err(invalid("audio source cannot link to itself"));
+    }
+    if required_text(payload, 10, "audio timeline")? != "source-timebase-us" {
+        return Err(invalid("unsupported audio configuration"));
+    }
+    Ok((envelope, config))
+}
+
+pub fn audio_config_supported(config: &ParsedAudioSourceConfig) -> bool {
+    (8_000..=192_000).contains(&config.sample_rate)
+        && (1..=8).contains(&config.channels)
+        && (config.channel_mask == 0
+            || config.channel_mask.count_ones() == u32::from(config.channels))
+        && config.extradata.len() <= MAX_AUDIO_EXTRADATA
+        && config.max_access_unit_bytes > 0
+        && config.max_access_unit_bytes <= MAX_AUDIO_ACCESS_UNIT_BYTES
+        && valid_audio_packetization(&config.codec, &config.packetization)
+}
+
+pub fn valid_audio_packetization(codec: &str, packetization: &str) -> bool {
+    match codec {
+        "mp3" => packetization == "mp3-frame-v1",
+        "aac" => packetization == "aac-raw-au-v1",
+        "alac" => packetization == "alac-frame-v1",
+        "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" | "pcm_f64le"
+        | "pcm_mulaw" | "pcm_alaw" => packetization == "pcm-packet-v1",
+        _ => false,
+    }
+}
+
 pub fn parse_create_node(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedNodeConfig)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
@@ -1156,6 +1284,9 @@ pub fn name(record_type: u16) -> &'static str {
         RECONFIGURE_SOURCE => "RECONFIGURE_SOURCE",
         DESTROY_SOURCE => "DESTROY_SOURCE",
         SOURCE_LOST => "SOURCE_LOST",
+        PROBE_AUDIO_CONFIG => "PROBE_AUDIO_CONFIG",
+        AUDIO_SUPPORT => "AUDIO_SUPPORT",
+        CREATE_AUDIO => "CREATE_AUDIO",
         BEGIN_TXN => "BEGIN_TXN",
         CREATE_NODE => "CREATE_NODE",
         UPDATE_NODE => "UPDATE_NODE",
@@ -1194,6 +1325,7 @@ pub fn name(record_type: u16) -> &'static str {
         BLOB_CHUNK => "BLOB_CHUNK",
         BUFFER_SUBMIT => "BUFFER_SUBMIT",
         IMAGE_DATA => "IMAGE_DATA",
+        AUDIO_PACKET => "AUDIO_PACKET",
         _ => "UNKNOWN",
     }
 }
@@ -1519,5 +1651,55 @@ mod tests {
         assert_eq!(parsed.source_id, 4);
         assert_eq!(parsed.code, ERROR_HASH_MISMATCH);
         assert_eq!(parsed.diagnostic, "bad hash");
+    }
+
+    #[test]
+    fn audio_config_round_trip_and_support_limits() {
+        let config = AudioSourceConfig {
+            source_id: 12,
+            linked_video_source_id: Some(10),
+            codec: "aac",
+            packetization: "aac-raw-au-v1",
+            extradata: &[0x12, 0x10],
+            sample_rate: 48_000,
+            channels: 2,
+            channel_mask: 3,
+            bitrate: 192_000,
+            max_access_unit_bytes: 8_192,
+        };
+        let (envelope, parsed) = parse_create_audio(&create_audio(7, &config)).unwrap();
+        assert_eq!(envelope.request_id, 7);
+        assert_eq!(parsed.source_id, 12);
+        assert_eq!(parsed.linked_video_source_id, Some(10));
+        assert_eq!(parsed.codec, "aac");
+        assert_eq!(parsed.extradata, [0x12, 0x10]);
+        assert!(audio_config_supported(&parsed));
+    }
+
+    #[test]
+    fn audio_probe_can_report_unsupported_codec_and_limits() {
+        let unsupported = AudioSourceConfig {
+            source_id: 0,
+            linked_video_source_id: None,
+            codec: "opus",
+            packetization: "unsupported-audio-packetization",
+            extradata: &[],
+            sample_rate: 48_000,
+            channels: 2,
+            channel_mask: 3,
+            bitrate: 128_000,
+            max_access_unit_bytes: 4_096,
+        };
+        let (_, parsed) = parse_create_audio(&probe_audio_config(8, &unsupported)).unwrap();
+        assert!(!audio_config_supported(&parsed));
+
+        let oversized = AudioSourceConfig {
+            codec: "mp3",
+            packetization: "mp3-frame-v1",
+            max_access_unit_bytes: MAX_AUDIO_ACCESS_UNIT_BYTES + 1,
+            ..unsupported
+        };
+        let (_, parsed) = parse_create_audio(&probe_audio_config(9, &oversized)).unwrap();
+        assert!(!audio_config_supported(&parsed));
     }
 }

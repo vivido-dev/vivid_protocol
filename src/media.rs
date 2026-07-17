@@ -8,6 +8,7 @@ pub const RASTER_FRAME_FULL: u32 = 1 << 0;
 pub const RASTER_FRAME_ZSTD: u32 = 1 << 1;
 
 const VIDEO_PACKET_PREFIX_SIZE: usize = 48;
+const AUDIO_PACKET_PREFIX_SIZE: usize = 48;
 const RASTER_FRAME_PREFIX_SIZE: usize = 48;
 const RASTER_RECT_SIZE: usize = 24;
 
@@ -20,6 +21,18 @@ pub struct ParsedVideoPacket<'a> {
     pub dts_us: i64,
     pub duration_us: u64,
     pub side_data: &'a [u8],
+    pub data: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ParsedAudioPacket<'a> {
+    pub epoch: u32,
+    pub packet_id: u64,
+    pub pts_us: i64,
+    pub dts_us: i64,
+    pub duration_us: u64,
+    pub trim_start_samples: u32,
+    pub trim_end_samples: u32,
     pub data: &'a [u8],
 }
 
@@ -87,6 +100,20 @@ pub fn video_body_len(max_access_unit_bytes: u32) -> Result<u32, SizeError> {
     }
 }
 
+pub fn audio_body_len(max_access_unit_bytes: u32) -> Result<u32, SizeError> {
+    if max_access_unit_bytes == 0 {
+        return Err(SizeError::Empty);
+    }
+    let bytes = max_access_unit_bytes
+        .checked_add(AUDIO_PACKET_PREFIX_SIZE as u32)
+        .ok_or(SizeError::Overflow)?;
+    if bytes > HARD_MAX_RECORD_BODY {
+        Err(SizeError::TooLarge)
+    } else {
+        Ok(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MediaSequence {
     last_id: u64,
@@ -119,6 +146,34 @@ pub struct VideoPacket<'a> {
     pub duration_us: u64,
     pub key: bool,
     pub data: &'a [u8],
+}
+
+pub struct AudioPacket<'a> {
+    pub epoch: u32,
+    pub packet_id: u64,
+    pub pts_us: i64,
+    pub dts_us: i64,
+    pub duration_us: u64,
+    pub trim_start_samples: u32,
+    pub trim_end_samples: u32,
+    pub data: &'a [u8],
+}
+
+pub fn audio_packet_body(packet: AudioPacket<'_>) -> io::Result<Vec<u8>> {
+    let capacity = AUDIO_PACKET_PREFIX_SIZE
+        .checked_add(packet.data.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "audio packet too large"))?;
+    let mut body = Vec::with_capacity(capacity);
+    push_u32(&mut body, packet.epoch);
+    push_u32(&mut body, 0);
+    push_u64(&mut body, packet.packet_id);
+    push_i64(&mut body, packet.pts_us);
+    push_i64(&mut body, packet.dts_us);
+    push_u64(&mut body, packet.duration_us);
+    push_u32(&mut body, packet.trim_start_samples);
+    push_u32(&mut body, packet.trim_end_samples);
+    body.extend_from_slice(packet.data);
+    Ok(body)
 }
 
 pub fn video_packet_body(packet: VideoPacket<'_>) -> io::Result<Vec<u8>> {
@@ -238,6 +293,28 @@ pub fn parse_video_packet(body: &[u8]) -> io::Result<ParsedVideoPacket<'_>> {
         duration_us: read_u64(body, 32)?,
         side_data: &body[VIDEO_PACKET_PREFIX_SIZE..data_offset],
         data: &body[data_offset..],
+    })
+}
+
+pub fn parse_audio_packet(body: &[u8]) -> io::Result<ParsedAudioPacket<'_>> {
+    if body.len() < AUDIO_PACKET_PREFIX_SIZE {
+        return Err(invalid("audio packet is shorter than its 48-byte prefix"));
+    }
+    if body.len() == AUDIO_PACKET_PREFIX_SIZE {
+        return Err(invalid("audio packet has an empty access unit"));
+    }
+    if read_u32(body, 4)? != 0 {
+        return Err(invalid("audio packet reserved flags are nonzero"));
+    }
+    Ok(ParsedAudioPacket {
+        epoch: read_u32(body, 0)?,
+        packet_id: read_u64(body, 8)?,
+        pts_us: read_i64(body, 16)?,
+        dts_us: read_i64(body, 24)?,
+        duration_us: read_u64(body, 32)?,
+        trim_start_samples: read_u32(body, 40)?,
+        trim_end_samples: read_u32(body, 44)?,
+        data: &body[AUDIO_PACKET_PREFIX_SIZE..],
     })
 }
 
@@ -537,6 +614,52 @@ mod tests {
             VIDEO_PACKET_KEY
         );
         assert_eq!(&body[48..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn audio_packet_round_trip_uses_documented_prefix() {
+        let body = audio_packet_body(AudioPacket {
+            epoch: 2,
+            packet_id: 7,
+            pts_us: 12,
+            dts_us: 10,
+            duration_us: 20_000,
+            trim_start_samples: 2112,
+            trim_end_samples: 17,
+            data: &[4, 5, 6],
+        })
+        .unwrap();
+        let parsed = parse_audio_packet(&body).unwrap();
+        assert_eq!(parsed.epoch, 2);
+        assert_eq!(parsed.packet_id, 7);
+        assert_eq!(parsed.trim_start_samples, 2112);
+        assert_eq!(parsed.trim_end_samples, 17);
+        assert_eq!(parsed.data, &[4, 5, 6]);
+        assert_eq!(audio_body_len(3).unwrap(), 51);
+    }
+
+    #[test]
+    fn audio_packets_reject_malformed_headers_and_reused_ids() {
+        assert!(parse_audio_packet(&[0; 47]).is_err());
+        assert!(parse_audio_packet(&[0; 48]).is_err());
+        let mut body = audio_packet_body(AudioPacket {
+            epoch: 1,
+            packet_id: 1,
+            pts_us: 0,
+            dts_us: 0,
+            duration_us: 1_000,
+            trim_start_samples: 0,
+            trim_end_samples: 0,
+            data: &[1],
+        })
+        .unwrap();
+        body[7] = 1;
+        assert!(parse_audio_packet(&body).is_err());
+
+        let mut sequence = MediaSequence::default();
+        assert!(sequence.accept(1, 1).is_ok());
+        assert!(sequence.accept(1, 1).is_err());
+        assert!(sequence.accept(2, 0).is_err());
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub enum ConnectionKind {
     Raster = 2,
     Blob = 3,
     LocalBuffer = 4,
+    Audio = 5,
 }
 
 impl TryFrom<u8> for ConnectionKind {
@@ -34,6 +35,7 @@ impl TryFrom<u8> for ConnectionKind {
             2 => Ok(Self::Raster),
             3 => Ok(Self::Blob),
             4 => Ok(Self::LocalBuffer),
+            5 => Ok(Self::Audio),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown Vivid connection kind {value}"),
@@ -455,6 +457,7 @@ mod tests {
         assert_eq!(RecordHeader::decode(header.encode()), header);
     }
 
+    #[cfg(unix)]
     #[test]
     fn endpoint_parser_accepts_explicit_and_bare_unix_paths() {
         assert_eq!(
@@ -464,6 +467,14 @@ mod tests {
         assert_eq!(
             Endpoint::parse("/tmp/vivid.sock").unwrap(),
             Endpoint::Unix(PathBuf::from("/tmp/vivid.sock"))
+        );
+    }
+
+    #[test]
+    fn endpoint_parser_accepts_tcp() {
+        assert_eq!(
+            Endpoint::parse("tcp:127.0.0.1:12345").unwrap(),
+            Endpoint::Tcp("127.0.0.1:12345".into())
         );
     }
 }
