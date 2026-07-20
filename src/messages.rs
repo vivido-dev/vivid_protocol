@@ -88,6 +88,7 @@ pub const FEATURE_VIDEO_ACCESS_UNIT_V1: u64 = 11;
 pub const FEATURE_VIDEO_CONTROL_V1: u64 = 12;
 pub const FEATURE_TEXT_ANCHORS_V2: u64 = 13;
 pub const FEATURE_AUDIO_ACCESS_UNIT_V1: u64 = 14;
+pub const FEATURE_NODE_CLIP_RECT_V1: u64 = 15;
 
 pub const PROFILE_RASTER_RGBA8: &str = "raster-rgba8-full-v1";
 pub const PROFILE_RASTER_ZSTD: &str = "raster-zstd-full-v1";
@@ -96,9 +97,13 @@ pub const PROFILE_VIDEO_ACCESS_UNIT: &str = "video-access-unit-v1";
 pub const PROFILE_TEXT_ANCHOR_V2: &str = "text-anchor-cell-v2";
 pub const PROFILE_VISIBILITY: &str = "visibility-source-v1";
 pub const PROFILE_AUDIO_ACCESS_UNIT: &str = "audio-access-unit-v1";
+pub const PROFILE_NODE_CLIP_RECT: &str = "node-clip-rect-v1";
 
 pub const MAX_AUDIO_EXTRADATA: usize = 64 * 1024;
 pub const MAX_AUDIO_ACCESS_UNIT_BYTES: u32 = 1024 * 1024;
+pub const AUDIO_PACKETIZATION_OPUS: &str = "opus-packet-v1";
+pub const AUDIO_PACKETIZATION_VORBIS: &str = "vorbis-packet-v1";
+pub const AUDIO_PACKETIZATION_FLAC: &str = "flac-frame-v1";
 
 pub const ERROR_AUTH_FAILED: u64 = 1;
 pub const ERROR_UNSUPPORTED_VERSION: u64 = 2;
@@ -142,14 +147,72 @@ pub const PRESENT_NEXT_COMPOSITOR_FRAME: u64 = 0;
 pub const START_AFTER_MINIMUM_BUFFER: u64 = 1;
 pub const LATE_DROP_PRESENTATION: u64 = 1;
 
+/// Conservatively size initial PLAY buffering from one clean control-path RTT sample.
+pub fn minimum_buffer_for_rtt(requested_us: u64, rtt_us: Option<u64>) -> u64 {
+    rtt_us.map_or(requested_us, |rtt_us| {
+        requested_us
+            .max(rtt_us.saturating_mul(2).saturating_add(25_000))
+            .min(500_000)
+    })
+}
+
+/// Complete Vivid 1.1 PLAY payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayRequest {
+    pub source_id: u64,
+    pub start_pts_us: i64,
+    pub minimum_buffer_us: u64,
+    pub maximum_latency_us: u64,
+    pub rate_32_32: i64,
+    pub late_policy: u64,
+    pub loop_count: u64,
+    pub start_policy: u64,
+}
+
+impl PlayRequest {
+    pub fn baseline(source_id: u64, minimum_buffer_us: u64) -> Self {
+        Self {
+            source_id,
+            start_pts_us: 0,
+            minimum_buffer_us,
+            maximum_latency_us: 500_000,
+            rate_32_32: 1_i64 << 32,
+            late_policy: LATE_DROP_PRESENTATION,
+            loop_count: 0,
+            start_policy: START_AFTER_MINIMUM_BUFFER,
+        }
+    }
+
+    pub fn validate(self) -> io::Result<Self> {
+        if self.source_id == 0 {
+            return Err(invalid("PLAY source ID is zero"));
+        }
+        if self.maximum_latency_us < self.minimum_buffer_us {
+            return Err(invalid("PLAY maximum latency is below its minimum buffer"));
+        }
+        if self.rate_32_32 != 1_i64 << 32
+            || self.late_policy != LATE_DROP_PRESENTATION
+            || self.loop_count != 0
+            || self.start_policy != START_AFTER_MINIMUM_BUFFER
+        {
+            return Err(invalid("PLAY contains a non-baseline playback policy"));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Welcome {
     pub session_id: u64,
     pub session_tag: Vec<u8>,
     pub root_context_id: u64,
     pub display_generation: u64,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
     pub grid_columns: u64,
     pub grid_rows: u64,
+    pub cell_width: u32,
+    pub cell_height: u32,
     pub maximum_control_body: u32,
     pub accepted_profiles: Vec<String>,
     pub selected_major: u64,
@@ -233,6 +296,33 @@ pub struct NodeConfig {
     pub anchor_id: Option<u64>,
 }
 
+/// A rectangle in signed 32.32 cell coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipRect {
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+/// Complete scene-node configuration for callers that need positioning, ordering, visibility, or
+/// clipping. [`NodeConfig`] remains the compact compatibility helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneNodeConfig {
+    pub node_id: u64,
+    pub source_id: u64,
+    pub context_id: u64,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    pub text_layer: u64,
+    pub z_index: i64,
+    pub visible: bool,
+    pub anchor_id: Option<u64>,
+    pub clip: Option<ClipRect>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlEnvelope {
     pub request_id: u64,
@@ -253,6 +343,35 @@ pub struct Hello {
     pub required_features: Vec<u64>,
     pub optional_features: Vec<u64>,
     pub maximum_record_body: u32,
+}
+
+/// Configurable HELLO encoder input. This is used by bridges and presenters that are not Vivi and
+/// must advertise their exact feature set.
+pub struct HelloConfig<'a> {
+    pub minimum_major: u64,
+    pub minimum_minor: u64,
+    pub maximum_major: u64,
+    pub maximum_minor: u64,
+    pub token: &'a str,
+    pub producer: &'a str,
+    pub producer_version: &'a str,
+    pub required_features: &'a [u64],
+    pub optional_features: &'a [u64],
+    pub maximum_record_body: u32,
+}
+
+/// Configurable WELCOME encoder input for virtual or alternate presenters.
+pub struct WelcomeConfig<'a> {
+    pub session_id: u64,
+    pub session_tag: &'a [u8; 16],
+    pub root_context_id: u64,
+    pub capability_generation: u64,
+    pub display: DisplayChanged,
+    pub maximum_control_body: u32,
+    pub accepted_profiles: &'a [&'a str],
+    pub selected_major: u64,
+    pub selected_minor: u64,
+    pub accepted_features: &'a [u64],
 }
 
 #[derive(Debug, Clone)]
@@ -330,7 +449,7 @@ pub struct SourceLost {
     pub diagnostic: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedNodeConfig {
     pub node_id: u64,
     pub source_id: u64,
@@ -345,36 +464,70 @@ pub struct ParsedNodeConfig {
     pub anchor_id: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSceneNode {
+    pub node: ParsedNodeConfig,
+    pub clip: Option<ClipRect>,
+}
+
 pub fn hello(request_id: u64, token: &str) -> Vec<u8> {
+    const REQUIRED: &[u64] = &[
+        FEATURE_RASTER_RGBA8,
+        FEATURE_SCENE_TRANSACTIONS,
+        FEATURE_GRID_CELL_NODES,
+        FEATURE_CREDIT_FLOW_CONTROL,
+        FEATURE_TEXT_ANCHORS_V2,
+    ];
+    const OPTIONAL: &[u64] = &[
+        FEATURE_ENCODED_IMAGE_V1,
+        FEATURE_RASTER_ZSTD_V1,
+        FEATURE_RASTER_PREMULTIPLIED_ALPHA,
+        FEATURE_VISIBILITY_EVENTS_V1,
+        FEATURE_VIDEO_ACCESS_UNIT_V1,
+        FEATURE_VIDEO_CONTROL_V1,
+        FEATURE_AUDIO_ACCESS_UNIT_V1,
+    ];
+    encode_hello(
+        request_id,
+        &HelloConfig {
+            minimum_major: 1,
+            minimum_minor: 1,
+            maximum_major: 1,
+            maximum_minor: 1,
+            token,
+            producer: "vivi",
+            producer_version: env!("CARGO_PKG_VERSION"),
+            required_features: REQUIRED,
+            optional_features: OPTIONAL,
+            maximum_record_body: super::CONTROL_MAX_RECORD_BODY,
+        },
+    )
+}
+
+pub fn encode_hello(request_id: u64, config: &HelloConfig<'_>) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
         encoder.map(10);
-        key_u64(encoder, 0, 1);
-        key_u64(encoder, 1, 1);
-        key_u64(encoder, 2, 1);
-        key_u64(encoder, 3, 1);
+        key_u64(encoder, 0, config.minimum_major);
+        key_u64(encoder, 1, config.minimum_minor);
+        key_u64(encoder, 2, config.maximum_major);
+        key_u64(encoder, 3, config.maximum_minor);
         encoder.u64(4);
-        encoder.text(token);
+        encoder.text(config.token);
         encoder.u64(5);
-        encoder.text("vivi");
+        encoder.text(config.producer);
         encoder.u64(6);
-        encoder.text(env!("CARGO_PKG_VERSION"));
+        encoder.text(config.producer_version);
         encoder.u64(7);
-        encoder.array(5);
-        encoder.u64(FEATURE_RASTER_RGBA8);
-        encoder.u64(FEATURE_SCENE_TRANSACTIONS);
-        encoder.u64(FEATURE_GRID_CELL_NODES);
-        encoder.u64(FEATURE_CREDIT_FLOW_CONTROL);
-        encoder.u64(FEATURE_TEXT_ANCHORS_V2);
+        encoder.array(config.required_features.len());
+        for feature in config.required_features {
+            encoder.u64(*feature);
+        }
         encoder.u64(8);
-        encoder.array(7);
-        encoder.u64(FEATURE_ENCODED_IMAGE_V1);
-        encoder.u64(FEATURE_RASTER_ZSTD_V1);
-        encoder.u64(FEATURE_RASTER_PREMULTIPLIED_ALPHA);
-        encoder.u64(FEATURE_VISIBILITY_EVENTS_V1);
-        encoder.u64(FEATURE_VIDEO_ACCESS_UNIT_V1);
-        encoder.u64(FEATURE_VIDEO_CONTROL_V1);
-        encoder.u64(FEATURE_AUDIO_ACCESS_UNIT_V1);
-        key_u64(encoder, 9, u64::from(super::CONTROL_MAX_RECORD_BODY));
+        encoder.array(config.optional_features.len());
+        for feature in config.optional_features {
+            encoder.u64(*feature);
+        }
+        key_u64(encoder, 9, u64::from(config.maximum_record_body));
     })
 }
 
@@ -527,8 +680,31 @@ pub fn create_node_at(
     x: i64,
     y: i64,
 ) -> Vec<u8> {
+    create_scene_node(
+        request_id,
+        transaction_id,
+        &SceneNodeConfig {
+            node_id: node.node_id,
+            source_id: node.source_id,
+            context_id: node.context_id,
+            x,
+            y,
+            width: fixed_cells(node.columns),
+            height: fixed_cells(node.rows),
+            text_layer: TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
+            z_index: 0,
+            visible: true,
+            anchor_id: node.anchor_id,
+            clip: None,
+        },
+    )
+}
+
+pub fn create_scene_node(request_id: u64, transaction_id: u64, node: &SceneNodeConfig) -> Vec<u8> {
     envelope(request_id, Some(transaction_id), None, |encoder| {
-        encoder.map(if node.anchor_id.is_some() { 15 } else { 14 });
+        let field_count =
+            14 + usize::from(node.anchor_id.is_some()) + 4 * usize::from(node.clip.is_some());
+        encoder.map(field_count);
         key_u64(encoder, 0, node.node_id);
         key_u64(encoder, 1, node.source_id);
         key_u64(encoder, 2, node.context_id);
@@ -541,19 +717,25 @@ pub fn create_node_at(
                 COORDINATE_GRID_CELL
             },
         );
-        key_i64(encoder, 4, x);
-        key_i64(encoder, 5, y);
-        key_i64(encoder, 6, fixed_cells(node.columns));
-        key_i64(encoder, 7, fixed_cells(node.rows));
+        key_i64(encoder, 4, node.x);
+        key_i64(encoder, 5, node.y);
+        key_i64(encoder, 6, node.width);
+        key_i64(encoder, 7, node.height);
         key_u64(encoder, 8, FIT_CONTAIN);
         key_u64(encoder, 9, SAMPLING_LINEAR);
-        key_u64(encoder, 10, TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH);
-        key_i64(encoder, 11, 0);
+        key_u64(encoder, 10, node.text_layer);
+        key_i64(encoder, 11, node.z_index);
         key_u64(encoder, 12, BLEND_SOURCE_OVER);
         encoder.u64(13);
-        encoder.bool(true);
+        encoder.bool(node.visible);
         if let Some(anchor_id) = node.anchor_id {
             key_u64(encoder, 14, anchor_id);
+        }
+        if let Some(clip) = node.clip {
+            key_i64(encoder, 15, clip.x);
+            key_i64(encoder, 16, clip.y);
+            key_i64(encoder, 17, clip.width);
+            key_i64(encoder, 18, clip.height);
         }
     })
 }
@@ -604,18 +786,25 @@ pub fn commit_transaction(
     )
 }
 
-pub fn play(request_id: u64, source_id: u64, minimum_buffer_us: u64) -> Vec<u8> {
+pub fn play_request(request_id: u64, request: &PlayRequest) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
         encoder.map(8);
-        key_u64(encoder, 0, source_id);
-        key_i64(encoder, 1, 0);
-        key_u64(encoder, 2, minimum_buffer_us);
-        key_u64(encoder, 3, 500_000);
-        key_i64(encoder, 4, 1_i64 << 32);
-        key_u64(encoder, 5, LATE_DROP_PRESENTATION);
-        key_u64(encoder, 6, 0);
-        key_u64(encoder, 7, START_AFTER_MINIMUM_BUFFER);
+        key_u64(encoder, 0, request.source_id);
+        key_i64(encoder, 1, request.start_pts_us);
+        key_u64(encoder, 2, request.minimum_buffer_us);
+        key_u64(encoder, 3, request.maximum_latency_us);
+        key_i64(encoder, 4, request.rate_32_32);
+        key_u64(encoder, 5, request.late_policy);
+        key_u64(encoder, 6, request.loop_count);
+        key_u64(encoder, 7, request.start_policy);
     })
+}
+
+pub fn play(request_id: u64, source_id: u64, minimum_buffer_us: u64) -> Vec<u8> {
+    play_request(
+        request_id,
+        &PlayRequest::baseline(source_id, minimum_buffer_us),
+    )
 }
 
 pub fn eos(request_id: u64, source_id: u64, epoch: u32) -> Vec<u8> {
@@ -655,35 +844,62 @@ pub fn welcome(
     display: DisplayChanged,
     accepted_features: &[u64],
 ) -> Vec<u8> {
+    const BASE_PROFILES: &[&str] = &[
+        PROFILE_AUDIO_ACCESS_UNIT,
+        PROFILE_IMAGE_PNG_JPEG,
+        PROFILE_RASTER_RGBA8,
+        PROFILE_RASTER_ZSTD,
+        PROFILE_TEXT_ANCHOR_V2,
+        PROFILE_VIDEO_ACCESS_UNIT,
+        PROFILE_VISIBILITY,
+    ];
+    let mut profiles = BASE_PROFILES.to_vec();
+    if accepted_features.contains(&FEATURE_NODE_CLIP_RECT_V1) {
+        profiles.insert(2, PROFILE_NODE_CLIP_RECT);
+    }
+    encode_welcome(
+        request_id,
+        &WelcomeConfig {
+            session_id,
+            session_tag,
+            root_context_id,
+            capability_generation: 1,
+            display,
+            maximum_control_body: super::CONTROL_MAX_RECORD_BODY,
+            accepted_profiles: &profiles,
+            selected_major: 1,
+            selected_minor: 1,
+            accepted_features,
+        },
+    )
+}
+
+pub fn encode_welcome(request_id: u64, config: &WelcomeConfig<'_>) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
         encoder.map(16);
-        key_u64(encoder, 0, session_id);
+        key_u64(encoder, 0, config.session_id);
         encoder.u64(1);
-        encoder.bytes(session_tag);
-        key_u64(encoder, 2, root_context_id);
-        key_u64(encoder, 3, 1); // capability generation
-        key_u64(encoder, 4, display.display_generation);
-        key_u64(encoder, 5, u64::from(display.viewport_width));
-        key_u64(encoder, 6, u64::from(display.viewport_height));
-        key_u64(encoder, 7, u64::from(display.grid_columns));
-        key_u64(encoder, 8, u64::from(display.grid_rows));
-        key_u64(encoder, 9, u64::from(display.cell_width));
-        key_u64(encoder, 10, u64::from(display.cell_height));
-        key_u64(encoder, 11, u64::from(super::CONTROL_MAX_RECORD_BODY));
+        encoder.bytes(config.session_tag);
+        key_u64(encoder, 2, config.root_context_id);
+        key_u64(encoder, 3, config.capability_generation);
+        key_u64(encoder, 4, config.display.display_generation);
+        key_u64(encoder, 5, u64::from(config.display.viewport_width));
+        key_u64(encoder, 6, u64::from(config.display.viewport_height));
+        key_u64(encoder, 7, u64::from(config.display.grid_columns));
+        key_u64(encoder, 8, u64::from(config.display.grid_rows));
+        key_u64(encoder, 9, u64::from(config.display.cell_width));
+        key_u64(encoder, 10, u64::from(config.display.cell_height));
+        key_u64(encoder, 11, u64::from(config.maximum_control_body));
         encoder.u64(12);
-        encoder.array(7);
-        encoder.text(PROFILE_AUDIO_ACCESS_UNIT);
-        encoder.text(PROFILE_IMAGE_PNG_JPEG);
-        encoder.text(PROFILE_RASTER_RGBA8);
-        encoder.text(PROFILE_RASTER_ZSTD);
-        encoder.text(PROFILE_TEXT_ANCHOR_V2);
-        encoder.text(PROFILE_VIDEO_ACCESS_UNIT);
-        encoder.text(PROFILE_VISIBILITY);
-        key_u64(encoder, 13, 1);
-        key_u64(encoder, 14, 1);
+        encoder.array(config.accepted_profiles.len());
+        for profile in config.accepted_profiles {
+            encoder.text(profile);
+        }
+        key_u64(encoder, 13, config.selected_major);
+        key_u64(encoder, 14, config.selected_minor);
         encoder.u64(15);
-        encoder.array(accepted_features.len());
-        for feature in accepted_features {
+        encoder.array(config.accepted_features.len());
+        for feature in config.accepted_features {
             encoder.u64(*feature);
         }
     })
@@ -1034,7 +1250,14 @@ pub fn audio_config_supported(config: &ParsedAudioSourceConfig) -> bool {
         && config.extradata.len() <= MAX_AUDIO_EXTRADATA
         && config.max_access_unit_bytes > 0
         && config.max_access_unit_bytes <= MAX_AUDIO_ACCESS_UNIT_BYTES
-        && valid_audio_packetization(&config.codec, &config.packetization)
+        && validate_audio_initialization(
+            &config.codec,
+            &config.packetization,
+            &config.extradata,
+            config.sample_rate,
+            config.channels,
+        )
+        .is_ok()
 }
 
 pub fn valid_audio_packetization(codec: &str, packetization: &str) -> bool {
@@ -1042,13 +1265,214 @@ pub fn valid_audio_packetization(codec: &str, packetization: &str) -> bool {
         "mp3" => packetization == "mp3-frame-v1",
         "aac" => packetization == "aac-raw-au-v1",
         "alac" => packetization == "alac-frame-v1",
+        "opus" => packetization == AUDIO_PACKETIZATION_OPUS,
+        "vorbis" => packetization == AUDIO_PACKETIZATION_VORBIS,
+        "flac" => packetization == AUDIO_PACKETIZATION_FLAC,
         "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" | "pcm_f64le"
         | "pcm_mulaw" | "pcm_alaw" => packetization == "pcm-packet-v1",
         _ => false,
     }
 }
 
+/// Validate the canonical, container-independent initialization carried by CREATE_AUDIO.
+pub fn validate_audio_initialization(
+    codec: &str,
+    packetization: &str,
+    extradata: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> io::Result<()> {
+    if extradata.len() > MAX_AUDIO_EXTRADATA {
+        return Err(invalid("audio initialization data is too large"));
+    }
+    if !valid_audio_packetization(codec, packetization) {
+        return Err(invalid("unsupported audio codec/packetization pair"));
+    }
+    match codec {
+        "opus" => validate_opus_head(extradata, sample_rate, channels),
+        "vorbis" => validate_vorbis_headers(extradata, sample_rate, channels),
+        "flac" => validate_flac_streaminfo(extradata, sample_rate, channels),
+        _ => Ok(()),
+    }
+}
+
+pub fn validate_opus_head(head: &[u8], sample_rate: u32, channels: u16) -> io::Result<()> {
+    if sample_rate != 48_000 || head.len() < 19 || &head[..8] != b"OpusHead" {
+        return Err(invalid(
+            "invalid OpusHead signature, length, or decode rate",
+        ));
+    }
+    if head[8] > 15 || u16::from(head[9]) != channels || channels == 0 {
+        return Err(invalid("OpusHead version or channel count is unsupported"));
+    }
+    match head[18] {
+        0 if head.len() == 19 && channels <= 2 => Ok(()),
+        1 => {
+            let expected = 21_usize
+                .checked_add(usize::from(channels))
+                .ok_or_else(|| invalid("OpusHead channel mapping length overflow"))?;
+            if head.len() != expected {
+                return Err(invalid(
+                    "OpusHead family-1 channel mapping length is invalid",
+                ));
+            }
+            let streams = head[19];
+            let coupled = head[20];
+            let coded_channels = streams.checked_add(coupled).unwrap_or(0);
+            if streams == 0
+                || coupled > streams
+                || coded_channels == 0
+                || u16::from(coded_channels) > channels
+                || head[21..]
+                    .iter()
+                    .any(|mapping| *mapping != 255 && *mapping >= coded_channels)
+            {
+                return Err(invalid("OpusHead family-1 mapping is invalid"));
+            }
+            Ok(())
+        }
+        _ => Err(invalid("unsupported OpusHead mapping family")),
+    }
+}
+
+pub fn validate_vorbis_headers(private: &[u8], sample_rate: u32, channels: u16) -> io::Result<()> {
+    if private.first() != Some(&2) {
+        return Err(invalid(
+            "Vorbis initialization is not three-header Xiph lacing",
+        ));
+    }
+    let mut cursor = 1_usize;
+    let first = xiph_laced_length(private, &mut cursor)?;
+    let second = xiph_laced_length(private, &mut cursor)?;
+    let header_bytes = first
+        .checked_add(second)
+        .and_then(|length| length.checked_add(cursor))
+        .ok_or_else(|| invalid("Vorbis header lengths overflow"))?;
+    if header_bytes >= private.len() {
+        return Err(invalid("Vorbis headers are truncated"));
+    }
+    let first_end = cursor + first;
+    let second_end = first_end + second;
+    let identification = &private[cursor..first_end];
+    let comments = &private[first_end..second_end];
+    let setup = &private[second_end..];
+    let block_sizes = identification.get(28).copied().unwrap_or(0);
+    let small_block = block_sizes & 0x0f;
+    let large_block = block_sizes >> 4;
+    if identification.len() != 30
+        || !identification.starts_with(b"\x01vorbis")
+        || !comments.starts_with(b"\x03vorbis")
+        || !setup.starts_with(b"\x05vorbis")
+        || identification[7..11] != [0, 0, 0, 0]
+        || u16::from(identification[11]) != channels
+        || u32::from_le_bytes(identification[12..16].try_into().unwrap()) != sample_rate
+        || !(6..=13).contains(&small_block)
+        || !(small_block..=13).contains(&large_block)
+        || identification[29] != 1
+        || !valid_vorbis_comment_header(comments)
+    {
+        return Err(invalid(
+            "Vorbis identification or header signatures are invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_vorbis_comment_header(header: &[u8]) -> bool {
+    let mut cursor = 7_usize;
+    let Some(vendor_length) = take_vorbis_length(header, &mut cursor) else {
+        return false;
+    };
+    let Some(after_vendor) = cursor.checked_add(vendor_length) else {
+        return false;
+    };
+    if after_vendor > header.len() {
+        return false;
+    }
+    cursor = after_vendor;
+    let Some(comment_count) = take_vorbis_length(header, &mut cursor) else {
+        return false;
+    };
+    if comment_count > header.len().saturating_sub(cursor).saturating_sub(1) / 4 {
+        return false;
+    }
+    for _ in 0..comment_count {
+        let Some(length) = take_vorbis_length(header, &mut cursor) else {
+            return false;
+        };
+        let Some(next) = cursor.checked_add(length) else {
+            return false;
+        };
+        if next > header.len() {
+            return false;
+        }
+        cursor = next;
+    }
+    header.get(cursor) == Some(&1) && cursor + 1 == header.len()
+}
+
+fn take_vorbis_length(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
+    let end = cursor.checked_add(4)?;
+    let length = u32::from_le_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+    *cursor = end;
+    usize::try_from(length).ok()
+}
+
+fn xiph_laced_length(bytes: &[u8], cursor: &mut usize) -> io::Result<usize> {
+    let mut length = 0_usize;
+    loop {
+        let value = *bytes
+            .get(*cursor)
+            .ok_or_else(|| invalid("truncated Xiph-laced length"))?;
+        *cursor += 1;
+        length = length
+            .checked_add(usize::from(value))
+            .ok_or_else(|| invalid("Xiph-laced length overflow"))?;
+        if value != 255 {
+            return Ok(length);
+        }
+    }
+}
+
+pub fn validate_flac_streaminfo(
+    streaminfo: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> io::Result<()> {
+    if streaminfo.len() != 34 {
+        return Err(invalid(
+            "FLAC initialization is not a raw 34-byte STREAMINFO",
+        ));
+    }
+    let minimum_block = u16::from_be_bytes(streaminfo[0..2].try_into().unwrap());
+    let maximum_block = u16::from_be_bytes(streaminfo[2..4].try_into().unwrap());
+    let packed = u64::from_be_bytes(streaminfo[10..18].try_into().unwrap());
+    let header_rate = ((packed >> 44) & 0x000f_ffff) as u32;
+    let header_channels = ((packed >> 41) & 0x7) as u16 + 1;
+    let bits_per_sample = ((packed >> 36) & 0x1f) as u8 + 1;
+    if minimum_block < 16
+        || maximum_block < minimum_block
+        || header_rate == 0
+        || header_rate != sample_rate
+        || header_channels != channels
+        || !(4..=32).contains(&bits_per_sample)
+    {
+        return Err(invalid("FLAC STREAMINFO configuration is invalid"));
+    }
+    Ok(())
+}
+
 pub fn parse_create_node(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedNodeConfig)> {
+    let (envelope, scene_node) = parse_scene_node(body)?;
+    if scene_node.clip.is_some() {
+        return Err(invalid(
+            "clipped node requires parse_scene_node; refusing to discard clip fields",
+        ));
+    }
+    Ok((envelope, scene_node.node))
+}
+
+pub fn parse_scene_node(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedSceneNode)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
     let coordinate_space = required_u64(payload, 3, "coordinate space")?;
@@ -1086,7 +1510,29 @@ pub fn parse_create_node(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedNode
     if parsed.width <= 0 || parsed.height <= 0 {
         return Err(invalid("node dimensions must be positive"));
     }
-    Ok((envelope.clone(), parsed))
+    let clip_values = [15_u64, 16, 17, 18].map(|key| payload.map_value(key));
+    let clip_count = clip_values.iter().filter(|value| value.is_some()).count();
+    let clip = match clip_count {
+        0 => None,
+        4 => {
+            let clip = ClipRect {
+                x: required_i64(payload, 15, "clip x")?,
+                y: required_i64(payload, 16, "clip y")?,
+                width: required_i64(payload, 17, "clip width")?,
+                height: required_i64(payload, 18, "clip height")?,
+            };
+            if clip.width <= 0 || clip.height <= 0 {
+                return Err(invalid("clip dimensions must be positive"));
+            }
+            if clip.x.checked_add(clip.width).is_none() || clip.y.checked_add(clip.height).is_none()
+            {
+                return Err(invalid("clip rectangle overflows coordinate space"));
+            }
+            Some(clip)
+        }
+        _ => return Err(invalid("clip rectangle is incomplete")),
+    };
+    Ok((envelope, ParsedSceneNode { node: parsed, clip }))
 }
 
 pub fn parse_anchor_event(body: &[u8]) -> io::Result<u64> {
@@ -1098,10 +1544,32 @@ pub fn parse_update_node(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedNode
     parse_create_node(body)
 }
 
+pub fn parse_update_scene_node(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedSceneNode)> {
+    parse_scene_node(body)
+}
+
 pub fn parse_object_id(body: &[u8], description: &str) -> io::Result<(ControlEnvelope, u64)> {
     let envelope = decode_control(body)?;
     let object_id = required_u64(&envelope.payload, 0, description)?;
     Ok((envelope, object_id))
+}
+
+pub fn parse_play(body: &[u8]) -> io::Result<(ControlEnvelope, PlayRequest)> {
+    let envelope = decode_control(body)?;
+    let payload = &envelope.payload;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7])?;
+    let request = PlayRequest {
+        source_id: required_u64(payload, 0, "PLAY source ID")?,
+        start_pts_us: required_i64(payload, 1, "PLAY start PTS")?,
+        minimum_buffer_us: required_u64(payload, 2, "PLAY minimum buffer")?,
+        maximum_latency_us: required_u64(payload, 3, "PLAY maximum latency")?,
+        rate_32_32: required_i64(payload, 4, "PLAY rate")?,
+        late_policy: required_u64(payload, 5, "PLAY late policy")?,
+        loop_count: required_u64(payload, 6, "PLAY loop count")?,
+        start_policy: required_u64(payload, 7, "PLAY start policy")?,
+    }
+    .validate()?;
+    Ok((envelope, request))
 }
 
 pub fn parse_eos(body: &[u8]) -> io::Result<(ControlEnvelope, u64, u32)> {
@@ -1127,8 +1595,12 @@ pub fn parse_welcome(body: &[u8]) -> io::Result<Welcome> {
         session_tag: required_bytes(&payload, 1, "session tag")?.to_vec(),
         root_context_id: required_u64(&payload, 2, "root context ID")?,
         display_generation: required_u64(&payload, 4, "display generation")?,
+        viewport_width: required_u32(&payload, 5, "viewport width")?,
+        viewport_height: required_u32(&payload, 6, "viewport height")?,
         grid_columns: required_u64(&payload, 7, "grid columns")?,
         grid_rows: required_u64(&payload, 8, "grid rows")?,
+        cell_width: required_u32(&payload, 9, "cell width")?,
+        cell_height: required_u32(&payload, 10, "cell height")?,
         maximum_control_body: required_u32(&payload, 11, "maximum control body")?,
         accepted_profiles: text_array(&payload, 12, "accepted profiles")?,
         selected_major: required_u64(&payload, 13, "selected protocol major")?,
@@ -1138,6 +1610,12 @@ pub fn parse_welcome(body: &[u8]) -> io::Result<Welcome> {
     if welcome.session_id == 0
         || welcome.root_context_id == 0
         || welcome.session_tag.len() != 16
+        || welcome.viewport_width == 0
+        || welcome.viewport_height == 0
+        || welcome.grid_columns == 0
+        || welcome.grid_rows == 0
+        || welcome.cell_width == 0
+        || welcome.cell_height == 0
         || welcome.maximum_control_body == 0
         || welcome.maximum_control_body > super::CONTROL_MAX_RECORD_BODY
         || (welcome.selected_major, welcome.selected_minor) != (1, 1)
@@ -1530,6 +2008,117 @@ mod tests {
     }
 
     #[test]
+    fn clipped_scene_nodes_round_trip_without_changing_legacy_nodes() {
+        let config = SceneNodeConfig {
+            node_id: 3,
+            source_id: 4,
+            context_id: 5,
+            x: -(1_i64 << 31),
+            y: 1_i64 << 31,
+            width: 10_i64 << 32,
+            height: 6_i64 << 32,
+            text_layer: TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
+            z_index: -2,
+            visible: true,
+            anchor_id: Some(9),
+            clip: Some(ClipRect {
+                x: 1_i64 << 31,
+                y: -(1_i64 << 31),
+                width: 4_i64 << 32,
+                height: 3_i64 << 32,
+            }),
+        };
+        let body = create_scene_node(1, 2, &config);
+        assert_eq!(
+            body,
+            create_scene_node(1, 2, &config),
+            "CBOR must be deterministic"
+        );
+        let (envelope, parsed) = parse_scene_node(&body).unwrap();
+        assert_eq!(envelope.transaction_id, Some(2));
+        assert_eq!(parsed.node.node_id, config.node_id);
+        assert_eq!(parsed.node.anchor_id, Some(9));
+        assert_eq!(parsed.clip, config.clip);
+        assert!(
+            parse_create_node(&body).is_err(),
+            "legacy parser must not drop clipping"
+        );
+
+        let legacy = create_node(
+            2,
+            3,
+            NodeConfig {
+                node_id: 4,
+                source_id: 5,
+                context_id: 6,
+                columns: 2,
+                rows: 2,
+                anchor_id: None,
+            },
+        );
+        assert!(parse_create_node(&legacy).is_ok());
+        assert_eq!(parse_scene_node(&legacy).unwrap().1.clip, None);
+    }
+
+    #[test]
+    fn clipped_scene_nodes_reject_invalid_geometry() {
+        let base = SceneNodeConfig {
+            node_id: 1,
+            source_id: 2,
+            context_id: 3,
+            x: 0,
+            y: 0,
+            width: 1_i64 << 32,
+            height: 1_i64 << 32,
+            text_layer: TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
+            z_index: 0,
+            visible: true,
+            anchor_id: None,
+            clip: Some(ClipRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 1_i64 << 32,
+            }),
+        };
+        assert!(parse_scene_node(&create_scene_node(1, 1, &base)).is_err());
+        let overflow = SceneNodeConfig {
+            clip: Some(ClipRect {
+                x: i64::MAX,
+                width: 1,
+                height: 1,
+                y: 0,
+            }),
+            ..base
+        };
+        assert!(parse_scene_node(&create_scene_node(1, 1, &overflow)).is_err());
+    }
+
+    #[test]
+    fn configurable_hello_advertises_exact_identity_and_features() {
+        let body = encode_hello(
+            7,
+            &HelloConfig {
+                minimum_major: 1,
+                minimum_minor: 1,
+                maximum_major: 1,
+                maximum_minor: 1,
+                token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                producer: "vvmux",
+                producer_version: "0.1.0",
+                required_features: &[FEATURE_NODE_CLIP_RECT_V1],
+                optional_features: &[],
+                maximum_record_body: 4096,
+            },
+        );
+        let (_, hello) = parse_hello(&body).unwrap();
+        assert_eq!(hello.producer, "vvmux");
+        assert_eq!(hello.required_features, [FEATURE_NODE_CLIP_RECT_V1]);
+        assert!(hello.optional_features.is_empty());
+        assert_eq!(hello.maximum_record_body, 4096);
+    }
+
+    #[test]
     fn server_parses_client_raster_and_node_messages() {
         let (_, raster) = parse_create_raster(&create_raster(7, 10, 640, 480)).unwrap();
         assert_eq!(
@@ -1587,6 +2176,10 @@ mod tests {
         ];
         let parsed = parse_welcome(&welcome(7, 9, &[1; 16], 10, display, &features)).unwrap();
         assert_eq!((parsed.selected_major, parsed.selected_minor), (1, 1));
+        assert_eq!(parsed.viewport_width, 800);
+        assert_eq!(parsed.viewport_height, 600);
+        assert_eq!(parsed.cell_width, 10);
+        assert_eq!(parsed.cell_height, 25);
         assert_eq!(
             parsed.maximum_control_body,
             super::super::CONTROL_MAX_RECORD_BODY
@@ -1701,5 +2294,92 @@ mod tests {
         };
         let (_, parsed) = parse_create_audio(&probe_audio_config(9, &oversized)).unwrap();
         assert!(!audio_config_supported(&parsed));
+    }
+
+    #[test]
+    fn play_request_round_trip_and_policy_validation() {
+        let request = PlayRequest {
+            source_id: 19,
+            start_pts_us: -25_000,
+            minimum_buffer_us: 125_000,
+            maximum_latency_us: 500_000,
+            rate_32_32: 1_i64 << 32,
+            late_policy: LATE_DROP_PRESENTATION,
+            loop_count: 0,
+            start_policy: START_AFTER_MINIMUM_BUFFER,
+        };
+        let (envelope, parsed) = parse_play(&play_request(41, &request)).unwrap();
+        assert_eq!(envelope.request_id, 41);
+        assert_eq!(parsed, request);
+
+        assert!(
+            PlayRequest {
+                source_id: 0,
+                ..request
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            PlayRequest {
+                maximum_latency_us: 1,
+                ..request
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            PlayRequest {
+                loop_count: 1,
+                ..request
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rtt_buffer_formula_preserves_unsampled_requests_and_caps_samples() {
+        assert_eq!(minimum_buffer_for_rtt(90_000, None), 90_000);
+        assert_eq!(minimum_buffer_for_rtt(90_000, Some(10_000)), 90_000);
+        assert_eq!(minimum_buffer_for_rtt(10_000, Some(50_000)), 125_000);
+        assert_eq!(minimum_buffer_for_rtt(10_000, Some(u64::MAX)), 500_000);
+    }
+
+    #[test]
+    fn canonical_portable_audio_initialization_is_validated() {
+        let mut opus = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        assert_eq!(opus.len(), 19);
+        validate_opus_head(&opus, 48_000, 2).unwrap();
+        opus[18] = 2;
+        assert!(validate_opus_head(&opus, 48_000, 2).is_err());
+
+        let mut identification = vec![0; 30];
+        identification[..7].copy_from_slice(b"\x01vorbis");
+        identification[11] = 2;
+        identification[12..16].copy_from_slice(&48_000_u32.to_le_bytes());
+        identification[28] = 0x86;
+        identification[29] = 1;
+        let mut comments = b"\x03vorbis".to_vec();
+        comments.extend_from_slice(&0_u32.to_le_bytes());
+        comments.extend_from_slice(&0_u32.to_le_bytes());
+        comments.push(1);
+        let setup = b"\x05vorbis-setup";
+        let mut vorbis = vec![2, identification.len() as u8, comments.len() as u8];
+        vorbis.extend_from_slice(&identification);
+        vorbis.extend_from_slice(&comments);
+        vorbis.extend_from_slice(setup);
+        validate_vorbis_headers(&vorbis, 48_000, 2).unwrap();
+        assert!(validate_vorbis_headers(&vorbis, 44_100, 2).is_err());
+
+        let mut streaminfo = [0_u8; 34];
+        streaminfo[0..2].copy_from_slice(&4096_u16.to_be_bytes());
+        streaminfo[2..4].copy_from_slice(&4096_u16.to_be_bytes());
+        let packed = (u64::from(48_000_u32) << 44)
+            | (u64::from(2_u16 - 1) << 41)
+            | (u64::from(16_u8 - 1) << 36);
+        streaminfo[10..18].copy_from_slice(&packed.to_be_bytes());
+        validate_flac_streaminfo(&streaminfo, 48_000, 2).unwrap();
+        assert!(validate_flac_streaminfo(&streaminfo[..33], 48_000, 2).is_err());
     }
 }

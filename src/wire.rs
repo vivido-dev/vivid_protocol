@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::{DEFAULT_MAX_RECORD_BODY, FRAMING_MAJOR, FRAMING_MINOR, HARD_MAX_RECORD_BODY};
@@ -132,7 +133,7 @@ impl Endpoint {
         Ok(Self::Unix(path))
     }
 
-    fn connect(&self) -> io::Result<Box<dyn ReadWrite>> {
+    fn connect(&self) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
         match self {
             Self::Unix(path) => connect_unix(path),
             Self::Tcp(address) => {
@@ -140,87 +141,53 @@ impl Endpoint {
                 stream.set_read_timeout(Some(Duration::from_secs(30)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(30)))?;
                 stream.set_nodelay(true)?;
-                Ok(Box::new(stream))
+                let writer = stream.try_clone()?;
+                Ok((Box::new(stream), Box::new(writer)))
             }
         }
     }
 }
 
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
-
 #[cfg(unix)]
-fn connect_unix(path: &Path) -> io::Result<Box<dyn ReadWrite>> {
+fn connect_unix(path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     use std::os::unix::net::UnixStream;
 
     let stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    Ok(Box::new(stream))
+    let writer = stream.try_clone()?;
+    Ok((Box::new(stream), Box::new(writer)))
 }
 
 #[cfg(not(unix))]
-fn connect_unix(_path: &Path) -> io::Result<Box<dyn ReadWrite>> {
+fn connect_unix(_path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Unix Vivid endpoints are not supported on this platform; named-pipe support is pending",
     ))
 }
 
-enum ConnectionIo {
-    Live(Box<dyn ReadWrite>),
+enum WriterIo {
+    Live(Box<dyn Write + Send>),
     Trace(File),
     Sink(io::Sink),
 }
 
-pub struct Connection {
-    io: ConnectionIo,
+struct WriterState {
+    io: WriterIo,
     send_sequence: u64,
-    receive_sequence: u64,
     send_body_limit: u32,
-    receive_body_limit: u32,
 }
 
-impl Connection {
-    pub fn open(endpoint: &Endpoint, kind: ConnectionKind) -> io::Result<Self> {
-        let stream = endpoint.connect()?;
-        Self::new(ConnectionIo::Live(stream), kind)
-    }
+/// Cloneable, sequence-safe half of a Vivid connection.
+#[derive(Clone)]
+pub struct ConnectionWriter {
+    state: Arc<Mutex<WriterState>>,
+}
 
-    pub fn trace(path: &Path, kind: ConnectionKind) -> io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = File::create(path)?;
-        Self::new(ConnectionIo::Trace(file), kind)
-    }
-
-    pub fn sink(kind: ConnectionKind) -> io::Result<Self> {
-        Self::new(ConnectionIo::Sink(io::sink()), kind)
-    }
-
-    fn new(mut io: ConnectionIo, kind: ConnectionKind) -> io::Result<Self> {
-        write_io(&mut io, &encode_preface(kind, DEFAULT_MAX_RECORD_BODY))?;
-        flush_io(&mut io)?;
-        Ok(Self {
-            io,
-            send_sequence: 0,
-            receive_sequence: 0,
-            send_body_limit: if kind == ConnectionKind::Control {
-                super::CONTROL_MAX_RECORD_BODY
-            } else {
-                DEFAULT_MAX_RECORD_BODY
-            },
-            receive_body_limit: if kind == ConnectionKind::Control {
-                super::CONTROL_MAX_RECORD_BODY
-            } else {
-                DEFAULT_MAX_RECORD_BODY
-            },
-        })
-    }
-
+impl ConnectionWriter {
     pub fn write_record(
-        &mut self,
+        &self,
         record_type: u16,
         flags: u16,
         object_id: u64,
@@ -234,14 +201,17 @@ impl Connection {
         }
         let body_length = u32::try_from(body.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record body exceeds u32"))?;
-        if body_length > self.send_body_limit || body_length > HARD_MAX_RECORD_BODY {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if body_length > state.send_body_limit || body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("record body of {body_length} bytes exceeds negotiated maximum"),
             ));
         }
-
-        self.send_sequence = self.send_sequence.checked_add(1).ok_or_else(|| {
+        state.send_sequence = state.send_sequence.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "record sequence exhausted")
         })?;
         let header = RecordHeader {
@@ -249,45 +219,49 @@ impl Connection {
             record_type,
             flags,
             object_id,
-            sequence: self.send_sequence,
+            sequence: state.send_sequence,
         };
-        write_io(&mut self.io, &header.encode())?;
-        write_io(&mut self.io, body)?;
-        flush_io(&mut self.io)
+        write_writer(&mut state.io, &header.encode())?;
+        write_writer(&mut state.io, body)?;
+        flush_writer(&mut state.io)
     }
 
-    pub fn set_send_body_limit(&mut self, maximum: u32) -> io::Result<()> {
-        if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid record-body limit",
-            ));
-        }
-        self.send_body_limit = maximum;
+    pub fn set_send_body_limit(&self, maximum: u32) -> io::Result<()> {
+        validate_body_limit(maximum)?;
+        self.state
+            .lock()
+            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?
+            .send_body_limit = maximum;
         Ok(())
     }
 
+    fn write_raw_preface(&self, preface: &[u8; PREFACE_SIZE]) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        write_writer(&mut state.io, preface)?;
+        flush_writer(&mut state.io)
+    }
+}
+
+/// Blocking receive half of a live Vivid connection.
+pub struct ConnectionReader {
+    io: Box<dyn Read + Send>,
+    receive_sequence: u64,
+    receive_body_limit: u32,
+}
+
+impl ConnectionReader {
     pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
-        if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid record-body limit",
-            ));
-        }
+        validate_body_limit(maximum)?;
         self.receive_body_limit = maximum;
         Ok(())
     }
 
     pub fn read_record(&mut self) -> io::Result<Record> {
-        let ConnectionIo::Live(stream) = &mut self.io else {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "trace connections do not have presenter replies",
-            ));
-        };
-
         let mut header = [0_u8; HEADER_SIZE];
-        stream.read_exact(&mut header)?;
+        self.io.read_exact(&mut header)?;
         let header = RecordHeader::decode(header);
         if header.flags & !RECORD_KNOWN_FLAGS != 0 {
             return Err(io::Error::new(
@@ -315,9 +289,8 @@ impl Connection {
             ));
         }
         self.receive_sequence = header.sequence;
-
         let mut body = vec![0; header.body_length as usize];
-        stream.read_exact(&mut body)?;
+        self.io.read_exact(&mut body)?;
         Ok(Record {
             record_type: header.record_type,
             flags: header.flags,
@@ -325,6 +298,116 @@ impl Connection {
             sequence: header.sequence,
             body,
         })
+    }
+}
+
+pub struct Connection {
+    reader: Option<ConnectionReader>,
+    writer: ConnectionWriter,
+}
+
+impl Connection {
+    pub fn open(endpoint: &Endpoint, kind: ConnectionKind) -> io::Result<Self> {
+        let (reader, writer) = endpoint.connect()?;
+        Self::new(Some(reader), WriterIo::Live(writer), kind)
+    }
+
+    pub fn trace(path: &Path, kind: ConnectionKind) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Self::new(None, WriterIo::Trace(File::create(path)?), kind)
+    }
+
+    pub fn sink(kind: ConnectionKind) -> io::Result<Self> {
+        Self::new(None, WriterIo::Sink(io::sink()), kind)
+    }
+
+    fn new(
+        reader: Option<Box<dyn Read + Send>>,
+        io: WriterIo,
+        kind: ConnectionKind,
+    ) -> io::Result<Self> {
+        let body_limit = if kind == ConnectionKind::Control {
+            super::CONTROL_MAX_RECORD_BODY
+        } else {
+            DEFAULT_MAX_RECORD_BODY
+        };
+        let writer = ConnectionWriter {
+            state: Arc::new(Mutex::new(WriterState {
+                io,
+                send_sequence: 0,
+                send_body_limit: body_limit,
+            })),
+        };
+        writer.write_raw_preface(&encode_preface(kind, DEFAULT_MAX_RECORD_BODY))?;
+        Ok(Self {
+            reader: reader.map(|io| ConnectionReader {
+                io,
+                receive_sequence: 0,
+                receive_body_limit: body_limit,
+            }),
+            writer,
+        })
+    }
+
+    pub fn split(self) -> io::Result<(ConnectionReader, ConnectionWriter)> {
+        let reader = self.reader.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "trace connections do not have presenter replies",
+            )
+        })?;
+        Ok((reader, self.writer))
+    }
+
+    pub fn writer(&self) -> ConnectionWriter {
+        self.writer.clone()
+    }
+
+    pub fn write_record(
+        &mut self,
+        record_type: u16,
+        flags: u16,
+        object_id: u64,
+        body: &[u8],
+    ) -> io::Result<()> {
+        self.writer
+            .write_record(record_type, flags, object_id, body)
+    }
+
+    pub fn set_send_body_limit(&mut self, maximum: u32) -> io::Result<()> {
+        self.writer.set_send_body_limit(maximum)
+    }
+
+    pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
+        self.reader
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "connection has no reader"))?
+            .set_receive_body_limit(maximum)
+    }
+
+    pub fn read_record(&mut self) -> io::Result<Record> {
+        self.reader
+            .as_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "trace connections do not have presenter replies",
+                )
+            })?
+            .read_record()
+    }
+}
+
+fn validate_body_limit(maximum: u32) -> io::Result<()> {
+    if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid record-body limit",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -341,19 +424,19 @@ impl DirectionalLimits {
     }
 }
 
-fn write_io(io: &mut ConnectionIo, bytes: &[u8]) -> io::Result<()> {
+fn write_writer(io: &mut WriterIo, bytes: &[u8]) -> io::Result<()> {
     match io {
-        ConnectionIo::Live(stream) => stream.write_all(bytes),
-        ConnectionIo::Trace(file) => file.write_all(bytes),
-        ConnectionIo::Sink(sink) => sink.write_all(bytes),
+        WriterIo::Live(stream) => stream.write_all(bytes),
+        WriterIo::Trace(file) => file.write_all(bytes),
+        WriterIo::Sink(sink) => sink.write_all(bytes),
     }
 }
 
-fn flush_io(io: &mut ConnectionIo) -> io::Result<()> {
+fn flush_writer(io: &mut WriterIo) -> io::Result<()> {
     match io {
-        ConnectionIo::Live(stream) => stream.flush(),
-        ConnectionIo::Trace(file) => file.flush(),
-        ConnectionIo::Sink(sink) => sink.flush(),
+        WriterIo::Live(stream) => stream.flush(),
+        WriterIo::Trace(file) => file.flush(),
+        WriterIo::Sink(sink) => sink.flush(),
     }
 }
 
@@ -411,6 +494,20 @@ pub fn encode_preface(kind: ConnectionKind, maximum: u32) -> [u8; PREFACE_SIZE] 
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct SharedBytes(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBytes {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn preface_matches_protocol_layout() {
         let preface = encode_preface(ConnectionKind::Video, 0x0102_0304);
@@ -443,6 +540,53 @@ mod tests {
     fn connection_rejects_reserved_record_flags() {
         let mut connection = Connection::sink(ConnectionKind::Control).unwrap();
         assert!(connection.write_record(1, 2, 0, &[]).is_err());
+    }
+
+    #[test]
+    fn cloned_writers_serialize_complete_records_and_sequences() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = ConnectionWriter {
+            state: Arc::new(Mutex::new(WriterState {
+                io: WriterIo::Live(Box::new(SharedBytes(bytes.clone()))),
+                send_sequence: 0,
+                send_body_limit: 16,
+            })),
+        };
+        let first = writer.clone();
+        let second = writer.clone();
+        let one = std::thread::spawn(move || first.write_record(0x10, 0, 1, &[0xaa]));
+        let two = std::thread::spawn(move || second.write_record(0x20, 0, 2, &[0xbb]));
+        one.join().unwrap().unwrap();
+        two.join().unwrap().unwrap();
+
+        let bytes = bytes.lock().unwrap();
+        assert_eq!(bytes.len(), 2 * (HEADER_SIZE + 1));
+        let first = RecordHeader::decode(bytes[..HEADER_SIZE].try_into().unwrap());
+        let second_offset = HEADER_SIZE + usize::try_from(first.body_length).unwrap();
+        let second = RecordHeader::decode(
+            bytes[second_offset..second_offset + HEADER_SIZE]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!((first.sequence, second.sequence), (1, 2));
+        assert_eq!(first.body_length, 1);
+        assert_eq!(second.body_length, 1);
+        assert_eq!(
+            bytes[HEADER_SIZE],
+            if first.record_type == 0x10 {
+                0xaa
+            } else {
+                0xbb
+            }
+        );
+        assert_eq!(
+            bytes[second_offset + HEADER_SIZE],
+            if second.record_type == 0x10 {
+                0xaa
+            } else {
+                0xbb
+            }
+        );
     }
 
     #[test]
