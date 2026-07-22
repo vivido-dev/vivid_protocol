@@ -1,4 +1,4 @@
-//! Authenticated Vivid 1.1 text-anchor marker codec.
+//! Authenticated Vivid 1.0 text-anchor marker codec.
 
 use std::fmt;
 

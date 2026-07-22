@@ -1,6 +1,6 @@
 [package]
 name = "vivid_protocol"
-version = "1.2.1"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
@@ -11,11 +11,18 @@ keywords = ["terminal", "graphics", "media", "protocol", "cbor"]
 categories = ["encoding", "multimedia", "network-programming"]
 include = ["Cargo.toml", "README.md", "src/**/*.rs"]
 
+[features]
+default = ["native"]
+native = ["dep:zstd", "dep:zstd-safe"]
+
 [dependencies]
 base64 = "0.22"
 hmac = "0.13"
 sha2 = "0.11"
 subtle = "2.6"
 zeroize = { version = "1.8", features = ["derive"] }
-zstd = "0.13"
-zstd-safe = "7.2"
+zstd = { version = "0.13", optional = true }
+zstd-safe = { version = "7.2", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ruzstd = "0.8"

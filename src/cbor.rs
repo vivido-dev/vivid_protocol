@@ -119,6 +119,10 @@ impl Encoder {
         self.bytes.push(if value { 0xf5 } else { 0xf4 });
     }
 
+    pub fn null(&mut self) {
+        self.bytes.push(0xf6);
+    }
+
     fn major_length(&mut self, major: u8, value: u64) {
         let prefix = major << 5;
         if value <= 23 {
@@ -136,6 +140,81 @@ impl Encoder {
             self.bytes.push(prefix | 27);
             self.bytes.extend_from_slice(&value.to_be_bytes());
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeError(String);
+
+impl Display for EncodeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+/// Encode a value using the canonical Vivid CBOR subset.
+pub fn encode(value: &Value) -> Result<Vec<u8>, EncodeError> {
+    let mut encoder = Encoder::new();
+    encode_value(&mut encoder, value, 0)?;
+    Ok(encoder.into_vec())
+}
+
+fn encode_value(encoder: &mut Encoder, value: &Value, depth: usize) -> Result<(), EncodeError> {
+    if depth > MAX_DEPTH {
+        return Err(EncodeError("CBOR nesting exceeds 16 levels".into()));
+    }
+    match value {
+        Value::Unsigned(value) => encoder.u64(*value),
+        Value::Negative(value) => encoder.i64(*value),
+        Value::Bytes(value) => {
+            validate_value_length(value.len())?;
+            encoder.bytes(value);
+        }
+        Value::Text(value) => {
+            validate_value_length(value.len())?;
+            encoder.text(value);
+        }
+        Value::Array(values) => {
+            validate_container_length(values.len())?;
+            encoder.array(values.len());
+            for value in values {
+                encode_value(encoder, value, depth + 1)?;
+            }
+        }
+        Value::Map(entries) => {
+            validate_container_length(entries.len())?;
+            if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+                return Err(EncodeError("CBOR map keys are not strictly sorted".into()));
+            }
+            encoder.map(entries.len());
+            for (key, value) in entries {
+                encoder.u64(*key);
+                encode_value(encoder, value, depth + 1)?;
+            }
+        }
+        Value::Bool(value) => encoder.bool(*value),
+        Value::Null => encoder.null(),
+    }
+    Ok(())
+}
+
+fn validate_value_length(length: usize) -> Result<(), EncodeError> {
+    if length > MAX_VALUE_LENGTH {
+        Err(EncodeError(
+            "CBOR value exceeds configured length limit".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_container_length(length: usize) -> Result<(), EncodeError> {
+    if length > MAX_CONTAINER_LENGTH {
+        Err(EncodeError("CBOR container exceeds 4096 items".into()))
+    } else {
+        Ok(())
     }
 }
 
@@ -359,6 +438,23 @@ mod tests {
         let mut encoder = Encoder::new();
         encoder.i64(i64::MIN);
         assert_eq!(decode(&encoder.into_vec()), Ok(Value::Negative(i64::MIN)));
+    }
+
+    #[test]
+    fn generic_encoder_is_canonical_and_round_trips_null() {
+        let value = Value::Map(vec![
+            (0, Value::Unsigned(42)),
+            (1, Value::Array(vec![Value::Bool(true), Value::Null])),
+        ]);
+        let bytes = encode(&value).unwrap();
+        assert_eq!(bytes, [0xa2, 0x00, 0x18, 0x2a, 0x01, 0x82, 0xf5, 0xf6]);
+        assert_eq!(decode(&bytes), Ok(value));
+    }
+
+    #[test]
+    fn generic_encoder_rejects_unsorted_maps() {
+        let value = Value::Map(vec![(1, Value::Unsigned(0)), (0, Value::Unsigned(0))]);
+        assert!(encode(&value).is_err());
     }
 
     #[test]

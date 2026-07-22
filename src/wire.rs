@@ -1,11 +1,21 @@
+use std::io;
+
+#[cfg(feature = "native")]
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+#[cfg(feature = "native")]
+use std::io::{Read, Write};
+#[cfg(feature = "native")]
 use std::net::TcpStream;
+#[cfg(feature = "native")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "native")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "native")]
 use std::time::Duration;
 
-use super::{DEFAULT_MAX_RECORD_BODY, FRAMING_MAJOR, FRAMING_MINOR, HARD_MAX_RECORD_BODY};
+#[cfg(feature = "native")]
+use super::DEFAULT_MAX_RECORD_BODY;
+use super::{HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
 
 pub const PREFACE_SIZE: usize = 16;
 pub const HEADER_SIZE: usize = 24;
@@ -92,11 +102,13 @@ impl Preface {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "native")]
 pub enum Endpoint {
     Unix(PathBuf),
     Tcp(String),
 }
 
+#[cfg(feature = "native")]
 impl Endpoint {
     pub fn parse(value: &str) -> io::Result<Self> {
         if let Some(path) = value.strip_prefix("unix:") {
@@ -148,7 +160,7 @@ impl Endpoint {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "native", unix))]
 fn connect_unix(path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     use std::os::unix::net::UnixStream;
 
@@ -159,7 +171,7 @@ fn connect_unix(path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write 
     Ok((Box::new(stream), Box::new(writer)))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "native", not(unix)))]
 fn connect_unix(_path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -167,12 +179,14 @@ fn connect_unix(_path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write
     ))
 }
 
+#[cfg(feature = "native")]
 enum WriterIo {
     Live(Box<dyn Write + Send>),
     Trace(File),
     Sink(io::Sink),
 }
 
+#[cfg(feature = "native")]
 struct WriterState {
     io: WriterIo,
     send_sequence: u64,
@@ -181,10 +195,12 @@ struct WriterState {
 
 /// Cloneable, sequence-safe half of a Vivid connection.
 #[derive(Clone)]
+#[cfg(feature = "native")]
 pub struct ConnectionWriter {
     state: Arc<Mutex<WriterState>>,
 }
 
+#[cfg(feature = "native")]
 impl ConnectionWriter {
     pub fn write_record(
         &self,
@@ -246,12 +262,14 @@ impl ConnectionWriter {
 }
 
 /// Blocking receive half of a live Vivid connection.
+#[cfg(feature = "native")]
 pub struct ConnectionReader {
     io: Box<dyn Read + Send>,
     receive_sequence: u64,
     receive_body_limit: u32,
 }
 
+#[cfg(feature = "native")]
 impl ConnectionReader {
     pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
         validate_body_limit(maximum)?;
@@ -301,14 +319,29 @@ impl ConnectionReader {
     }
 }
 
+#[cfg(feature = "native")]
 pub struct Connection {
     reader: Option<ConnectionReader>,
     writer: ConnectionWriter,
 }
 
+#[cfg(feature = "native")]
 impl Connection {
     pub fn open(endpoint: &Endpoint, kind: ConnectionKind) -> io::Result<Self> {
         let (reader, writer) = endpoint.connect()?;
+        Self::new(Some(reader), WriterIo::Live(writer), kind)
+    }
+
+    /// Start an initiator-side Vivid connection over an already authenticated transport.
+    ///
+    /// The caller owns transport authentication and peer routing. This constructor still emits
+    /// the connection preface and preserves all normal record limits and sequencing, making it
+    /// suitable for bindings such as an authenticated WebSocket relay.
+    pub fn from_streams(
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        kind: ConnectionKind,
+    ) -> io::Result<Self> {
         Self::new(Some(reader), WriterIo::Live(writer), kind)
     }
 
@@ -400,6 +433,7 @@ impl Connection {
     }
 }
 
+#[cfg(feature = "native")]
 fn validate_body_limit(maximum: u32) -> io::Result<()> {
     if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
         Err(io::Error::new(
@@ -424,6 +458,7 @@ impl DirectionalLimits {
     }
 }
 
+#[cfg(feature = "native")]
 fn write_writer(io: &mut WriterIo, bytes: &[u8]) -> io::Result<()> {
     match io {
         WriterIo::Live(stream) => stream.write_all(bytes),
@@ -432,6 +467,7 @@ fn write_writer(io: &mut WriterIo, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+#[cfg(feature = "native")]
 fn flush_writer(io: &mut WriterIo) -> io::Result<()> {
     match io {
         WriterIo::Live(stream) => stream.flush(),
@@ -482,8 +518,8 @@ impl RecordHeader {
 pub fn encode_preface(kind: ConnectionKind, maximum: u32) -> [u8; PREFACE_SIZE] {
     let mut bytes = [0_u8; PREFACE_SIZE];
     bytes[0..4].copy_from_slice(MAGIC);
-    bytes[4] = FRAMING_MAJOR;
-    bytes[5] = FRAMING_MINOR;
+    bytes[4] = VIVID_MAJOR;
+    bytes[5] = VIVID_MINOR;
     bytes[6] = kind as u8;
     bytes[7] = 0;
     bytes[8..12].copy_from_slice(&maximum.to_be_bytes());
@@ -494,9 +530,11 @@ pub fn encode_preface(kind: ConnectionKind, maximum: u32) -> [u8; PREFACE_SIZE] 
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native")]
     #[derive(Clone)]
     struct SharedBytes(Arc<Mutex<Vec<u8>>>);
 
+    #[cfg(feature = "native")]
     impl Write for SharedBytes {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
@@ -509,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn preface_matches_protocol_layout() {
+    fn preface_matches_vivid_layout() {
         let preface = encode_preface(ConnectionKind::Video, 0x0102_0304);
         assert_eq!(&preface[0..4], b"VIVD");
         assert_eq!(preface[4..8], [1, 0, 1, 0]);
@@ -537,12 +575,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn connection_rejects_reserved_record_flags() {
         let mut connection = Connection::sink(ConnectionKind::Control).unwrap();
         assert!(connection.write_record(1, 2, 0, &[]).is_err());
     }
 
     #[test]
+    #[cfg(feature = "native")]
+    fn connection_from_streams_emits_the_normal_preface() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let _connection = Connection::from_streams(
+            Box::new(io::empty()),
+            Box::new(SharedBytes(bytes.clone())),
+            ConnectionKind::Raster,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes.lock().unwrap().as_slice(),
+            encode_preface(ConnectionKind::Raster, DEFAULT_MAX_RECORD_BODY)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
     fn cloned_writers_serialize_complete_records_and_sequences() {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writer = ConnectionWriter {
@@ -601,7 +657,7 @@ mod tests {
         assert_eq!(RecordHeader::decode(header.encode()), header);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(feature = "native", unix))]
     #[test]
     fn endpoint_parser_accepts_explicit_and_bare_unix_paths() {
         assert_eq!(
@@ -615,6 +671,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn endpoint_parser_accepts_tcp() {
         assert_eq!(
             Endpoint::parse("tcp:127.0.0.1:12345").unwrap(),

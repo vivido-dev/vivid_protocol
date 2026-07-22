@@ -72,14 +72,14 @@ multiplexers that do not preserve authenticated Vivid anchors are not supported.
 
 ## Compatibility
 
-Vivid Protocol 1.1 deliberately retains the framing-1.0 `VIVD` preface. The Opus, Vorbis, and FLAC
+Vivid Protocol 1.0 uses the version-1.0 `VIVD` preface. The Opus, Vorbis, and FLAC
 packetizations extend the existing audio feature rather than allocating new feature IDs, so an
 older presenter rejects unsupported configurations through the normal `CREATE_AUDIO` error path.
 The crate declares Rust 1.85 compatibility.
 
 `PLAY` carries start PTS, minimum buffer, maximum latency, 32.32 rate, late policy, loop count, and
 start policy. `PING`/`PONG` are bidirectional correlated session records. Playback telemetry,
-derived media tickets, audio batching, and alternate packet framing are not part of Vivid 1.1.
+derived media tickets, audio batching, and alternate packet framing are not part of Vivid 1.0.
 
 ## License
 

@@ -1,4 +1,9 @@
-use std::io::{self, Cursor, Read};
+use std::io;
+
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+use std::io::Cursor;
+#[cfg(any(feature = "native", target_arch = "wasm32"))]
+use std::io::Read;
 
 use crate::HARD_MAX_RECORD_BODY;
 
@@ -230,11 +235,22 @@ pub fn raster_frame_body_with_compression(
             ),
         ));
     }
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     let compressed;
     let pixels = if compress {
-        compressed = zstd::bulk::compress(rgba, 1)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        compressed.as_slice()
+        #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+        {
+            compressed = zstd::bulk::compress(rgba, 1)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            compressed.as_slice()
+        }
+        #[cfg(any(not(feature = "native"), target_arch = "wasm32"))]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "zstd raster compression requires the native feature",
+            ));
+        }
     } else {
         rgba
     };
@@ -375,14 +391,19 @@ pub fn decode_raster_pixels(frame: ParsedRasterFrame<'_>) -> io::Result<Vec<u8>>
     {
         return Err(invalid("zstd skippable frames are forbidden"));
     }
-    if zstd_safe::get_dict_id_from_frame(frame.pixels).is_some()
-        || zstd_safe::find_frame_compressed_size(frame.pixels).ok() != Some(frame.pixels.len())
+    decode_zstd_pixels(frame.pixels, expected)
+}
+
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
+    if zstd_safe::get_dict_id_from_frame(pixels).is_some()
+        || zstd_safe::find_frame_compressed_size(pixels).ok() != Some(pixels.len())
     {
         return Err(invalid(
             "zstd dictionaries and trailing frames are forbidden",
         ));
     }
-    let cursor = Cursor::new(frame.pixels);
+    let cursor = Cursor::new(pixels);
     let mut decoder = zstd::stream::read::Decoder::new(cursor)
         .map_err(|_| invalid("invalid zstd frame"))?
         .single_frame();
@@ -392,12 +413,40 @@ pub fn decode_raster_pixels(frame: ParsedRasterFrame<'_>) -> io::Result<Vec<u8>>
         .take((expected + 1) as u64)
         .read_to_end(&mut output)?;
     let cursor = decoder.finish();
-    if output.len() != expected || cursor.get_ref().position() as usize != frame.pixels.len() {
+    if output.len() != expected || cursor.get_ref().position() as usize != pixels.len() {
         return Err(invalid(
             "zstd raster has wrong output size or trailing data",
         ));
     }
     Ok(output)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(pixels)
+        .map_err(|_| invalid("invalid zstd frame"))?;
+    let mut output = Vec::with_capacity(expected);
+    decoder
+        .by_ref()
+        .take((expected + 1) as u64)
+        .read_to_end(&mut output)?;
+    if output.len() != expected
+        || !decoder.decoder.is_finished()
+        || decoder.decoder.bytes_read_from_source() as usize != pixels.len()
+    {
+        return Err(invalid(
+            "zstd raster has wrong output size or trailing data",
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(all(not(feature = "native"), not(target_arch = "wasm32")))]
+fn decode_zstd_pixels(_pixels: &[u8], _expected: usize) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "zstd raster decoding requires either native support or wasm32",
+    ))
 }
 
 pub fn is_portable_packetization(codec: &str, packetization: &str) -> bool {
@@ -684,6 +733,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn zstd_raster_round_trip() {
         let pixels = vec![7; 64];
         let body = raster_frame_body_with_compression(1, 1, 4, 4, &pixels, true).unwrap();
@@ -693,6 +743,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn zstd_rejects_concatenated_frames() {
         let pixels = vec![7; 64];
         let mut body = raster_frame_body_with_compression(1, 1, 4, 4, &pixels, true).unwrap();

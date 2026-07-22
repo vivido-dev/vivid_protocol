@@ -1,10 +1,12 @@
-//! Normative Vivid 1.1 numeric registry and deterministic control schemas.
+//! Normative Vivid 1.0 numeric registry and deterministic control schemas.
 
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 use super::cbor::{self, Encoder, Value};
+use super::{VIVID_MAJOR, VIVID_MINOR};
 
 pub const HELLO: u16 = 0x0001;
 pub const WELCOME: u16 = 0x0002;
@@ -89,6 +91,31 @@ pub const FEATURE_VIDEO_CONTROL_V1: u64 = 12;
 pub const FEATURE_TEXT_ANCHORS_V2: u64 = 13;
 pub const FEATURE_AUDIO_ACCESS_UNIT_V1: u64 = 14;
 pub const FEATURE_NODE_CLIP_RECT_V1: u64 = 15;
+pub const FEATURE_DECODER_DESCRIPTION_V1: u64 = 16;
+
+/// Negotiate a HELLO feature request against a presenter's supported set.
+///
+/// Every required feature must be supported; the first unsupported one is returned as the error
+/// (answer it with `ERROR_UNSUPPORTED_FEATURE`). The accepted set is the supported union of
+/// required and optional features, sorted and deduplicated as WELCOME demands.
+pub fn negotiate_features(
+    required: &[u64],
+    optional: &[u64],
+    mut supported: impl FnMut(u64) -> bool,
+) -> Result<Vec<u64>, u64> {
+    if let Some(missing) = required.iter().find(|feature| !supported(**feature)) {
+        return Err(*missing);
+    }
+    let mut accepted: Vec<u64> = required
+        .iter()
+        .chain(optional.iter())
+        .copied()
+        .filter(|feature| supported(*feature))
+        .collect();
+    accepted.sort_unstable();
+    accepted.dedup();
+    Ok(accepted)
+}
 
 pub const PROFILE_RASTER_RGBA8: &str = "raster-rgba8-full-v1";
 pub const PROFILE_RASTER_ZSTD: &str = "raster-zstd-full-v1";
@@ -100,6 +127,8 @@ pub const PROFILE_AUDIO_ACCESS_UNIT: &str = "audio-access-unit-v1";
 pub const PROFILE_NODE_CLIP_RECT: &str = "node-clip-rect-v1";
 
 pub const MAX_AUDIO_EXTRADATA: usize = 64 * 1024;
+pub const MAX_CODEC_STRING: usize = 64;
+pub const MAX_DECODER_CONFIG: usize = 4096;
 pub const MAX_AUDIO_ACCESS_UNIT_BYTES: u32 = 1024 * 1024;
 pub const AUDIO_PACKETIZATION_OPUS: &str = "opus-packet-v1";
 pub const AUDIO_PACKETIZATION_VORBIS: &str = "vorbis-packet-v1";
@@ -119,6 +148,12 @@ pub const ERROR_FLOW_CONTROL: u64 = 11;
 pub const ERROR_HASH_MISMATCH: u64 = 12;
 pub const ERROR_NEED_KEYFRAME: u64 = 13;
 pub const ERROR_STALE_EPOCH: u64 = 14;
+
+/// `NEED_KEYFRAME` reason codes (specification section 7.8).
+pub const KEYFRAME_REASON_INITIAL: u64 = 1;
+pub const KEYFRAME_REASON_DECODER_ERROR: u64 = 2;
+pub const KEYFRAME_REASON_EPOCH_DISCONTINUITY: u64 = 3;
+pub const KEYFRAME_REASON_DEVICE_RESET: u64 = 4;
 pub const ERROR_STALE_DISPLAY_GENERATION: u64 = 15;
 pub const ERROR_ANCHOR_GONE: u64 = 16;
 pub const ERROR_CONTEXT_REVOKED: u64 = 17;
@@ -156,7 +191,7 @@ pub fn minimum_buffer_for_rtt(requested_us: u64, rtt_us: Option<u64>) -> u64 {
     })
 }
 
-/// Complete Vivid 1.1 PLAY payload.
+/// Complete Vivid 1.0 PLAY payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayRequest {
     pub source_id: u64,
@@ -255,6 +290,97 @@ pub struct Credits {
     pub fragments: u64,
 }
 
+/// Per-source credit ledger shared by producers, presenters, and bridges so grant/consume
+/// arithmetic stays checked and identical on every side of the wire.
+///
+/// One media record costs one packet credit plus its body length in byte credits. Fragmented
+/// profiles additionally consume the declared number of fragment slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CreditLedger {
+    pub bytes: u64,
+    pub packets: u64,
+    pub fragments: u64,
+    lost: bool,
+}
+
+impl CreditLedger {
+    pub fn new(initial: Credits) -> Self {
+        Self {
+            bytes: initial.bytes,
+            packets: initial.packets,
+            fragments: initial.fragments,
+            lost: false,
+        }
+    }
+
+    /// Permanently close this source's credit window after `SOURCE_LOST` or local cancellation.
+    pub fn mark_lost(&mut self) {
+        self.lost = true;
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.lost
+    }
+
+    /// Apply a `CREDIT` grant with checked arithmetic; overflow is a protocol violation.
+    pub fn grant(&mut self, credits: Credits) -> io::Result<()> {
+        if self.lost {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "cannot grant credit to a lost source",
+            ));
+        }
+        let bytes = self
+            .bytes
+            .checked_add(credits.bytes)
+            .ok_or_else(|| invalid("byte credit overflow"))?;
+        let packets = self
+            .packets
+            .checked_add(credits.packets)
+            .ok_or_else(|| invalid("packet credit overflow"))?;
+        let fragments = self
+            .fragments
+            .checked_add(credits.fragments)
+            .ok_or_else(|| invalid("fragment credit overflow"))?;
+        self.bytes = bytes;
+        self.packets = packets;
+        self.fragments = fragments;
+        Ok(())
+    }
+
+    /// Whether one unfragmented media record with `body_length` bytes can be sent now.
+    pub fn can_consume(&self, body_length: u64) -> bool {
+        self.can_consume_with_fragments(body_length, 0)
+    }
+
+    /// Whether one media record and its logical fragments fit the current credit window.
+    pub fn can_consume_with_fragments(&self, body_length: u64, fragments: u64) -> bool {
+        !self.lost && self.bytes >= body_length && self.packets > 0 && self.fragments >= fragments
+    }
+
+    /// Consume the credit for one unfragmented media record.
+    pub fn consume(&mut self, body_length: u64) -> io::Result<()> {
+        self.consume_with_fragments(body_length, 0)
+    }
+
+    /// Consume one packet, its body bytes, and `fragments` fragment slots atomically.
+    pub fn consume_with_fragments(&mut self, body_length: u64, fragments: u64) -> io::Result<()> {
+        if self.lost {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "cannot consume credit for a lost source",
+            ));
+        }
+        if !self.can_consume_with_fragments(body_length, fragments) {
+            return Err(invalid("media record exceeds the granted credit window"));
+        }
+        self.bytes -= body_length;
+        self.packets -= 1;
+        self.fragments -= fragments;
+        Ok(())
+    }
+}
+
 pub struct VideoSourceConfig<'a> {
     pub source_id: u64,
     pub codec: &'a str,
@@ -272,6 +398,12 @@ pub struct VideoSourceConfig<'a> {
     pub sar_num: u32,
     pub sar_den: u32,
     pub max_access_unit_bytes: u32,
+    /// Optional RFC 6381 codec string (`decoder-description-v1`). Send only when the presenter
+    /// accepted [`FEATURE_DECODER_DESCRIPTION_V1`].
+    pub codec_string: Option<&'a str>,
+    /// Optional ISO-BMFF decoder configuration box body matching the codec (avcC/hvcC/vpcC/av1C).
+    /// Send only when the presenter accepted [`FEATURE_DECODER_DESCRIPTION_V1`].
+    pub decoder_config: Option<&'a [u8]>,
 }
 
 pub struct AudioSourceConfig<'a> {
@@ -285,6 +417,9 @@ pub struct AudioSourceConfig<'a> {
     pub channel_mask: u64,
     pub bitrate: i64,
     pub max_access_unit_bytes: u32,
+    /// Optional RFC 6381 codec string (`decoder-description-v1`). Send only when the presenter
+    /// accepted [`FEATURE_DECODER_DESCRIPTION_V1`].
+    pub codec_string: Option<&'a str>,
 }
 
 pub struct NodeConfig {
@@ -303,6 +438,111 @@ pub struct ClipRect {
     pub y: i64,
     pub width: i64,
     pub height: i64,
+}
+
+pub const MAX_SCENE_NODES: usize = 256;
+pub const MAX_SCENE_FRAGMENTS_PER_NODE: usize = 8;
+
+/// Stable owner-scoped object identity used by the shared scene snapshot validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SceneValidationKey {
+    pub owner_id: u64,
+    pub object_id: u64,
+}
+
+/// Source linkage needed for structural scene validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneValidationSource {
+    pub key: SceneValidationKey,
+    pub is_video: bool,
+    pub linked_video: Option<SceneValidationKey>,
+}
+
+/// One projected fragment of a logical scene node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneValidationNode {
+    pub owner_id: u64,
+    pub node_id: u64,
+    pub fragment_id: u64,
+    pub source: SceneValidationKey,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    pub clip: Option<ClipRect>,
+}
+
+/// Validate one signed 32.32 scene rectangle: positive extent and non-overflowing edges, per the
+/// specification's checked-arithmetic rule for scene geometry. Shared by presenters and bridges
+/// so every consumer rejects the same degenerate rectangles.
+pub fn validate_scene_rect(x: i64, y: i64, width: i64, height: i64) -> io::Result<()> {
+    if width <= 0
+        || height <= 0
+        || x.checked_add(width).is_none()
+        || y.checked_add(height).is_none()
+    {
+        return Err(invalid(
+            "scene rectangle has non-positive or overflowing geometry",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the consumer-independent structure of one authoritative scene snapshot.
+///
+/// Session capability and anchor existence remain consumer-owned checks. This function owns the
+/// cross-consumer limits and relationships: unique sources/fragments, linked audio scope,
+/// fragment count, source ownership, and checked signed 32.32 geometry.
+pub fn validate_scene_snapshot(
+    sources: &[SceneValidationSource],
+    nodes: &[SceneValidationNode],
+) -> io::Result<()> {
+    if nodes.len() > MAX_SCENE_NODES {
+        return Err(invalid("scene snapshot exceeds the node limit"));
+    }
+
+    let source_kinds = sources
+        .iter()
+        .map(|source| (source.key, source.is_video))
+        .collect::<HashMap<_, _>>();
+    if source_kinds.len() != sources.len() {
+        return Err(invalid("scene snapshot repeats a source key"));
+    }
+    for source in sources {
+        if let Some(video) = source.linked_video
+            && (video.owner_id != source.key.owner_id
+                || source_kinds.get(&video).copied() != Some(true))
+        {
+            return Err(invalid(
+                "scene audio source references a missing or foreign video source",
+            ));
+        }
+    }
+
+    let mut fragment_keys = HashSet::new();
+    let mut logical_counts = HashMap::<(u64, u64), usize>::new();
+    for node in nodes {
+        if !fragment_keys.insert((node.owner_id, node.node_id, node.fragment_id)) {
+            return Err(invalid("scene snapshot repeats a fragment key"));
+        }
+        let count = logical_counts
+            .entry((node.owner_id, node.node_id))
+            .or_default();
+        *count += 1;
+        if *count > MAX_SCENE_FRAGMENTS_PER_NODE {
+            return Err(invalid(
+                "scene snapshot exceeds the fragment limit for a logical node",
+            ));
+        }
+        if node.owner_id != node.source.owner_id || !source_kinds.contains_key(&node.source) {
+            return Err(invalid("scene node references a missing or foreign source"));
+        }
+        validate_scene_rect(node.x, node.y, node.width, node.height)?;
+        if let Some(clip) = node.clip {
+            validate_scene_rect(clip.x, clip.y, clip.width, clip.height)?;
+        }
+    }
+    Ok(())
 }
 
 /// Complete scene-node configuration for callers that need positioning, ordering, visibility, or
@@ -411,6 +651,8 @@ pub struct ParsedVideoSourceConfig {
     pub sar_num: u32,
     pub sar_den: u32,
     pub max_access_unit_bytes: u32,
+    pub codec_string: Option<String>,
+    pub decoder_config: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,6 +667,7 @@ pub struct ParsedAudioSourceConfig {
     pub channel_mask: u64,
     pub bitrate: u64,
     pub max_access_unit_bytes: u32,
+    pub codec_string: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,14 +729,15 @@ pub fn hello(request_id: u64, token: &str) -> Vec<u8> {
         FEATURE_VIDEO_ACCESS_UNIT_V1,
         FEATURE_VIDEO_CONTROL_V1,
         FEATURE_AUDIO_ACCESS_UNIT_V1,
+        FEATURE_DECODER_DESCRIPTION_V1,
     ];
     encode_hello(
         request_id,
         &HelloConfig {
-            minimum_major: 1,
-            minimum_minor: 1,
-            maximum_major: 1,
-            maximum_minor: 1,
+            minimum_major: u64::from(VIVID_MAJOR),
+            minimum_minor: u64::from(VIVID_MINOR),
+            maximum_major: u64::from(VIVID_MAJOR),
+            maximum_minor: u64::from(VIVID_MINOR),
             token,
             producer: "vivi",
             producer_version: env!("CARGO_PKG_VERSION"),
@@ -578,7 +822,9 @@ pub fn create_image(request_id: u64, config: &ImageSourceConfig) -> Vec<u8> {
 
 pub fn create_video(request_id: u64, config: &VideoSourceConfig<'_>) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(21);
+        let optional = usize::from(config.codec_string.is_some())
+            + usize::from(config.decoder_config.is_some());
+        encoder.map(21 + optional);
         key_u64(encoder, 0, config.source_id);
         encoder.u64(1);
         encoder.text(config.codec);
@@ -604,6 +850,14 @@ pub fn create_video(request_id: u64, config: &VideoSourceConfig<'_>) -> Vec<u8> 
         key_u64(encoder, 18, u64::from(config.sar_num));
         key_u64(encoder, 19, u64::from(config.sar_den));
         key_u64(encoder, 20, u64::from(config.max_access_unit_bytes));
+        if let Some(codec_string) = config.codec_string {
+            encoder.u64(21);
+            encoder.text(codec_string);
+        }
+        if let Some(decoder_config) = config.decoder_config {
+            encoder.u64(22);
+            encoder.bytes(decoder_config);
+        }
     })
 }
 
@@ -613,7 +867,7 @@ pub fn probe_video_config(request_id: u64, config: &VideoSourceConfig<'_>) -> Ve
 
 pub fn create_audio(request_id: u64, config: &AudioSourceConfig<'_>) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(11);
+        encoder.map(11 + usize::from(config.codec_string.is_some()));
         key_u64(encoder, 0, config.source_id);
         key_u64(encoder, 1, config.linked_video_source_id.unwrap_or(0));
         encoder.u64(2);
@@ -629,6 +883,10 @@ pub fn create_audio(request_id: u64, config: &AudioSourceConfig<'_>) -> Vec<u8> 
         key_u64(encoder, 9, u64::from(config.max_access_unit_bytes));
         encoder.u64(10);
         encoder.text("source-timebase-us");
+        if let Some(codec_string) = config.codec_string {
+            encoder.u64(11);
+            encoder.text(codec_string);
+        }
     })
 }
 
@@ -867,8 +1125,8 @@ pub fn welcome(
             display,
             maximum_control_body: super::CONTROL_MAX_RECORD_BODY,
             accepted_profiles: &profiles,
-            selected_major: 1,
-            selected_minor: 1,
+            selected_major: u64::from(VIVID_MAJOR),
+            selected_minor: u64::from(VIVID_MINOR),
             accepted_features,
         },
     )
@@ -1077,7 +1335,7 @@ pub fn parse_hello(body: &[u8]) -> io::Result<(u64, Hello)> {
         maximum_record_body,
     };
     if (hello.minimum_major, hello.minimum_minor) > (hello.maximum_major, hello.maximum_minor) {
-        return Err(invalid("HELLO protocol range is reversed"));
+        return Err(invalid("HELLO Vivid version range is reversed"));
     }
     if hello.token.len() != 64 || !hello.token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid(
@@ -1170,11 +1428,29 @@ pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVid
     reject_unknown_fields(
         payload,
         &[
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
         ],
     )?;
     let profile = required_i64(payload, 6, "video profile")?;
     let level = required_i64(payload, 7, "video level")?;
+    let codec_string = match payload.map_value(21) {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_text()
+                .ok_or_else(|| invalid("video codec string is not text"))?
+                .to_owned(),
+        ),
+    };
+    let decoder_config = match payload.map_value(22) {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_bytes()
+                .ok_or_else(|| invalid("video decoder configuration is not bytes"))?
+                .to_vec(),
+        ),
+    };
     let config = ParsedVideoSourceConfig {
         source_id: required_u64(payload, 0, "source ID")?,
         codec: required_text(payload, 1, "codec")?.to_owned(),
@@ -1192,7 +1468,15 @@ pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVid
         sar_num: required_u32(payload, 18, "sample aspect ratio numerator")?,
         sar_den: required_u32(payload, 19, "sample aspect ratio denominator")?,
         max_access_unit_bytes: required_u32(payload, 20, "maximum access-unit bytes")?,
+        codec_string,
+        decoder_config,
     };
+    if let Some(codec_string) = &config.codec_string {
+        validate_video_codec_string(&config.codec, codec_string)?;
+    }
+    if let Some(decoder_config) = &config.decoder_config {
+        validate_video_decoder_config(&config.codec, decoder_config)?;
+    }
     if config.width == 0 || config.height == 0 || config.width > 8192 || config.height > 8192 {
         return Err(invalid("video dimensions are outside Vivid v1 limits"));
     }
@@ -1217,9 +1501,18 @@ pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVid
 pub fn parse_create_audio(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedAudioSourceConfig)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
-    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])?;
     let channels = required_u32(payload, 6, "audio channel count")?;
     let linked = required_u64(payload, 1, "linked video source ID")?;
+    let codec_string = match payload.map_value(11) {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_text()
+                .ok_or_else(|| invalid("audio codec string is not text"))?
+                .to_owned(),
+        ),
+    };
     let config = ParsedAudioSourceConfig {
         source_id: required_u64(payload, 0, "source ID")?,
         linked_video_source_id: (linked != 0).then_some(linked),
@@ -1232,12 +1525,16 @@ pub fn parse_create_audio(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedAud
         channel_mask: required_u64(payload, 7, "audio channel mask")?,
         bitrate: required_u64(payload, 8, "audio bitrate")?,
         max_access_unit_bytes: required_u32(payload, 9, "maximum audio access-unit bytes")?,
+        codec_string,
     };
     if config.linked_video_source_id == Some(config.source_id) {
         return Err(invalid("audio source cannot link to itself"));
     }
     if required_text(payload, 10, "audio timeline")? != "source-timebase-us" {
         return Err(invalid("unsupported audio configuration"));
+    }
+    if let Some(codec_string) = &config.codec_string {
+        validate_audio_codec_string(&config.codec, codec_string)?;
     }
     Ok((envelope, config))
 }
@@ -1274,6 +1571,80 @@ pub fn valid_audio_packetization(codec: &str, packetization: &str) -> bool {
     }
 }
 
+/// Validate an optional RFC 6381 codec string against a CREATE_VIDEO codec key
+/// (`decoder-description-v1`).
+pub fn validate_video_codec_string(codec: &str, codec_string: &str) -> io::Result<()> {
+    validate_codec_string_shape(codec_string)?;
+    let family_matches = match codec {
+        "h264" => codec_string.starts_with("avc1.") || codec_string.starts_with("avc3."),
+        "hevc" => codec_string.starts_with("hvc1.") || codec_string.starts_with("hev1."),
+        "vp9" => codec_string.starts_with("vp09."),
+        "av1" => codec_string.starts_with("av01."),
+        _ => false,
+    };
+    if !family_matches {
+        return Err(invalid(
+            "video codec string family does not match the codec",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an optional ISO-BMFF decoder configuration body against a CREATE_VIDEO codec key
+/// (`decoder-description-v1`): avcC for `h264`, hvcC for `hevc`, vpcC for `vp9`, av1C for `av1`.
+pub fn validate_video_decoder_config(codec: &str, decoder_config: &[u8]) -> io::Result<()> {
+    if decoder_config.is_empty() || decoder_config.len() > MAX_DECODER_CONFIG {
+        return Err(invalid("video decoder configuration is empty or oversized"));
+    }
+    let version_matches = match codec {
+        // These minimum lengths cover the fixed header through the first codec-specific field.
+        "h264" => decoder_config.len() >= 7 && decoder_config[0] == 1,
+        "hevc" => decoder_config.len() >= 23 && decoder_config[0] == 1,
+        "vp9" => decoder_config.len() >= 12 && decoder_config[0] == 1,
+        // av1C begins with marker (1) << 7 | version (1).
+        "av1" => decoder_config.len() >= 4 && decoder_config[0] == 0x81,
+        _ => false,
+    };
+    if !version_matches {
+        return Err(invalid(
+            "video decoder configuration does not match the codec",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an optional RFC 6381 codec string against a CREATE_AUDIO codec key
+/// (`decoder-description-v1`).
+pub fn validate_audio_codec_string(codec: &str, codec_string: &str) -> io::Result<()> {
+    validate_codec_string_shape(codec_string)?;
+    let family_matches = match codec {
+        "aac" => codec_string.starts_with("mp4a.40."),
+        "mp3" => codec_string == "mp3" || codec_string.eq_ignore_ascii_case("mp4a.6b"),
+        "opus" | "vorbis" | "flac" | "alac" => codec_string == codec,
+        "pcm_mulaw" => codec_string == "ulaw",
+        "pcm_alaw" => codec_string == "alaw",
+        _ => codec.starts_with("pcm_") && codec_string.starts_with("pcm-"),
+    };
+    if !family_matches {
+        return Err(invalid(
+            "audio codec string family does not match the codec",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_codec_string_shape(codec_string: &str) -> io::Result<()> {
+    if codec_string.is_empty()
+        || codec_string.len() > MAX_CODEC_STRING
+        || !codec_string.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(invalid(
+            "codec string is empty, oversized, or not printable ASCII",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the canonical, container-independent initialization carried by CREATE_AUDIO.
 pub fn validate_audio_initialization(
     codec: &str,
@@ -1292,7 +1663,98 @@ pub fn validate_audio_initialization(
         "opus" => validate_opus_head(extradata, sample_rate, channels),
         "vorbis" => validate_vorbis_headers(extradata, sample_rate, channels),
         "flac" => validate_flac_streaminfo(extradata, sample_rate, channels),
+        "aac" => validate_aac_audio_specific_config(extradata, sample_rate, channels),
         _ => Ok(()),
+    }
+}
+
+/// MPEG-4 samplingFrequencyIndex table (ISO/IEC 14496-3); indexes 13 and 14 are reserved.
+const AAC_SAMPLE_RATES: [u32; 13] = [
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+];
+
+/// Validate an AAC AudioSpecificConfig against the declared CREATE_AUDIO rate and channel count.
+///
+/// Accepts the HE-AAC convention where the base configuration declares half the output sample
+/// rate. `channelConfiguration == 0` (program config element) is accepted for any channel count.
+pub fn validate_aac_audio_specific_config(
+    config: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> io::Result<()> {
+    let mut reader = AscBitReader::new(config);
+    let audio_object_type = reader
+        .read_audio_object_type()
+        .ok_or_else(|| invalid("AudioSpecificConfig is truncated"))?;
+    if audio_object_type == 0 {
+        return Err(invalid("AudioSpecificConfig audio object type is null"));
+    }
+    let frequency = reader
+        .read_sampling_frequency()
+        .ok_or_else(|| invalid("AudioSpecificConfig sampling frequency is invalid"))?;
+    let channel_configuration = reader
+        .read_bits(4)
+        .ok_or_else(|| invalid("AudioSpecificConfig is truncated"))?;
+    if frequency != sample_rate && frequency.checked_mul(2) != Some(sample_rate) {
+        return Err(invalid(
+            "AudioSpecificConfig sampling frequency does not match the declared rate",
+        ));
+    }
+    let declared = u32::from(channels);
+    let configured = match channel_configuration {
+        0 => declared, // program config element carries the layout
+        7 => 8,
+        other => other,
+    };
+    if configured != declared {
+        return Err(invalid(
+            "AudioSpecificConfig channel configuration does not match the declared channels",
+        ));
+    }
+    Ok(())
+}
+
+/// Minimal big-endian bit reader for AudioSpecificConfig validation.
+struct AscBitReader<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl<'a> AscBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, position: 0 }
+    }
+
+    fn read_bits(&mut self, count: u32) -> Option<u32> {
+        debug_assert!(count <= 24);
+        let mut value = 0_u32;
+        for _ in 0..count {
+            let byte = *self.data.get(self.position / 8)?;
+            let bit = (byte >> (7 - (self.position % 8))) & 1;
+            value = (value << 1) | u32::from(bit);
+            self.position += 1;
+        }
+        Some(value)
+    }
+
+    fn read_audio_object_type(&mut self) -> Option<u32> {
+        let base = self.read_bits(5)?;
+        if base == 31 {
+            Some(32 + self.read_bits(6)?)
+        } else {
+            Some(base)
+        }
+    }
+
+    fn read_sampling_frequency(&mut self) -> Option<u32> {
+        match self.read_bits(4)? {
+            15 => {
+                let explicit = self.read_bits(24)?;
+                (explicit > 0).then_some(explicit)
+            }
+            13 | 14 => None, // reserved indexes
+            index => AAC_SAMPLE_RATES.get(index as usize).copied(),
+        }
     }
 }
 
@@ -1573,6 +2035,16 @@ pub fn parse_play(body: &[u8]) -> io::Result<(ControlEnvelope, PlayRequest)> {
 }
 
 pub fn parse_eos(body: &[u8]) -> io::Result<(ControlEnvelope, u64, u32)> {
+    parse_source_epoch(body)
+}
+
+/// `FLUSH` shares the source-ID/epoch body layout with `EOS` but has distinct semantics; parse it
+/// under its own name so call sites stay legible.
+pub fn parse_flush(body: &[u8]) -> io::Result<(ControlEnvelope, u64, u32)> {
+    parse_source_epoch(body)
+}
+
+fn parse_source_epoch(body: &[u8]) -> io::Result<(ControlEnvelope, u64, u32)> {
     let envelope = decode_control(body)?;
     let source_id = required_u64(&envelope.payload, 0, "source ID")?;
     let epoch = required_u32(&envelope.payload, 1, "source epoch")?;
@@ -1603,8 +2075,8 @@ pub fn parse_welcome(body: &[u8]) -> io::Result<Welcome> {
         cell_height: required_u32(&payload, 10, "cell height")?,
         maximum_control_body: required_u32(&payload, 11, "maximum control body")?,
         accepted_profiles: text_array(&payload, 12, "accepted profiles")?,
-        selected_major: required_u64(&payload, 13, "selected protocol major")?,
-        selected_minor: required_u64(&payload, 14, "selected protocol minor")?,
+        selected_major: required_u64(&payload, 13, "selected Vivid major version")?,
+        selected_minor: required_u64(&payload, 14, "selected Vivid minor version")?,
         accepted_features: feature_array(&payload, 15, "accepted features")?,
     };
     if welcome.session_id == 0
@@ -1618,9 +2090,10 @@ pub fn parse_welcome(body: &[u8]) -> io::Result<Welcome> {
         || welcome.cell_height == 0
         || welcome.maximum_control_body == 0
         || welcome.maximum_control_body > super::CONTROL_MAX_RECORD_BODY
-        || (welcome.selected_major, welcome.selected_minor) != (1, 1)
+        || (welcome.selected_major, welcome.selected_minor)
+            != (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR))
     {
-        return Err(invalid("WELCOME contains an invalid mandatory 1.1 field"));
+        return Err(invalid("WELCOME contains an invalid mandatory 1.0 field"));
     }
     Ok(welcome)
 }
@@ -2099,10 +2572,10 @@ mod tests {
         let body = encode_hello(
             7,
             &HelloConfig {
-                minimum_major: 1,
-                minimum_minor: 1,
-                maximum_major: 1,
-                maximum_minor: 1,
+                minimum_major: u64::from(VIVID_MAJOR),
+                minimum_minor: u64::from(VIVID_MINOR),
+                maximum_major: u64::from(VIVID_MAJOR),
+                maximum_minor: u64::from(VIVID_MINOR),
                 token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 producer: "vvmux",
                 producer_version: "0.1.0",
@@ -2112,6 +2585,20 @@ mod tests {
             },
         );
         let (_, hello) = parse_hello(&body).unwrap();
+        assert_eq!(
+            (
+                hello.minimum_major,
+                hello.minimum_minor,
+                hello.maximum_major,
+                hello.maximum_minor,
+            ),
+            (
+                u64::from(VIVID_MAJOR),
+                u64::from(VIVID_MINOR),
+                u64::from(VIVID_MAJOR),
+                u64::from(VIVID_MINOR),
+            )
+        );
         assert_eq!(hello.producer, "vvmux");
         assert_eq!(hello.required_features, [FEATURE_NODE_CLIP_RECT_V1]);
         assert!(hello.optional_features.is_empty());
@@ -2157,7 +2644,7 @@ mod tests {
     }
 
     #[test]
-    fn welcome_and_source_ready_require_protocol_1_1_fields() {
+    fn welcome_and_source_ready_require_vivid_1_0_fields() {
         let display = DisplayChanged {
             display_generation: 3,
             viewport_width: 800,
@@ -2175,7 +2662,26 @@ mod tests {
             FEATURE_TEXT_ANCHORS_V2,
         ];
         let parsed = parse_welcome(&welcome(7, 9, &[1; 16], 10, display, &features)).unwrap();
-        assert_eq!((parsed.selected_major, parsed.selected_minor), (1, 1));
+        assert_eq!(
+            (parsed.selected_major, parsed.selected_minor),
+            (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR))
+        );
+        let unsupported = encode_welcome(
+            7,
+            &WelcomeConfig {
+                session_id: 9,
+                session_tag: &[1; 16],
+                root_context_id: 10,
+                capability_generation: 1,
+                display,
+                maximum_control_body: super::super::CONTROL_MAX_RECORD_BODY,
+                accepted_profiles: &[],
+                selected_major: 1,
+                selected_minor: 1,
+                accepted_features: &features,
+            },
+        );
+        assert!(parse_welcome(&unsupported).is_err());
         assert_eq!(parsed.viewport_width, 800);
         assert_eq!(parsed.viewport_height, 600);
         assert_eq!(parsed.cell_width, 10);
@@ -2253,20 +2759,275 @@ mod tests {
             linked_video_source_id: Some(10),
             codec: "aac",
             packetization: "aac-raw-au-v1",
-            extradata: &[0x12, 0x10],
+            // AudioSpecificConfig: AAC-LC, 48 kHz, stereo.
+            extradata: &[0x11, 0x90],
             sample_rate: 48_000,
             channels: 2,
             channel_mask: 3,
             bitrate: 192_000,
             max_access_unit_bytes: 8_192,
+            codec_string: Some("mp4a.40.2"),
         };
         let (envelope, parsed) = parse_create_audio(&create_audio(7, &config)).unwrap();
         assert_eq!(envelope.request_id, 7);
         assert_eq!(parsed.source_id, 12);
         assert_eq!(parsed.linked_video_source_id, Some(10));
         assert_eq!(parsed.codec, "aac");
-        assert_eq!(parsed.extradata, [0x12, 0x10]);
+        assert_eq!(parsed.extradata, [0x11, 0x90]);
+        assert_eq!(parsed.codec_string.as_deref(), Some("mp4a.40.2"));
         assert!(audio_config_supported(&parsed));
+    }
+
+    #[test]
+    fn video_config_round_trips_decoder_description() {
+        let base = VideoSourceConfig {
+            source_id: 3,
+            codec: "h264",
+            packetization: "h264-annexb-au-v1",
+            extradata: &[0, 0, 0, 1, 0x67],
+            width: 1280,
+            height: 720,
+            profile: 100,
+            level: 31,
+            bitrate: 2_000_000,
+            color_primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            range: 1,
+            sar_num: 1,
+            sar_den: 1,
+            max_access_unit_bytes: 1 << 20,
+            codec_string: None,
+            decoder_config: None,
+        };
+
+        // Without the feature the encoding stays byte-identical to a 21-key config.
+        let (_, parsed) = parse_create_video(&create_video(11, &base)).unwrap();
+        assert_eq!(parsed.codec_string, None);
+        assert_eq!(parsed.decoder_config, None);
+
+        let avcc = [1, 0x64, 0x00, 0x1f, 0xff, 0xe1, 0x00];
+        let described = VideoSourceConfig {
+            codec_string: Some("avc1.64001F"),
+            decoder_config: Some(&avcc),
+            ..base
+        };
+        let (_, parsed) = parse_create_video(&create_video(12, &described)).unwrap();
+        assert_eq!(parsed.codec_string.as_deref(), Some("avc1.64001F"));
+        assert_eq!(parsed.decoder_config.as_deref(), Some(avcc.as_slice()));
+
+        // Family mismatch and malformed boxes are rejected at parse time.
+        let mismatched = VideoSourceConfig {
+            codec_string: Some("vp09.00.10.08"),
+            decoder_config: None,
+            ..base
+        };
+        assert!(parse_create_video(&create_video(13, &mismatched)).is_err());
+        let wrong_box = VideoSourceConfig {
+            codec_string: None,
+            decoder_config: Some(&[0x81]),
+            ..base
+        };
+        assert!(parse_create_video(&create_video(14, &wrong_box)).is_err());
+
+        assert!(validate_video_codec_string("av1", "av01.0.05M.08").is_ok());
+        assert!(validate_video_codec_string("hevc", "hvc1.1.6.L93.B0").is_ok());
+        assert!(validate_video_codec_string("h264", "avc1 spaced").is_err());
+        assert!(validate_video_decoder_config("av1", &[0x81, 0x00, 0x00, 0x00]).is_ok());
+        assert!(validate_video_decoder_config("hevc", &[1; 22]).is_err());
+        assert!(validate_video_decoder_config("vp9", &[1; 11]).is_err());
+        assert!(validate_video_decoder_config("h264", &vec![1; MAX_DECODER_CONFIG + 1]).is_err());
+    }
+
+    #[test]
+    fn negotiate_features_rejects_missing_required_and_sorts_accepted() {
+        let supported = |feature: u64| feature <= 5 || feature == FEATURE_TEXT_ANCHORS_V2;
+        assert_eq!(
+            negotiate_features(&[1, 3], &[FEATURE_TEXT_ANCHORS_V2, 4, 99], supported),
+            Ok(vec![1, 3, 4, FEATURE_TEXT_ANCHORS_V2])
+        );
+        assert_eq!(negotiate_features(&[1, 99], &[], supported), Err(99));
+        assert_eq!(negotiate_features(&[], &[99], supported), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn credit_ledger_checked_grant_and_consume() {
+        let mut ledger = CreditLedger::new(Credits {
+            bytes: 100,
+            packets: 1,
+            fragments: 0,
+        });
+        assert!(ledger.can_consume(100));
+        assert!(!ledger.can_consume(101));
+        ledger.consume(60).unwrap();
+        // One packet credit paid: byte credit remains but the packet window is exhausted.
+        assert!(!ledger.can_consume(1));
+        assert!(ledger.consume(1).is_err());
+        ledger
+            .grant(Credits {
+                bytes: 10,
+                packets: 1,
+                fragments: 2,
+            })
+            .unwrap();
+        assert!(ledger.can_consume(50));
+        assert!(ledger.can_consume_with_fragments(50, 2));
+        ledger.consume_with_fragments(50, 2).unwrap();
+        assert_eq!(ledger.fragments, 0);
+        let mut saturated = CreditLedger::new(Credits {
+            bytes: u64::MAX,
+            packets: 1,
+            fragments: 0,
+        });
+        assert!(
+            saturated
+                .grant(Credits {
+                    bytes: 1,
+                    packets: 0,
+                    fragments: 0,
+                })
+                .is_err()
+        );
+        let mut atomic = CreditLedger::new(Credits {
+            bytes: 1,
+            packets: u64::MAX,
+            fragments: 1,
+        });
+        assert!(
+            atomic
+                .grant(Credits {
+                    bytes: 1,
+                    packets: 1,
+                    fragments: 1,
+                })
+                .is_err()
+        );
+        assert_eq!(
+            (atomic.bytes, atomic.packets, atomic.fragments),
+            (1, u64::MAX, 1)
+        );
+        ledger.mark_lost();
+        assert!(ledger.is_lost());
+        assert!(!ledger.can_consume(1));
+        assert!(ledger.consume(1).is_err());
+        assert!(ledger.grant(Credits::default()).is_err());
+    }
+
+    #[test]
+    fn scene_rect_validation_rejects_degenerate_and_overflowing_rects() {
+        assert!(validate_scene_rect(0, 0, 1 << 32, 1 << 32).is_ok());
+        assert!(validate_scene_rect(-(1 << 32), -(1 << 32), 1, 1).is_ok());
+        assert!(validate_scene_rect(0, 0, 0, 1).is_err());
+        assert!(validate_scene_rect(0, 0, 1, -1).is_err());
+        assert!(validate_scene_rect(i64::MAX, 0, 1, 1).is_err());
+        assert!(validate_scene_rect(0, i64::MAX - 1, 1, 2).is_err());
+    }
+
+    #[test]
+    fn scene_snapshot_validation_enforces_shared_structure() {
+        let video = SceneValidationSource {
+            key: SceneValidationKey {
+                owner_id: 1,
+                object_id: 10,
+            },
+            is_video: true,
+            linked_video: None,
+        };
+        let audio = SceneValidationSource {
+            key: SceneValidationKey {
+                owner_id: 1,
+                object_id: 11,
+            },
+            is_video: false,
+            linked_video: Some(video.key),
+        };
+        let node = SceneValidationNode {
+            owner_id: 1,
+            node_id: 20,
+            fragment_id: 0,
+            source: video.key,
+            x: 0,
+            y: 0,
+            width: 1 << 32,
+            height: 1 << 32,
+            clip: Some(ClipRect {
+                x: 0,
+                y: 0,
+                width: 1 << 32,
+                height: 1 << 32,
+            }),
+        };
+        assert!(validate_scene_snapshot(&[video, audio], &[node]).is_ok());
+
+        let foreign_audio = SceneValidationSource {
+            linked_video: Some(SceneValidationKey {
+                owner_id: 2,
+                object_id: 10,
+            }),
+            ..audio
+        };
+        assert!(validate_scene_snapshot(&[video, foreign_audio], &[node]).is_err());
+        let non_video_link = SceneValidationSource {
+            linked_video: Some(audio.key),
+            ..audio
+        };
+        assert!(validate_scene_snapshot(&[video, non_video_link], &[node]).is_err());
+        assert!(validate_scene_snapshot(&[video], &[node, node]).is_err());
+
+        let fragments = (0..=MAX_SCENE_FRAGMENTS_PER_NODE)
+            .map(|fragment_id| SceneValidationNode {
+                fragment_id: fragment_id as u64,
+                ..node
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_scene_snapshot(&[video], &fragments).is_err());
+
+        let nodes = (0..=MAX_SCENE_NODES)
+            .map(|node_id| SceneValidationNode {
+                node_id: node_id as u64,
+                ..node
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_scene_snapshot(&[video], &nodes).is_err());
+
+        let invalid_clip = SceneValidationNode {
+            clip: Some(ClipRect {
+                width: 0,
+                ..node.clip.unwrap()
+            }),
+            ..node
+        };
+        assert!(validate_scene_snapshot(&[video], &[invalid_clip]).is_err());
+    }
+
+    #[test]
+    fn flush_and_eos_parse_under_their_own_names() {
+        let body = flush(9, 4, 7);
+        let (envelope, source_id, epoch) = parse_flush(&body).unwrap();
+        assert_eq!((envelope.request_id, source_id, epoch), (9, 4, 7));
+        let body = eos(10, 4, 8);
+        let (envelope, source_id, epoch) = parse_eos(&body).unwrap();
+        assert_eq!((envelope.request_id, source_id, epoch), (10, 4, 8));
+    }
+
+    #[test]
+    fn aac_audio_specific_config_validation() {
+        // AAC-LC, 48 kHz, stereo.
+        assert!(validate_aac_audio_specific_config(&[0x11, 0x90], 48_000, 2).is_ok());
+        // HE-AAC convention: base configuration declares half the output rate.
+        assert!(validate_aac_audio_specific_config(&[0x13, 0x10], 48_000, 2).is_ok());
+        // Explicit 24-bit frequency (index 15).
+        assert!(
+            validate_aac_audio_specific_config(&[0x17, 0x80, 0x5D, 0xC0, 0x10], 48_000, 2).is_ok()
+        );
+        // Rate mismatch, channel mismatch, reserved index, truncation, null object type.
+        assert!(validate_aac_audio_specific_config(&[0x12, 0x10], 48_000, 2).is_err());
+        assert!(validate_aac_audio_specific_config(&[0x11, 0x88], 48_000, 2).is_err());
+        assert!(validate_aac_audio_specific_config(&[0x16, 0x90], 48_000, 2).is_err());
+        assert!(validate_aac_audio_specific_config(&[0x11], 48_000, 2).is_err());
+        assert!(validate_aac_audio_specific_config(&[0x01, 0x90], 48_000, 2).is_err());
+        // Program config element (channelConfiguration 0) accepts any declared count.
+        assert!(validate_aac_audio_specific_config(&[0x11, 0x80], 48_000, 2).is_ok());
     }
 
     #[test]
@@ -2282,6 +3043,7 @@ mod tests {
             channel_mask: 3,
             bitrate: 128_000,
             max_access_unit_bytes: 4_096,
+            codec_string: None,
         };
         let (_, parsed) = parse_create_audio(&probe_audio_config(8, &unsupported)).unwrap();
         assert!(!audio_config_supported(&parsed));
