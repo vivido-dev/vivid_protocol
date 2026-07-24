@@ -67,6 +67,12 @@ pub const DELEGATE_CONTEXT: u16 = 0x0601;
 pub const REVOKE_CONTEXT: u16 = 0x0602;
 pub const CONTEXT_CHANGED: u16 = 0x0603;
 
+pub const KEY_INPUT: u16 = 0x7000;
+pub const POINTER_MOTION: u16 = 0x7001;
+pub const POINTER_BUTTON: u16 = 0x7002;
+pub const POINTER_AXIS: u16 = 0x7003;
+pub const INPUT_RESET: u16 = 0x7004;
+
 pub const ATTACH_CHANNEL: u16 = 0x8000;
 pub const VIDEO_PACKET: u16 = 0x8001;
 pub const VIDEO_FRAGMENT: u16 = 0x8002;
@@ -92,6 +98,7 @@ pub const FEATURE_TEXT_ANCHORS_V2: u64 = 13;
 pub const FEATURE_AUDIO_ACCESS_UNIT_V1: u64 = 14;
 pub const FEATURE_NODE_CLIP_RECT_V1: u64 = 15;
 pub const FEATURE_DECODER_DESCRIPTION_V1: u64 = 16;
+pub const FEATURE_DESKTOP_INPUT_V1: u64 = 17;
 
 /// Negotiate a HELLO feature request against a presenter's supported set.
 ///
@@ -125,6 +132,12 @@ pub const PROFILE_TEXT_ANCHOR_V2: &str = "text-anchor-cell-v2";
 pub const PROFILE_VISIBILITY: &str = "visibility-source-v1";
 pub const PROFILE_AUDIO_ACCESS_UNIT: &str = "audio-access-unit-v1";
 pub const PROFILE_NODE_CLIP_RECT: &str = "node-clip-rect-v1";
+pub const PROFILE_DESKTOP_INPUT: &str = "desktop-input-v1";
+
+pub const HID_KEYBOARD_USAGE_MIN: u16 = 0x04;
+pub const HID_KEYBOARD_USAGE_MAX: u16 = 0xe7;
+pub const POINTER_BUTTON_MAX: u8 = 4;
+pub const POINTER_AXIS_MAX: i32 = 12_000;
 
 pub const MAX_AUDIO_EXTRADATA: usize = 64 * 1024;
 pub const MAX_CODEC_STRING: usize = 64;
@@ -692,6 +705,33 @@ pub struct SourceLost {
     pub diagnostic: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyInput {
+    pub usage: u16,
+    pub pressed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerMotion {
+    pub source_id: u64,
+    pub x: u32,
+    pub y: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerButton {
+    pub source_id: u64,
+    pub button: u8,
+    pub pressed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerAxis {
+    pub source_id: u64,
+    pub horizontal_120: i32,
+    pub vertical_120: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedNodeConfig {
     pub node_id: u64,
@@ -1112,8 +1152,14 @@ pub fn welcome(
         PROFILE_VISIBILITY,
     ];
     let mut profiles = BASE_PROFILES.to_vec();
+    if accepted_features.contains(&FEATURE_DESKTOP_INPUT_V1) {
+        profiles.insert(1, PROFILE_DESKTOP_INPUT);
+    }
     if accepted_features.contains(&FEATURE_NODE_CLIP_RECT_V1) {
-        profiles.insert(2, PROFILE_NODE_CLIP_RECT);
+        let index = profiles
+            .binary_search(&PROFILE_NODE_CLIP_RECT)
+            .unwrap_or_else(|index| index);
+        profiles.insert(index, PROFILE_NODE_CLIP_RECT);
     }
     encode_welcome(
         request_id,
@@ -1271,6 +1317,47 @@ pub fn credit(bytes: u64, packets: u64, fragments: u64) -> Vec<u8> {
         key_u64(encoder, 1, packets);
         key_u64(encoder, 2, fragments);
     })
+}
+
+pub fn key_input(usage: u16, pressed: bool) -> Vec<u8> {
+    envelope(0, None, None, |encoder| {
+        encoder.map(2);
+        key_u64(encoder, 0, u64::from(usage));
+        encoder.u64(1);
+        encoder.bool(pressed);
+    })
+}
+
+pub fn pointer_motion(source_id: u64, x: u32, y: u32) -> Vec<u8> {
+    envelope(0, None, None, |encoder| {
+        encoder.map(3);
+        key_u64(encoder, 0, source_id);
+        key_u64(encoder, 1, u64::from(x));
+        key_u64(encoder, 2, u64::from(y));
+    })
+}
+
+pub fn pointer_button(source_id: u64, button: u8, pressed: bool) -> Vec<u8> {
+    envelope(0, None, None, |encoder| {
+        encoder.map(3);
+        key_u64(encoder, 0, source_id);
+        key_u64(encoder, 1, u64::from(button));
+        encoder.u64(2);
+        encoder.bool(pressed);
+    })
+}
+
+pub fn pointer_axis(source_id: u64, horizontal_120: i32, vertical_120: i32) -> Vec<u8> {
+    envelope(0, None, None, |encoder| {
+        encoder.map(3);
+        key_u64(encoder, 0, source_id);
+        key_i64(encoder, 1, i64::from(horizontal_120));
+        key_i64(encoder, 2, i64::from(vertical_120));
+    })
+}
+
+pub fn input_reset() -> Vec<u8> {
+    envelope(0, None, None, |encoder| encoder.map(0))
 }
 
 pub fn decode_control(body: &[u8]) -> io::Result<ControlEnvelope> {
@@ -2182,6 +2269,82 @@ pub fn parse_credit(body: &[u8]) -> io::Result<Credits> {
     })
 }
 
+pub fn parse_key_input(body: &[u8]) -> io::Result<KeyInput> {
+    let envelope = parse_unsolicited(body, &[0, 1])?;
+    let usage = u16::try_from(required_u64(&envelope.payload, 0, "keyboard usage")?)
+        .map_err(|_| invalid("keyboard usage exceeds u16"))?;
+    if !(HID_KEYBOARD_USAGE_MIN..=HID_KEYBOARD_USAGE_MAX).contains(&usage) {
+        return Err(invalid("keyboard usage is outside the HID keyboard page"));
+    }
+    let pressed = envelope
+        .payload
+        .map_value(1)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| invalid("missing keyboard state"))?;
+    Ok(KeyInput { usage, pressed })
+}
+
+pub fn parse_pointer_motion(body: &[u8]) -> io::Result<PointerMotion> {
+    let envelope = parse_unsolicited(body, &[0, 1, 2])?;
+    let motion = PointerMotion {
+        source_id: required_u64(&envelope.payload, 0, "pointer source ID")?,
+        x: required_u32(&envelope.payload, 1, "pointer x")?,
+        y: required_u32(&envelope.payload, 2, "pointer y")?,
+    };
+    if motion.source_id == 0 {
+        return Err(invalid("pointer source ID is zero"));
+    }
+    Ok(motion)
+}
+
+pub fn parse_pointer_button(body: &[u8]) -> io::Result<PointerButton> {
+    let envelope = parse_unsolicited(body, &[0, 1, 2])?;
+    let source_id = required_u64(&envelope.payload, 0, "pointer source ID")?;
+    let button = u8::try_from(required_u64(&envelope.payload, 1, "pointer button")?)
+        .map_err(|_| invalid("pointer button exceeds u8"))?;
+    let pressed = envelope
+        .payload
+        .map_value(2)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| invalid("missing pointer button state"))?;
+    if source_id == 0 || button > POINTER_BUTTON_MAX {
+        return Err(invalid("pointer button event is outside its bounds"));
+    }
+    Ok(PointerButton {
+        source_id,
+        button,
+        pressed,
+    })
+}
+
+pub fn parse_pointer_axis(body: &[u8]) -> io::Result<PointerAxis> {
+    let envelope = parse_unsolicited(body, &[0, 1, 2])?;
+    let source_id = required_u64(&envelope.payload, 0, "pointer source ID")?;
+    let horizontal_120 = i32::try_from(required_i64(
+        &envelope.payload,
+        1,
+        "horizontal pointer axis",
+    )?)
+    .map_err(|_| invalid("horizontal pointer axis exceeds i32"))?;
+    let vertical_120 = i32::try_from(required_i64(&envelope.payload, 2, "vertical pointer axis")?)
+        .map_err(|_| invalid("vertical pointer axis exceeds i32"))?;
+    if source_id == 0
+        || horizontal_120.unsigned_abs() > POINTER_AXIS_MAX as u32
+        || vertical_120.unsigned_abs() > POINTER_AXIS_MAX as u32
+    {
+        return Err(invalid("pointer axis event is outside its bounds"));
+    }
+    Ok(PointerAxis {
+        source_id,
+        horizontal_120,
+        vertical_120,
+    })
+}
+
+pub fn parse_input_reset(body: &[u8]) -> io::Result<()> {
+    parse_unsolicited(body, &[]).map(|_| ())
+}
+
 pub fn parse_error(body: &[u8]) -> io::Result<String> {
     let error = parse_error_reply(body)?;
     Ok(format!(
@@ -2269,6 +2432,11 @@ pub fn name(record_type: u16) -> &'static str {
         DELEGATE_CONTEXT => "DELEGATE_CONTEXT",
         REVOKE_CONTEXT => "REVOKE_CONTEXT",
         CONTEXT_CHANGED => "CONTEXT_CHANGED",
+        KEY_INPUT => "KEY_INPUT",
+        POINTER_MOTION => "POINTER_MOTION",
+        POINTER_BUTTON => "POINTER_BUTTON",
+        POINTER_AXIS => "POINTER_AXIS",
+        INPUT_RESET => "INPUT_RESET",
         ATTACH_CHANNEL => "ATTACH_CHANNEL",
         VIDEO_PACKET => "VIDEO_PACKET",
         VIDEO_FRAGMENT => "VIDEO_FRAGMENT",
@@ -2279,6 +2447,20 @@ pub fn name(record_type: u16) -> &'static str {
         AUDIO_PACKET => "AUDIO_PACKET",
         _ => "UNKNOWN",
     }
+}
+
+fn parse_unsolicited(body: &[u8], fields: &[u64]) -> io::Result<ControlEnvelope> {
+    let envelope = decode_control(body)?;
+    if envelope.request_id != 0
+        || envelope.transaction_id.is_some()
+        || envelope.expected_generation.is_some()
+    {
+        return Err(invalid(
+            "unsolicited input has request or transaction state",
+        ));
+    }
+    reject_unknown_fields(&envelope.payload, fields)?;
+    Ok(envelope)
 }
 
 fn envelope(
@@ -2640,6 +2822,89 @@ mod tests {
         assert_eq!(
             parse_anchor_event(&anchor_event(0x1020_3040)).unwrap(),
             0x1020_3040
+        );
+    }
+
+    #[test]
+    fn desktop_input_messages_round_trip_and_reject_bounds() {
+        assert_eq!(
+            parse_key_input(&key_input(0x04, true)).unwrap(),
+            KeyInput {
+                usage: 0x04,
+                pressed: true,
+            }
+        );
+        assert_eq!(
+            parse_pointer_motion(&pointer_motion(7, 1919, 1079)).unwrap(),
+            PointerMotion {
+                source_id: 7,
+                x: 1919,
+                y: 1079,
+            }
+        );
+        assert_eq!(
+            parse_pointer_button(&pointer_button(7, 2, false)).unwrap(),
+            PointerButton {
+                source_id: 7,
+                button: 2,
+                pressed: false,
+            }
+        );
+        assert_eq!(
+            parse_pointer_axis(&pointer_axis(7, -120, 240)).unwrap(),
+            PointerAxis {
+                source_id: 7,
+                horizontal_120: -120,
+                vertical_120: 240,
+            }
+        );
+        parse_input_reset(&input_reset()).unwrap();
+
+        assert!(parse_key_input(&key_input(0x03, true)).is_err());
+        assert!(parse_pointer_motion(&pointer_motion(0, 0, 0)).is_err());
+        assert!(parse_pointer_button(&pointer_button(7, 5, true)).is_err());
+        assert!(parse_pointer_axis(&pointer_axis(7, 12_001, 0)).is_err());
+        assert!(parse_input_reset(&ok(1)).is_err());
+    }
+
+    #[test]
+    fn desktop_input_feature_negotiates_and_advertises_its_profile() {
+        let accepted = negotiate_features(
+            &[FEATURE_SCENE_TRANSACTIONS],
+            &[FEATURE_DESKTOP_INPUT_V1],
+            |feature| {
+                matches!(
+                    feature,
+                    FEATURE_SCENE_TRANSACTIONS | FEATURE_DESKTOP_INPUT_V1
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            accepted,
+            vec![FEATURE_SCENE_TRANSACTIONS, FEATURE_DESKTOP_INPUT_V1]
+        );
+        assert_eq!(
+            negotiate_features(&[FEATURE_DESKTOP_INPUT_V1], &[], |_| false),
+            Err(FEATURE_DESKTOP_INPUT_V1)
+        );
+
+        let display = DisplayChanged {
+            display_generation: 1,
+            viewport_width: 800,
+            viewport_height: 600,
+            grid_columns: 800,
+            grid_rows: 600,
+            cell_width: 1,
+            cell_height: 1,
+        };
+        let body = welcome(7, 9, &[1; 16], 10, display, &accepted);
+        let parsed = parse_welcome(&body).unwrap();
+        assert!(
+            parsed
+                .accepted_profiles
+                .iter()
+                .any(|profile| profile == PROFILE_DESKTOP_INPUT)
         );
     }
 

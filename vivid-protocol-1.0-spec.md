@@ -389,6 +389,7 @@ raster-zstd-full-v1
 image-png-jpeg-v1
 video-access-unit-v1
 audio-access-unit-v1
+desktop-input-v1
 text-anchor-cell-v2
 visibility-source-v1
 node-clip-rect-v1
@@ -414,8 +415,9 @@ node-clip-rect-v1
 | 14 | `AUDIO_ACCESS_UNIT_V1` | Optional; encoded audio and `DRAIN` |
 | 15 | `NODE_CLIP_RECT_V1` | Optional; exact cell-space node clipping |
 | 16 | `DECODER_DESCRIPTION_V1` | Optional; decoder-ready codec description fields |
+| 17 | `DESKTOP_INPUT_V1` | Optional; terminal-independent keyboard and pointer input |
 
-Feature IDs 17 and 18 are unassigned in Vivid 1.0 and MUST NOT be negotiated. The portable
+Feature ID 18 is unassigned in Vivid 1.0 and MUST NOT be negotiated. The portable
 Opus, Vorbis, and FLAC forms below extend `AUDIO_ACCESS_UNIT_V1`; they do not allocate new feature
 IDs.
 
@@ -451,7 +453,10 @@ Numeric assignments are normative.
 | `0x0502` | `BLOB_NEED` | `0x0503` | `BLOB_COMPLETE` |
 | `0x0504` | `CACHE_EVICTED` | `0x0600` | `CREATE_CONTEXT` |
 | `0x0601` | `DELEGATE_CONTEXT` | `0x0602` | `REVOKE_CONTEXT` |
-| `0x0603` | `CONTEXT_CHANGED` | `0x8000` | `ATTACH_CHANNEL` |
+| `0x0603` | `CONTEXT_CHANGED` |  |  |
+| `0x7000` | `KEY_INPUT` | `0x7001` | `POINTER_MOTION` |
+| `0x7002` | `POINTER_BUTTON` | `0x7003` | `POINTER_AXIS` |
+| `0x7004` | `INPUT_RESET` | `0x8000` | `ATTACH_CHANNEL` |
 | `0x8001` | `VIDEO_PACKET` | `0x8002` | `VIDEO_FRAGMENT` |
 | `0x8003` | `RASTER_FRAME` | `0x8004` | `BLOB_CHUNK` |
 | `0x8005` | `BUFFER_SUBMIT` | `0x8006` | `IMAGE_DATA` |
@@ -467,6 +472,7 @@ SOURCE_READY DESTROY_SOURCE SOURCE_LOST
 BEGIN_TXN CREATE_NODE UPDATE_NODE DELETE_NODE COMMIT_TXN ABORT_TXN PRESENTED
 ANCHOR_READY ANCHOR_GONE
 PLAY PAUSE FLUSH DRAIN EOS CREDIT VISIBILITY NEED_KEYFRAME
+KEY_INPUT POINTER_MOTION POINTER_BUTTON POINTER_AXIS INPUT_RESET
 ATTACH_CHANNEL VIDEO_PACKET AUDIO_PACKET RASTER_FRAME IMAGE_DATA
 ```
 
@@ -475,7 +481,7 @@ All other assigned operations require a future negotiated profile.
 Extension ranges remain:
 
 ```text
-0x7000-0x7fff  standards-track negotiated extensions
+0x7005-0x7fff  standards-track negotiated extensions
 0x9000-0xbfff  experimental negotiated extensions
 0xc000-0xffff  vendor-specific extensions, disabled unless explicitly negotiated
 ```
@@ -912,6 +918,58 @@ A producer MAY pause, reduce frame rate, or reduce bitrate while false. It MUST 
 ### 7.11 Anchor events
 
 `ANCHOR_READY` and `ANCHOR_GONE` are unsolicited. Payload key 0 and the record object ID both identify the anchor. Anchor IDs are scoped to the authenticated session.
+
+### 7.12 Desktop input
+
+The messages in this section require `DESKTOP_INPUT_V1`. They are unsolicited, use request ID
+zero, have no transaction or display generation, and receive no reply. A presenter MUST send
+`INPUT_RESET` when its input focus is lost. A producer MUST release all held keys and buttons on
+`INPUT_RESET`, control-session loss, or shutdown.
+
+`KEY_INPUT` is session-level and uses object ID zero:
+
+| Key | Type | Meaning |
+|---:|---|---|
+| 0 | uint | USB HID keyboard-page usage, `0x04` through `0xe7` |
+| 1 | bool | `true` for pressed, `false` for released |
+
+The presenter sends physical transitions only and suppresses browser-generated key-repeat
+transitions. The receiving desktop is responsible for key repeat and applies its configured
+keyboard layout.
+
+`POINTER_MOTION` identifies the target video source in both the record object ID and payload key
+zero:
+
+| Key | Type | Meaning |
+|---:|---|---|
+| 0 | uint | Nonzero target video source ID |
+| 1 | uint | Absolute source-pixel x coordinate |
+| 2 | uint | Absolute source-pixel y coordinate |
+
+Coordinates MUST be within the target source dimensions. A presenter SHOULD coalesce motion to at
+most one update per compositor frame.
+
+`POINTER_BUTTON` identifies the target video source in both the record object ID and payload key
+zero:
+
+| Key | Type | Meaning |
+|---:|---|---|
+| 0 | uint | Nonzero target video source ID |
+| 1 | uint | Button: `0` primary, `1` auxiliary, `2` secondary, `3` back, `4` forward |
+| 2 | bool | `true` for pressed, `false` for released |
+
+`POINTER_AXIS` identifies the target video source in both the record object ID and payload key zero:
+
+| Key | Type | Meaning |
+|---:|---|---|
+| 0 | uint | Nonzero target video source ID |
+| 1 | int | Horizontal wheel delta in 1/120 detent units, from `-12000` through `12000` |
+| 2 | int | Vertical wheel delta in 1/120 detent units, from `-12000` through `12000` |
+
+Positive horizontal values scroll left and positive vertical values scroll up. Zero on either
+axis means no motion on that axis.
+
+`INPUT_RESET` is session-level, uses object ID zero, and has an empty payload.
 
 ## 8. Media-channel binding
 
