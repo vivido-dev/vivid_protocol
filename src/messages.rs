@@ -17,6 +17,9 @@ pub const PONG: u16 = 0x0006;
 pub const GOODBYE: u16 = 0x0007;
 pub const DISPLAY_CHANGED: u16 = 0x0008;
 pub const CAPS_CHANGED: u16 = 0x0009;
+pub const SET_OBSERVATION: u16 = 0x000a;
+pub const QUERY_LIMITS: u16 = 0x000b;
+pub const LIMITS_STATUS: u16 = 0x000c;
 
 pub const PROBE_VIDEO_CONFIG: u16 = 0x0100;
 pub const VIDEO_SUPPORT: u16 = 0x0101;
@@ -30,6 +33,14 @@ pub const SOURCE_LOST: u16 = 0x0108;
 pub const PROBE_AUDIO_CONFIG: u16 = 0x0109;
 pub const AUDIO_SUPPORT: u16 = 0x010a;
 pub const CREATE_AUDIO: u16 = 0x010b;
+pub const QUERY_SOURCE: u16 = 0x010c;
+pub const SOURCE_STATUS: u16 = 0x010d;
+pub const SOURCE_CHANGED: u16 = 0x010e;
+pub const WAIT_SOURCE: u16 = 0x010f;
+pub const WAIT_SATISFIED: u16 = 0x0110;
+pub const CANCEL_WAIT: u16 = 0x0111;
+pub const SET_SOURCE_POLICY: u16 = 0x0112;
+pub const UPDATE_SOURCE_DESCRIPTOR: u16 = 0x0113;
 
 pub const BEGIN_TXN: u16 = 0x0200;
 pub const CREATE_NODE: u16 = 0x0201;
@@ -41,6 +52,11 @@ pub const PRESENTED: u16 = 0x0206;
 pub const ANCHOR_READY: u16 = 0x0207;
 pub const ANCHOR_GONE: u16 = 0x0208;
 pub const BARRIER_REACHED: u16 = 0x0209;
+pub const QUERY_SCENE: u16 = 0x020a;
+pub const SCENE_STATUS: u16 = 0x020b;
+pub const SCENE_CHANGED: u16 = 0x020c;
+pub const QUERY_ANCHOR: u16 = 0x020d;
+pub const ANCHOR_STATUS: u16 = 0x020e;
 
 pub const PLAY: u16 = 0x0300;
 pub const PAUSE: u16 = 0x0301;
@@ -55,6 +71,7 @@ pub const FEEDBACK: u16 = 0x0401;
 pub const VISIBILITY: u16 = 0x0402;
 pub const QUALITY_HINT: u16 = 0x0403;
 pub const NEED_KEYFRAME: u16 = 0x0404;
+pub const NEED_FULL_FRAME: u16 = 0x0405;
 
 pub const BLOB_OFFER: u16 = 0x0500;
 pub const BLOB_HAVE: u16 = 0x0501;
@@ -66,6 +83,8 @@ pub const CREATE_CONTEXT: u16 = 0x0600;
 pub const DELEGATE_CONTEXT: u16 = 0x0601;
 pub const REVOKE_CONTEXT: u16 = 0x0602;
 pub const CONTEXT_CHANGED: u16 = 0x0603;
+pub const CONTEXT_READY: u16 = 0x0604;
+pub const CONTEXT_CAPABILITY: u16 = 0x0605;
 
 pub const KEY_INPUT: u16 = 0x7000;
 pub const POINTER_MOTION: u16 = 0x7001;
@@ -99,7 +118,15 @@ pub const FEATURE_AUDIO_ACCESS_UNIT_V1: u64 = 14;
 pub const FEATURE_NODE_CLIP_RECT_V1: u64 = 15;
 pub const FEATURE_DECODER_DESCRIPTION_V1: u64 = 16;
 pub const FEATURE_DESKTOP_INPUT_V1: u64 = 17;
+pub const FEATURE_OBSERVABILITY_CORE_V1: u64 = 18;
+pub const FEATURE_ATOMIC_CONTROL_V1: u64 = 19;
+pub const FEATURE_SOURCE_DESCRIPTOR_V1: u64 = 20;
 pub const FEATURE_DELEGATED_CONTEXT_V1: u64 = 21;
+pub const FEATURE_SOURCE_CAPTURE_POLICY_V1: u64 = 22;
+pub const FEATURE_RASTER_DELTA_V1: u64 = 23;
+pub const FEATURE_IMAGE_CACHE_V1: u64 = 24;
+pub const FEATURE_MEDIA_ORDER_BARRIER_V1: u64 = 25;
+pub const FEATURE_CLOCK_SAMPLING_V1: u64 = 26;
 
 pub const AUTHENTICATION_WINDOW_ROOT: u64 = 0;
 pub const AUTHENTICATION_DELEGATED_CONTEXT: u64 = 1;
@@ -4166,5 +4193,257 @@ mod tests {
         streaminfo[10..18].copy_from_slice(&packed.to_be_bytes());
         validate_flac_streaminfo(&streaminfo, 48_000, 2).unwrap();
         assert!(validate_flac_streaminfo(&streaminfo[..33], 48_000, 2).is_err());
+    }
+
+    fn validate_registry<T>(
+        registry: &str,
+        entries: &[(&str, T)],
+        expected: &[T],
+    ) -> Result<(), String>
+    where
+        T: Copy + Ord + std::fmt::Debug,
+    {
+        let mut assigned = BTreeMap::new();
+        for (name, value) in entries {
+            if let Some(previous) = assigned.insert(*value, *name) {
+                return Err(format!(
+                    "{registry} value {value:?} is assigned to both {previous} and {name}"
+                ));
+            }
+        }
+        let actual = assigned.keys().copied().collect::<Vec<_>>();
+        if actual != expected {
+            return Err(format!(
+                "{registry} assignments {actual:?} do not match the normative registry {expected:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vivid_1_1_numeric_registries_have_no_collisions_or_contradictory_gaps() {
+        let features = [
+            ("RASTER_RGBA8", FEATURE_RASTER_RGBA8),
+            (
+                "RETIRED_VIDEO_FFMPEG_PACKET_V0",
+                FEATURE_RETIRED_VIDEO_FFMPEG_PACKET_V0,
+            ),
+            ("SCENE_TRANSACTIONS", FEATURE_SCENE_TRANSACTIONS),
+            ("GRID_CELL_NODES", FEATURE_GRID_CELL_NODES),
+            ("CREDIT_FLOW_CONTROL", FEATURE_CREDIT_FLOW_CONTROL),
+            ("RETIRED_TEXT_ANCHORS_V1", FEATURE_RETIRED_TEXT_ANCHORS_V1),
+            ("ENCODED_IMAGE_V1", FEATURE_ENCODED_IMAGE_V1),
+            ("RASTER_ZSTD_V1", FEATURE_RASTER_ZSTD_V1),
+            (
+                "RASTER_PREMULTIPLIED_ALPHA",
+                FEATURE_RASTER_PREMULTIPLIED_ALPHA,
+            ),
+            ("VISIBILITY_EVENTS_V1", FEATURE_VISIBILITY_EVENTS_V1),
+            ("VIDEO_ACCESS_UNIT_V1", FEATURE_VIDEO_ACCESS_UNIT_V1),
+            ("VIDEO_CONTROL_V1", FEATURE_VIDEO_CONTROL_V1),
+            ("TEXT_ANCHORS_V2", FEATURE_TEXT_ANCHORS_V2),
+            ("AUDIO_ACCESS_UNIT_V1", FEATURE_AUDIO_ACCESS_UNIT_V1),
+            ("NODE_CLIP_RECT_V1", FEATURE_NODE_CLIP_RECT_V1),
+            ("DECODER_DESCRIPTION_V1", FEATURE_DECODER_DESCRIPTION_V1),
+            ("DESKTOP_INPUT_V1", FEATURE_DESKTOP_INPUT_V1),
+            ("OBSERVABILITY_CORE_V1", FEATURE_OBSERVABILITY_CORE_V1),
+            ("ATOMIC_CONTROL_V1", FEATURE_ATOMIC_CONTROL_V1),
+            ("SOURCE_DESCRIPTOR_V1", FEATURE_SOURCE_DESCRIPTOR_V1),
+            ("DELEGATED_CONTEXT_V1", FEATURE_DELEGATED_CONTEXT_V1),
+            ("SOURCE_CAPTURE_POLICY_V1", FEATURE_SOURCE_CAPTURE_POLICY_V1),
+            ("RASTER_DELTA_V1", FEATURE_RASTER_DELTA_V1),
+            ("IMAGE_CACHE_V1", FEATURE_IMAGE_CACHE_V1),
+            ("MEDIA_ORDER_BARRIER_V1", FEATURE_MEDIA_ORDER_BARRIER_V1),
+            ("CLOCK_SAMPLING_V1", FEATURE_CLOCK_SAMPLING_V1),
+        ];
+        validate_registry("feature", &features, &(1..=26).collect::<Vec<_>>()).unwrap();
+
+        let record_types = [
+            ("HELLO", HELLO),
+            ("WELCOME", WELCOME),
+            ("OK", OK),
+            ("ERROR", ERROR),
+            ("PING", PING),
+            ("PONG", PONG),
+            ("GOODBYE", GOODBYE),
+            ("DISPLAY_CHANGED", DISPLAY_CHANGED),
+            ("CAPS_CHANGED", CAPS_CHANGED),
+            ("SET_OBSERVATION", SET_OBSERVATION),
+            ("QUERY_LIMITS", QUERY_LIMITS),
+            ("LIMITS_STATUS", LIMITS_STATUS),
+            ("PROBE_VIDEO_CONFIG", PROBE_VIDEO_CONFIG),
+            ("VIDEO_SUPPORT", VIDEO_SUPPORT),
+            ("CREATE_IMAGE", CREATE_IMAGE),
+            ("CREATE_VIDEO", CREATE_VIDEO),
+            ("CREATE_RASTER", CREATE_RASTER),
+            ("SOURCE_READY", SOURCE_READY),
+            ("RECONFIGURE_SOURCE", RECONFIGURE_SOURCE),
+            ("DESTROY_SOURCE", DESTROY_SOURCE),
+            ("SOURCE_LOST", SOURCE_LOST),
+            ("PROBE_AUDIO_CONFIG", PROBE_AUDIO_CONFIG),
+            ("AUDIO_SUPPORT", AUDIO_SUPPORT),
+            ("CREATE_AUDIO", CREATE_AUDIO),
+            ("QUERY_SOURCE", QUERY_SOURCE),
+            ("SOURCE_STATUS", SOURCE_STATUS),
+            ("SOURCE_CHANGED", SOURCE_CHANGED),
+            ("WAIT_SOURCE", WAIT_SOURCE),
+            ("WAIT_SATISFIED", WAIT_SATISFIED),
+            ("CANCEL_WAIT", CANCEL_WAIT),
+            ("SET_SOURCE_POLICY", SET_SOURCE_POLICY),
+            ("UPDATE_SOURCE_DESCRIPTOR", UPDATE_SOURCE_DESCRIPTOR),
+            ("BEGIN_TXN", BEGIN_TXN),
+            ("CREATE_NODE", CREATE_NODE),
+            ("UPDATE_NODE", UPDATE_NODE),
+            ("DELETE_NODE", DELETE_NODE),
+            ("COMMIT_TXN", COMMIT_TXN),
+            ("ABORT_TXN", ABORT_TXN),
+            ("PRESENTED", PRESENTED),
+            ("ANCHOR_READY", ANCHOR_READY),
+            ("ANCHOR_GONE", ANCHOR_GONE),
+            ("BARRIER_REACHED", BARRIER_REACHED),
+            ("QUERY_SCENE", QUERY_SCENE),
+            ("SCENE_STATUS", SCENE_STATUS),
+            ("SCENE_CHANGED", SCENE_CHANGED),
+            ("QUERY_ANCHOR", QUERY_ANCHOR),
+            ("ANCHOR_STATUS", ANCHOR_STATUS),
+            ("PLAY", PLAY),
+            ("PAUSE", PAUSE),
+            ("STEP", STEP),
+            ("FLUSH", FLUSH),
+            ("DRAIN", DRAIN),
+            ("EOS", EOS),
+            ("PLAYBACK_STATE", PLAYBACK_STATE),
+            ("CREDIT", CREDIT),
+            ("FEEDBACK", FEEDBACK),
+            ("VISIBILITY", VISIBILITY),
+            ("QUALITY_HINT", QUALITY_HINT),
+            ("NEED_KEYFRAME", NEED_KEYFRAME),
+            ("NEED_FULL_FRAME", NEED_FULL_FRAME),
+            ("BLOB_OFFER", BLOB_OFFER),
+            ("BLOB_HAVE", BLOB_HAVE),
+            ("BLOB_NEED", BLOB_NEED),
+            ("BLOB_COMPLETE", BLOB_COMPLETE),
+            ("CACHE_EVICTED", CACHE_EVICTED),
+            ("CREATE_CONTEXT", CREATE_CONTEXT),
+            ("DELEGATE_CONTEXT", DELEGATE_CONTEXT),
+            ("REVOKE_CONTEXT", REVOKE_CONTEXT),
+            ("CONTEXT_CHANGED", CONTEXT_CHANGED),
+            ("CONTEXT_READY", CONTEXT_READY),
+            ("CONTEXT_CAPABILITY", CONTEXT_CAPABILITY),
+            ("KEY_INPUT", KEY_INPUT),
+            ("POINTER_MOTION", POINTER_MOTION),
+            ("POINTER_BUTTON", POINTER_BUTTON),
+            ("POINTER_AXIS", POINTER_AXIS),
+            ("INPUT_RESET", INPUT_RESET),
+            ("ATTACH_CHANNEL", ATTACH_CHANNEL),
+            ("VIDEO_PACKET", VIDEO_PACKET),
+            ("VIDEO_FRAGMENT", VIDEO_FRAGMENT),
+            ("RASTER_FRAME", RASTER_FRAME),
+            ("BLOB_CHUNK", BLOB_CHUNK),
+            ("BUFFER_SUBMIT", BUFFER_SUBMIT),
+            ("IMAGE_DATA", IMAGE_DATA),
+            ("AUDIO_PACKET", AUDIO_PACKET),
+        ];
+        let expected_record_types = [
+            (0x0001..=0x000c).collect::<Vec<_>>(),
+            (0x0100..=0x0113).collect(),
+            (0x0200..=0x020e).collect(),
+            (0x0300..=0x0306).collect(),
+            (0x0400..=0x0405).collect(),
+            (0x0500..=0x0504).collect(),
+            (0x0600..=0x0605).collect(),
+            (0x7000..=0x7004).collect(),
+            (0x8000..=0x8007).collect(),
+        ]
+        .concat();
+        validate_registry("record type", &record_types, &expected_record_types).unwrap();
+
+        let envelope_keys = [
+            ("request_id", 0_u64),
+            ("transaction_id", 1),
+            ("expected_display_generation", 2),
+            ("payload", 3),
+            ("preconditions", 4),
+            ("idempotency_key", 5),
+            ("causation_id", 6),
+        ];
+        validate_registry("envelope key", &envelope_keys, &(0..=6).collect::<Vec<_>>()).unwrap();
+
+        for (schema, last_key) in [
+            ("CREATE_VIDEO", 24_u64),
+            ("CREATE_AUDIO", 13),
+            ("CREATE_RASTER", 10),
+            ("CREATE_IMAGE", 10),
+            ("CREATE_NODE/UPDATE_NODE", 18),
+            ("PLAY", 7),
+            ("ERROR detail", 12),
+        ] {
+            let entries = (0..=last_key)
+                .map(|key| (format!("{schema}.{key}"), key))
+                .collect::<Vec<_>>();
+            let borrowed = entries
+                .iter()
+                .map(|(name, key)| (name.as_str(), *key))
+                .collect::<Vec<_>>();
+            validate_registry(
+                &format!("{schema} payload key"),
+                &borrowed,
+                &(0..=last_key).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn registry_checker_rejects_a_deliberate_duplicate() {
+        let duplicate = [("first", 1_u64), ("second", 1_u64)];
+        let error = validate_registry("test", &duplicate, &[1]).unwrap_err();
+        assert!(error.contains("assigned to both first and second"));
+    }
+
+    #[test]
+    fn every_specification_key_table_has_unique_numeric_assignments() {
+        let specification = include_str!("../vivid-protocol-1.1-spec.md");
+        let lines = specification.lines().collect::<Vec<_>>();
+        let mut heading = "document";
+        let mut checked_tables = 0;
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index].trim();
+            if line.starts_with('#') {
+                heading = line;
+            }
+            if !line.starts_with("| Key |") {
+                index += 1;
+                continue;
+            }
+            checked_tables += 1;
+            index += 2;
+            let mut keys = BTreeMap::new();
+            while index < lines.len() {
+                let row = lines[index].trim();
+                if !row.starts_with('|') {
+                    break;
+                }
+                let first = row
+                    .trim_matches('|')
+                    .split('|')
+                    .next()
+                    .unwrap()
+                    .trim()
+                    .trim_matches('`');
+                if let Ok(key) = first.parse::<u64>() {
+                    assert!(
+                        keys.insert(key, index + 1).is_none(),
+                        "{heading} assigns payload key {key} more than once"
+                    );
+                }
+                index += 1;
+            }
+        }
+        assert!(
+            checked_tables >= 40,
+            "registry scan unexpectedly covered only {checked_tables} key tables"
+        );
     }
 }

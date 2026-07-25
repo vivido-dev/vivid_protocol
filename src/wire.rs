@@ -1013,6 +1013,22 @@ mod tests {
     }
 
     #[test]
+    fn connection_kind_registry_is_collision_free_and_contiguous() {
+        let kinds = [
+            ConnectionKind::Control as u8,
+            ConnectionKind::Video as u8,
+            ConnectionKind::Raster as u8,
+            ConnectionKind::Blob as u8,
+            ConnectionKind::LocalBuffer as u8,
+            ConnectionKind::Audio as u8,
+        ];
+        assert_eq!(kinds, [0, 1, 2, 3, 4, 5]);
+        for (expected, value) in kinds.into_iter().enumerate() {
+            assert_eq!(ConnectionKind::try_from(value).unwrap() as usize, expected);
+        }
+    }
+
+    #[test]
     fn rejects_invalid_prefaces() {
         let mut preface = encode_preface(ConnectionKind::Control, 1024);
         preface[0] = b'X';
@@ -1053,6 +1069,45 @@ mod tests {
         let mut silent = Vec::new();
         assert!(accept_preface(malformed, &mut silent).is_err());
         assert!(silent.is_empty());
+    }
+
+    #[cfg(feature = "native")]
+    fn assert_stream_version_rejection<S>(mut initiator: S, mut receiver: S)
+    where
+        S: Read + Write + Send + 'static,
+    {
+        let server = std::thread::spawn(move || {
+            let mut preface = [0; PREFACE_SIZE];
+            receiver.read_exact(&mut preface).unwrap();
+            let error = accept_preface(preface, &mut receiver).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        });
+        let mut preface = encode_preface(ConnectionKind::Control, 4096);
+        preface[5] = VIVID_MINOR.wrapping_sub(1);
+        initiator.write_all(&preface).unwrap();
+        let mut received = Vec::new();
+        initiator.read_to_end(&mut received).unwrap();
+        server.join().unwrap();
+        assert_eq!(received, unsupported_version_record());
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn unix_transport_emits_exactly_one_typed_version_rejection_then_closes() {
+        let (initiator, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_stream_version_rejection(initiator, receiver);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn loopback_tcp_and_ssh_forward_transport_reject_versions_identically() {
+        for _transport in ["loopback TCP", "SSH-forwarded loopback TCP"] {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let initiator = std::net::TcpStream::connect(address).unwrap();
+            let (receiver, _) = listener.accept().unwrap();
+            assert_stream_version_rejection(initiator, receiver);
+        }
     }
 
     #[test]
