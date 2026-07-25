@@ -439,6 +439,7 @@ pub struct DisplayChanged {
     pub grid_rows: u32,
     pub cell_width: u32,
     pub cell_height: u32,
+    pub settled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1879,7 +1880,7 @@ pub fn try_encode_welcome_for_version(
 
 pub fn display_changed(request_id: u64, display: DisplayChanged) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(7);
+        encoder.map(if display.settled { 7 } else { 8 });
         key_u64(encoder, 0, display.display_generation);
         key_u64(encoder, 1, u64::from(display.viewport_width));
         key_u64(encoder, 2, u64::from(display.viewport_height));
@@ -1887,6 +1888,10 @@ pub fn display_changed(request_id: u64, display: DisplayChanged) -> Vec<u8> {
         key_u64(encoder, 4, u64::from(display.grid_rows));
         key_u64(encoder, 5, u64::from(display.cell_width));
         key_u64(encoder, 6, u64::from(display.cell_height));
+        if !display.settled {
+            encoder.u64(7);
+            encoder.bool(false);
+        }
     })
 }
 
@@ -3294,6 +3299,7 @@ pub fn parse_welcome_for_version(body: &[u8], major: u64, minor: u64) -> io::Res
 
 pub fn parse_display_changed(body: &[u8]) -> io::Result<DisplayChanged> {
     let (_, payload) = decode_envelope(body)?;
+    reject_unknown_fields(&payload, &[0, 1, 2, 3, 4, 5, 6, 7])?;
     Ok(DisplayChanged {
         display_generation: required_u64(&payload, 0, "display generation")?,
         viewport_width: required_u32(&payload, 1, "viewport width")?,
@@ -3302,6 +3308,15 @@ pub fn parse_display_changed(body: &[u8]) -> io::Result<DisplayChanged> {
         grid_rows: required_u32(&payload, 4, "grid rows")?,
         cell_width: required_u32(&payload, 5, "cell width")?,
         cell_height: required_u32(&payload, 6, "cell height")?,
+        settled: payload
+            .map_value(7)
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| invalid("display settled is not boolean"))
+            })
+            .transpose()?
+            .unwrap_or(true),
     })
 }
 
@@ -4785,6 +4800,7 @@ mod tests {
             grid_rows: 600,
             cell_width: 1,
             cell_height: 1,
+            settled: true,
         };
         let body = welcome(7, 9, &[1; 16], 10, display, &accepted);
         let parsed = parse_welcome(&body).unwrap();
@@ -4806,6 +4822,7 @@ mod tests {
             grid_rows: 24,
             cell_width: 10,
             cell_height: 25,
+            settled: true,
         };
         let features = [
             FEATURE_RASTER_RGBA8,
@@ -4888,6 +4905,7 @@ mod tests {
             grid_rows: 24,
             cell_width: 10,
             cell_height: 25,
+            settled: true,
         };
         let preserved = vec![PreservedField {
             key: 19,
@@ -4929,6 +4947,7 @@ mod tests {
                     grid_rows: parsed.grid_rows as u32,
                     cell_width: parsed.cell_width,
                     cell_height: parsed.cell_height,
+                    settled: true,
                 },
                 maximum_control_body: parsed.maximum_control_body,
                 accepted_profiles: &[],
@@ -5464,20 +5483,37 @@ mod tests {
     #[test]
     fn observability_existing_message_extensions_round_trip() {
         let tag = [3; 16];
+        let final_display = DisplayChanged {
+            display_generation: 1,
+            viewport_width: 800,
+            viewport_height: 600,
+            grid_columns: 80,
+            grid_rows: 30,
+            cell_width: 10,
+            cell_height: 20,
+            settled: true,
+        };
+        assert_eq!(
+            parse_display_changed(&display_changed(0, final_display)).unwrap(),
+            final_display,
+            "an omitted settled field defaults to true"
+        );
+        let resizing_display = DisplayChanged {
+            display_generation: 2,
+            settled: false,
+            ..final_display
+        };
+        assert_eq!(
+            parse_display_changed(&display_changed(0, resizing_display)).unwrap(),
+            resizing_display
+        );
+
         let welcome = parse_welcome(&welcome_preserving_at_scene_revision(
             3,
             4,
             &tag,
             5,
-            DisplayChanged {
-                display_generation: 1,
-                viewport_width: 800,
-                viewport_height: 600,
-                grid_columns: 80,
-                grid_rows: 30,
-                cell_width: 10,
-                cell_height: 20,
-            },
+            final_display,
             &[FEATURE_OBSERVABILITY_CORE_V1],
             SceneRevision::new(23),
             &[],
