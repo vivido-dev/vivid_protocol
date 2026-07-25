@@ -192,6 +192,11 @@ pub fn write(path: &Path, report: &BenchmarkReport) -> io::Result<()> {
     )?;
     writeln!(
         output,
+        "    \"credit_latency_non_regression\": {},",
+        report.gate.credit_latency_non_regression
+    )?;
+    writeln!(
+        output,
         "    \"source_isolation\": {}",
         report.gate.source_isolation
     )?;

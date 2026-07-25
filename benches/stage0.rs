@@ -200,6 +200,7 @@ struct GateResult {
     stage0_copied_bytes: u64,
     pre_stage0_copied_bytes: u64,
     control_latency_non_regression: bool,
+    credit_latency_non_regression: bool,
     source_isolation: bool,
 }
 
@@ -307,6 +308,7 @@ fn run_scenario(
     let gate_passed = stage0.total_hot_path_allocations < pre_stage0.total_hot_path_allocations
         && stage0.copied_bytes < pre_stage0.copied_bytes
         && stage0.control_reply_latency_us.p99 <= pre_stage0.control_reply_latency_us.p99
+        && stage0.credit_return_latency_us.p99 <= pre_stage0.credit_return_latency_us.p99
         && isolation.passed
         && delivery_check.passed;
 
@@ -769,6 +771,9 @@ fn gate(results: &[ScenarioResult]) -> GateResult {
     let control_latency_non_regression = results.iter().all(|result| {
         result.stage0.control_reply_latency_us.p99 <= result.pre_stage0.control_reply_latency_us.p99
     });
+    let credit_latency_non_regression = results.iter().all(|result| {
+        result.stage0.credit_return_latency_us.p99 <= result.pre_stage0.credit_return_latency_us.p99
+    });
     let source_isolation = results
         .iter()
         .all(|result| result.isolation.passed && result.delivery_check.passed);
@@ -778,12 +783,14 @@ fn gate(results: &[ScenarioResult]) -> GateResult {
             && stage0_allocations < pre_stage0_allocations
             && stage0_copied_bytes < pre_stage0_copied_bytes
             && control_latency_non_regression
+            && credit_latency_non_regression
             && source_isolation,
         stage0_allocations,
         pre_stage0_allocations,
         stage0_copied_bytes,
         pre_stage0_copied_bytes,
         control_latency_non_regression,
+        credit_latency_non_regression,
         source_isolation,
     }
 }
