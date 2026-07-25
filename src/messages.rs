@@ -312,6 +312,16 @@ pub const ERROR_DETAIL_OFFENDING_PAYLOAD_KEY: u64 = 10;
 pub const ERROR_DETAIL_SUPPORTED_MAJOR: u64 = 11;
 pub const ERROR_DETAIL_SUPPORTED_MINOR: u64 = 12;
 
+pub const PRECONDITION_SCENE_REVISION: u64 = 0;
+pub const PRECONDITION_SOURCE_REVISION: u64 = 1;
+pub const PRECONDITION_SOURCE_EPOCH: u64 = 2;
+pub const PRECONDITION_SOURCE_LIFECYCLE: u64 = 3;
+pub const PRECONDITION_ANCHOR_STATE: u64 = 4;
+pub const PRECONDITION_CONTENT_REVISION: u64 = 5;
+pub const MAX_PRECONDITIONS: usize = 6;
+pub const IDEMPOTENCY_KEY_BYTES: usize = 16;
+pub const CAUSATION_ID_BYTES: usize = 16;
+
 pub const LIMIT_CONCURRENT_SESSIONS: u64 = 1;
 pub const LIMIT_CONCURRENT_CONNECTIONS: u64 = 2;
 pub const LIMIT_SOURCES: u64 = 3;
@@ -1043,6 +1053,37 @@ pub struct ControlEnvelope {
     pub transaction_id: Option<u64>,
     pub expected_generation: Option<u64>,
     pub payload: Value,
+    pub preconditions: BTreeMap<u64, u64>,
+    pub idempotency_key: Option<[u8; IDEMPOTENCY_KEY_BYTES]>,
+    pub causation_id: Option<[u8; CAUSATION_ID_BYTES]>,
+}
+
+/// Optional Vivid 1.1 state-changing request metadata carried in envelope keys 4 through 6.
+///
+/// The byte arrays are intentionally fixed-size and contain no formatting or display helpers:
+/// idempotency keys and causation IDs must never accidentally become loggable credentials or
+/// user-facing diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestMetadata {
+    pub preconditions: BTreeMap<u64, u64>,
+    pub idempotency_key: Option<[u8; IDEMPOTENCY_KEY_BYTES]>,
+    pub causation_id: Option<[u8; CAUSATION_ID_BYTES]>,
+}
+
+impl RequestMetadata {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.preconditions.len() > MAX_PRECONDITIONS
+            || self
+                .preconditions
+                .keys()
+                .any(|kind| *kind > PRECONDITION_CONTENT_REVISION)
+        {
+            return Err(invalid(
+                "request contains an unknown or excessive precondition",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1267,6 +1308,7 @@ pub fn hello(request_id: u64, token: &str) -> Vec<u8> {
         FEATURE_AUDIO_ACCESS_UNIT_V1,
         FEATURE_DECODER_DESCRIPTION_V1,
         FEATURE_OBSERVABILITY_CORE_V1,
+        FEATURE_ATOMIC_CONTROL_V1,
     ];
     encode_hello(
         request_id,
@@ -2453,7 +2495,20 @@ pub fn decode_control(body: &[u8]) -> io::Result<ControlEnvelope> {
     if !matches!(payload, Value::Map(_)) {
         return Err(invalid("control payload is not a map"));
     }
-    reject_unknown_fields(&value, &[0, 1, 2, 3])?;
+    reject_unknown_fields(&value, &[0, 1, 2, 3, 4, 5, 6])?;
+    let preconditions = value
+        .map_value(4)
+        .map(parse_preconditions)
+        .transpose()?
+        .unwrap_or_default();
+    let idempotency_key = value
+        .map_value(5)
+        .map(|value| fixed_bytes::<IDEMPOTENCY_KEY_BYTES>(value, "idempotency key"))
+        .transpose()?;
+    let causation_id = value
+        .map_value(6)
+        .map(|value| fixed_bytes::<CAUSATION_ID_BYTES>(value, "causation ID"))
+        .transpose()?;
     Ok(ControlEnvelope {
         request_id: required_u64(&value, 0, "request ID")?,
         transaction_id: value
@@ -2476,7 +2531,98 @@ pub fn decode_control(body: &[u8]) -> io::Result<ControlEnvelope> {
             })
             .transpose()?,
         payload,
+        preconditions,
+        idempotency_key,
+        causation_id,
     })
+}
+
+/// Add keys 4 through 6 to an already encoded deterministic control envelope.
+///
+/// This is the canonical adapter for callers that use the existing operation-specific encoders.
+/// It rejects attempts to overwrite metadata and always re-encodes the map canonically.
+pub fn with_request_metadata(body: &[u8], metadata: &RequestMetadata) -> io::Result<Vec<u8>> {
+    metadata.validate()?;
+    let mut value = cbor::decode(body).map_err(invalid_data)?;
+    let Value::Map(entries) = &mut value else {
+        return Err(invalid("control envelope is not a map"));
+    };
+    if entries.iter().any(|(key, _)| (4..=6).contains(key)) {
+        return Err(invalid(
+            "control envelope already contains request metadata",
+        ));
+    }
+    if !metadata.preconditions.is_empty() {
+        entries.push((
+            4,
+            Value::Map(
+                metadata
+                    .preconditions
+                    .iter()
+                    .map(|(kind, expected)| (*kind, Value::Unsigned(*expected)))
+                    .collect(),
+            ),
+        ));
+    }
+    if let Some(key) = metadata.idempotency_key {
+        entries.push((5, Value::Bytes(key.to_vec())));
+    }
+    if let Some(id) = metadata.causation_id {
+        entries.push((6, Value::Bytes(id.to_vec())));
+    }
+    entries.sort_by_key(|(key, _)| *key);
+    cbor::encode(&value).map_err(invalid_data)
+}
+
+/// Enforce the cross-operation envelope rules from specification section 4.2.
+pub fn validate_request_metadata(
+    record_type: u16,
+    envelope: &ControlEnvelope,
+    atomic_control_accepted: bool,
+) -> io::Result<()> {
+    if (!envelope.preconditions.is_empty() || envelope.idempotency_key.is_some())
+        && !atomic_control_accepted
+    {
+        return Err(invalid(
+            "atomic request metadata was supplied without ATOMIC_CONTROL_V1",
+        ));
+    }
+    if (!envelope.preconditions.is_empty() || envelope.idempotency_key.is_some())
+        && !is_state_changing_request(record_type)
+    {
+        return Err(invalid(
+            "probe, query, wait, liveness, or reply record contains atomic request metadata",
+        ));
+    }
+    Ok(())
+}
+
+pub fn is_state_changing_request(record_type: u16) -> bool {
+    matches!(
+        record_type,
+        SET_OBSERVATION
+            | CREATE_IMAGE
+            | CREATE_VIDEO
+            | CREATE_RASTER
+            | DESTROY_SOURCE
+            | CREATE_AUDIO
+            | SET_SOURCE_POLICY
+            | UPDATE_SOURCE_DESCRIPTOR
+            | BEGIN_TXN
+            | CREATE_NODE
+            | UPDATE_NODE
+            | DELETE_NODE
+            | COMMIT_TXN
+            | ABORT_TXN
+            | PLAY
+            | PAUSE
+            | FLUSH
+            | DRAIN
+            | EOS
+            | CREATE_CONTEXT
+            | DELEGATE_CONTEXT
+            | REVOKE_CONTEXT
+    )
 }
 
 pub fn parse_hello(body: &[u8]) -> io::Result<(u64, Hello)> {
@@ -3992,6 +4138,8 @@ fn parse_unsolicited(body: &[u8], fields: &[u64]) -> io::Result<ControlEnvelope>
     if envelope.request_id != 0
         || envelope.transaction_id.is_some()
         || envelope.expected_generation.is_some()
+        || !envelope.preconditions.is_empty()
+        || envelope.idempotency_key.is_some()
     {
         return Err(invalid(
             "unsolicited input has request or transaction state",
@@ -3999,6 +4147,42 @@ fn parse_unsolicited(body: &[u8], fields: &[u64]) -> io::Result<ControlEnvelope>
     }
     reject_unknown_fields(&envelope.payload, fields)?;
     Ok(envelope)
+}
+
+fn parse_preconditions(value: &Value) -> io::Result<BTreeMap<u64, u64>> {
+    let Value::Map(entries) = value else {
+        return Err(invalid("preconditions are not a map"));
+    };
+    if entries.len() > MAX_PRECONDITIONS {
+        return Err(invalid("request contains too many preconditions"));
+    }
+    entries
+        .iter()
+        .map(|(kind, value)| {
+            if *kind > PRECONDITION_CONTENT_REVISION {
+                return Err(invalid("request contains an unknown precondition kind"));
+            }
+            let expected = value
+                .as_u64()
+                .ok_or_else(|| invalid("precondition value is not unsigned"))?;
+            Ok((*kind, expected))
+        })
+        .collect()
+}
+
+fn fixed_bytes<const N: usize>(value: &Value, description: &str) -> io::Result<[u8; N]> {
+    let Value::Bytes(bytes) = value else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} is not a byte string"),
+        ));
+    };
+    bytes.as_slice().try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} is not {N} bytes"),
+        )
+    })
 }
 
 fn envelope(
@@ -4463,6 +4647,60 @@ fn key_i64(encoder: &mut Encoder, key: u64, value: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_request_metadata_round_trips_and_is_feature_gated() {
+        let mut preconditions = BTreeMap::new();
+        preconditions.insert(PRECONDITION_SCENE_REVISION, 41);
+        preconditions.insert(PRECONDITION_SOURCE_REVISION, 9);
+        let metadata = RequestMetadata {
+            preconditions,
+            idempotency_key: Some([0x11; IDEMPOTENCY_KEY_BYTES]),
+            causation_id: Some([0x22; CAUSATION_ID_BYTES]),
+        };
+        let encoded =
+            with_request_metadata(&destroy_source(7, 23), &metadata).expect("encode metadata");
+        let envelope = decode_control(&encoded).expect("decode metadata");
+        assert_eq!(envelope.preconditions, metadata.preconditions);
+        assert_eq!(envelope.idempotency_key, metadata.idempotency_key);
+        assert_eq!(envelope.causation_id, metadata.causation_id);
+        assert!(validate_request_metadata(DESTROY_SOURCE, &envelope, true).is_ok());
+        assert!(validate_request_metadata(DESTROY_SOURCE, &envelope, false).is_err());
+    }
+
+    #[test]
+    fn atomic_metadata_is_never_silently_accepted_on_non_mutating_records() {
+        let metadata = RequestMetadata {
+            preconditions: BTreeMap::from([(PRECONDITION_SOURCE_REVISION, 3)]),
+            idempotency_key: Some([0x33; IDEMPOTENCY_KEY_BYTES]),
+            causation_id: None,
+        };
+        for (record_type, body) in [
+            (PING, ok(1)),
+            (QUERY_SOURCE, query_source(2, 8).unwrap()),
+            (
+                WAIT_SOURCE,
+                wait_source(
+                    3,
+                    WaitSource {
+                        source_id: 8,
+                        condition: WAIT_SOURCE_REVISION,
+                        value: Some(4),
+                        timeout_us: 1_000,
+                    },
+                )
+                .unwrap(),
+            ),
+        ] {
+            let encoded = with_request_metadata(&body, &metadata).unwrap();
+            let envelope = decode_control(&encoded).unwrap();
+            assert!(
+                validate_request_metadata(record_type, &envelope, true).is_err(),
+                "{} silently accepted atomic metadata",
+                name(record_type)
+            );
+        }
+    }
 
     #[test]
     fn hello_uses_control_envelope() {
