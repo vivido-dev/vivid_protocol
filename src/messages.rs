@@ -321,6 +321,28 @@ pub const PRECONDITION_CONTENT_REVISION: u64 = 5;
 pub const MAX_PRECONDITIONS: usize = 6;
 pub const IDEMPOTENCY_KEY_BYTES: usize = 16;
 pub const CAUSATION_ID_BYTES: usize = 16;
+pub const CONTEXT_CAPABILITY_BYTES: usize = 32;
+pub const MAX_CONTEXT_LABEL_BYTES: usize = 64;
+pub const MAX_CONTEXTS_PER_SESSION: usize = 32;
+
+pub const CONTEXT_CLASS_OBSERVE: u64 = 1 << 0;
+pub const CONTEXT_CLASS_CREATE_SOURCE: u64 = 1 << 1;
+pub const CONTEXT_CLASS_MUTATE_SCENE: u64 = 1 << 2;
+pub const CONTEXT_CLASS_CREATE_ANCHOR: u64 = 1 << 3;
+pub const CONTEXT_CLASS_DESKTOP_INPUT: u64 = 1 << 4;
+pub const CONTEXT_CLASS_ADMINISTER: u64 = 1 << 5;
+pub const CONTEXT_CLASS_MASK: u64 = (1 << 6) - 1;
+
+pub const CONTEXT_STATE_ACTIVE: u64 = 1;
+pub const CONTEXT_STATE_EXPIRED: u64 = 2;
+pub const CONTEXT_STATE_REVOKED: u64 = 3;
+
+pub const CONTEXT_CHANGED_EXPLICIT_REVOCATION: u64 = 1 << 0;
+pub const CONTEXT_CHANGED_EXPIRY: u64 = 1 << 1;
+pub const CONTEXT_CHANGED_PARENT_REVOKED: u64 = 1 << 2;
+pub const CONTEXT_CHANGED_QUOTA_REDUCTION: u64 = 1 << 3;
+pub const CONTEXT_CHANGED_PRESENTER_POLICY: u64 = 1 << 4;
+pub const CONTEXT_CHANGED_REASON_MASK: u64 = (1 << 5) - 1;
 
 pub const LIMIT_CONCURRENT_SESSIONS: u64 = 1;
 pub const LIMIT_CONCURRENT_CONNECTIONS: u64 = 2;
@@ -1068,6 +1090,56 @@ pub struct RequestMetadata {
     pub preconditions: BTreeMap<u64, u64>,
     pub idempotency_key: Option<[u8; IDEMPOTENCY_KEY_BYTES]>,
     pub causation_id: Option<[u8; CAUSATION_ID_BYTES]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextQuotas {
+    pub maximum_sources: u64,
+    pub maximum_nodes: u64,
+    pub maximum_retained_pixels: u64,
+    pub maximum_media_bytes: u64,
+    pub maximum_media_connections: u64,
+}
+
+impl ContextQuotas {
+    pub fn intersect(self, parent: Self) -> Self {
+        Self {
+            maximum_sources: self.maximum_sources.min(parent.maximum_sources),
+            maximum_nodes: self.maximum_nodes.min(parent.maximum_nodes),
+            maximum_retained_pixels: self
+                .maximum_retained_pixels
+                .min(parent.maximum_retained_pixels),
+            maximum_media_bytes: self.maximum_media_bytes.min(parent.maximum_media_bytes),
+            maximum_media_connections: self
+                .maximum_media_connections
+                .min(parent.maximum_media_connections),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateContextRequest {
+    pub context_id: u64,
+    pub parent_context_id: u64,
+    pub class_mask: u64,
+    pub label: String,
+    pub expiry_us: u64,
+    pub quotas: ContextQuotas,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextReady {
+    pub context_id: u64,
+    pub class_mask: u64,
+    pub quotas: ContextQuotas,
+    pub expiry_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextChanged {
+    pub context_id: u64,
+    pub state: u64,
+    pub reason_mask: u64,
 }
 
 impl RequestMetadata {
@@ -2483,6 +2555,64 @@ pub fn input_reset() -> Vec<u8> {
     envelope(0, None, None, |encoder| encoder.map(0))
 }
 
+pub fn create_context(request_id: u64, request: &CreateContextRequest) -> io::Result<Vec<u8>> {
+    validate_create_context(request)?;
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(6);
+        key_u64(encoder, 0, request.context_id);
+        key_u64(encoder, 1, request.parent_context_id);
+        key_u64(encoder, 2, request.class_mask);
+        encoder.u64(3);
+        encoder.text(&request.label);
+        key_u64(encoder, 4, request.expiry_us);
+        encoder.u64(5);
+        encode_context_quotas(encoder, request.quotas);
+    }))
+}
+
+pub fn context_ready(request_id: u64, ready: ContextReady) -> io::Result<Vec<u8>> {
+    validate_context_ready(ready)?;
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(4);
+        key_u64(encoder, 0, ready.context_id);
+        key_u64(encoder, 1, ready.class_mask);
+        encoder.u64(2);
+        encode_context_quotas(encoder, ready.quotas);
+        key_u64(encoder, 3, ready.expiry_us);
+    }))
+}
+
+pub fn delegate_context(request_id: u64, context_id: u64) -> Vec<u8> {
+    object_id_payload(request_id, context_id)
+}
+
+pub fn context_capability(
+    request_id: u64,
+    context_id: u64,
+    capability: &[u8; CONTEXT_CAPABILITY_BYTES],
+) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(2);
+        key_u64(encoder, 0, context_id);
+        encoder.u64(1);
+        encoder.bytes(capability);
+    })
+}
+
+pub fn revoke_context(request_id: u64, context_id: u64) -> Vec<u8> {
+    object_id_payload(request_id, context_id)
+}
+
+pub fn context_changed(changed: ContextChanged) -> io::Result<Vec<u8>> {
+    validate_context_changed(changed)?;
+    Ok(envelope(0, None, None, |encoder| {
+        encoder.map(3);
+        key_u64(encoder, 0, changed.context_id);
+        key_u64(encoder, 1, changed.state);
+        key_u64(encoder, 2, changed.reason_mask);
+    }))
+}
+
 pub fn decode_control(body: &[u8]) -> io::Result<ControlEnvelope> {
     let value = cbor::decode(body).map_err(invalid_data)?;
     if !matches!(value, Value::Map(_)) {
@@ -2671,6 +2801,80 @@ pub fn parse_hello(body: &[u8]) -> io::Result<(u64, Hello)> {
         return Err(invalid("HELLO required and optional feature sets overlap"));
     }
     Ok((request_id, hello))
+}
+
+pub fn parse_create_context(body: &[u8]) -> io::Result<(ControlEnvelope, CreateContextRequest)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0, 1, 2, 3, 4, 5])?;
+    let request = CreateContextRequest {
+        context_id: required_u64(&envelope.payload, 0, "context ID")?,
+        parent_context_id: required_u64(&envelope.payload, 1, "parent context ID")?,
+        class_mask: required_u64(&envelope.payload, 2, "context class mask")?,
+        label: bounded_text(
+            &envelope.payload,
+            3,
+            "context label",
+            MAX_CONTEXT_LABEL_BYTES,
+        )?
+        .to_owned(),
+        expiry_us: required_u64(&envelope.payload, 4, "context expiry")?,
+        quotas: parse_context_quotas(
+            envelope
+                .payload
+                .map_value(5)
+                .ok_or_else(|| invalid("missing context quota map"))?,
+        )?,
+    };
+    validate_create_context(&request)?;
+    Ok((envelope, request))
+}
+
+pub fn parse_context_ready(body: &[u8]) -> io::Result<(u64, ContextReady)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0, 1, 2, 3])?;
+    let ready = ContextReady {
+        context_id: required_u64(&envelope.payload, 0, "context ID")?,
+        class_mask: required_u64(&envelope.payload, 1, "context class mask")?,
+        quotas: parse_context_quotas(
+            envelope
+                .payload
+                .map_value(2)
+                .ok_or_else(|| invalid("missing effective context quota map"))?,
+        )?,
+        expiry_us: required_u64(&envelope.payload, 3, "context expiry")?,
+    };
+    validate_context_ready(ready)?;
+    Ok((envelope.request_id, ready))
+}
+
+pub fn parse_context_capability(
+    body: &[u8],
+) -> io::Result<(u64, u64, [u8; CONTEXT_CAPABILITY_BYTES])> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0, 1])?;
+    let context_id = required_u64(&envelope.payload, 0, "context ID")?;
+    if context_id == 0 {
+        return Err(invalid("context capability contains a zero context ID"));
+    }
+    let capability = fixed_bytes::<CONTEXT_CAPABILITY_BYTES>(
+        envelope
+            .payload
+            .map_value(1)
+            .ok_or_else(|| invalid("missing delegated context capability"))?,
+        "delegated context capability",
+    )?;
+    Ok((envelope.request_id, context_id, capability))
+}
+
+pub fn parse_context_changed(body: &[u8]) -> io::Result<ContextChanged> {
+    let envelope = parse_unsolicited(body, &[0, 1, 2])?;
+    let changed = ContextChanged {
+        context_id: required_u64(&envelope.payload, 0, "context ID")?,
+        state: required_u64(&envelope.payload, 1, "context state")?,
+        reason_mask: required_u64(&envelope.payload, 2, "context change reason")?,
+    };
+    validate_context_changed(changed)?;
+    Ok(changed)
 }
 
 pub fn parse_create_raster(body: &[u8]) -> io::Result<(ControlEnvelope, RasterSourceConfig)> {
@@ -4170,6 +4374,70 @@ fn parse_preconditions(value: &Value) -> io::Result<BTreeMap<u64, u64>> {
         .collect()
 }
 
+fn validate_create_context(request: &CreateContextRequest) -> io::Result<()> {
+    if request.context_id == 0
+        || request.parent_context_id == 0
+        || request.class_mask & !CONTEXT_CLASS_MASK != 0
+        || request.label.len() > MAX_CONTEXT_LABEL_BYTES
+    {
+        return Err(invalid("CREATE_CONTEXT contains an invalid bounded field"));
+    }
+    validate_context_quotas(request.quotas)
+}
+
+fn validate_context_ready(ready: ContextReady) -> io::Result<()> {
+    if ready.context_id == 0 || ready.class_mask & !CONTEXT_CLASS_MASK != 0 {
+        return Err(invalid(
+            "CONTEXT_READY contains an invalid ID or class mask",
+        ));
+    }
+    validate_context_quotas(ready.quotas)
+}
+
+fn validate_context_changed(changed: ContextChanged) -> io::Result<()> {
+    if changed.context_id == 0
+        || !(CONTEXT_STATE_ACTIVE..=CONTEXT_STATE_REVOKED).contains(&changed.state)
+        || changed.reason_mask & !CONTEXT_CHANGED_REASON_MASK != 0
+    {
+        return Err(invalid("CONTEXT_CHANGED contains an invalid state"));
+    }
+    Ok(())
+}
+
+fn validate_context_quotas(quotas: ContextQuotas) -> io::Result<()> {
+    if quotas.maximum_sources == 0
+        || quotas.maximum_nodes == 0
+        || quotas.maximum_retained_pixels == 0
+        || quotas.maximum_media_bytes == 0
+        || quotas.maximum_media_connections == 0
+    {
+        return Err(invalid("context quota values must be nonzero"));
+    }
+    Ok(())
+}
+
+fn encode_context_quotas(encoder: &mut Encoder, quotas: ContextQuotas) {
+    encoder.map(5);
+    key_u64(encoder, 0, quotas.maximum_sources);
+    key_u64(encoder, 1, quotas.maximum_nodes);
+    key_u64(encoder, 2, quotas.maximum_retained_pixels);
+    key_u64(encoder, 3, quotas.maximum_media_bytes);
+    key_u64(encoder, 4, quotas.maximum_media_connections);
+}
+
+fn parse_context_quotas(value: &Value) -> io::Result<ContextQuotas> {
+    reject_unknown_fields(value, &[0, 1, 2, 3, 4])?;
+    let quotas = ContextQuotas {
+        maximum_sources: required_u64(value, 0, "maximum context sources")?,
+        maximum_nodes: required_u64(value, 1, "maximum context nodes")?,
+        maximum_retained_pixels: required_u64(value, 2, "maximum retained pixels")?,
+        maximum_media_bytes: required_u64(value, 3, "maximum context media bytes")?,
+        maximum_media_connections: required_u64(value, 4, "maximum media connections")?,
+    };
+    validate_context_quotas(quotas)?;
+    Ok(quotas)
+}
+
 fn fixed_bytes<const N: usize>(value: &Value, description: &str) -> io::Result<[u8; N]> {
     let Value::Bytes(bytes) = value else {
         return Err(io::Error::new(
@@ -4182,6 +4450,13 @@ fn fixed_bytes<const N: usize>(value: &Value, description: &str) -> io::Result<[
             io::ErrorKind::InvalidData,
             format!("{description} is not {N} bytes"),
         )
+    })
+}
+
+fn object_id_payload(request_id: u64, object_id: u64) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(1);
+        key_u64(encoder, 0, object_id);
     })
 }
 
@@ -4700,6 +4975,104 @@ mod tests {
                 name(record_type)
             );
         }
+    }
+
+    #[test]
+    fn delegated_context_schemas_round_trip_with_bounded_intersections() {
+        let requested = ContextQuotas {
+            maximum_sources: 12,
+            maximum_nodes: 30,
+            maximum_retained_pixels: 4096,
+            maximum_media_bytes: 1_000_000,
+            maximum_media_connections: 8,
+        };
+        let parent = ContextQuotas {
+            maximum_sources: 8,
+            maximum_nodes: 40,
+            maximum_retained_pixels: 2048,
+            maximum_media_bytes: 2_000_000,
+            maximum_media_connections: 4,
+        };
+        let request = CreateContextRequest {
+            context_id: 9,
+            parent_context_id: 1,
+            class_mask: CONTEXT_CLASS_OBSERVE | CONTEXT_CLASS_CREATE_SOURCE,
+            label: "worker".into(),
+            expiry_us: 1_000_000,
+            quotas: requested,
+        };
+        let (envelope, parsed) =
+            parse_create_context(&create_context(3, &request).unwrap()).unwrap();
+        assert_eq!(envelope.request_id, 3);
+        assert_eq!(parsed, request);
+        assert_eq!(
+            requested.intersect(parent),
+            ContextQuotas {
+                maximum_sources: 8,
+                maximum_nodes: 30,
+                maximum_retained_pixels: 2048,
+                maximum_media_bytes: 1_000_000,
+                maximum_media_connections: 4,
+            }
+        );
+
+        let ready = ContextReady {
+            context_id: 9,
+            class_mask: request.class_mask,
+            quotas: requested.intersect(parent),
+            expiry_us: 900_000,
+        };
+        assert_eq!(
+            parse_context_ready(&context_ready(3, ready).unwrap()).unwrap(),
+            (3, ready)
+        );
+        let capability = [0x5a; CONTEXT_CAPABILITY_BYTES];
+        assert_eq!(
+            parse_context_capability(&context_capability(4, 9, &capability)).unwrap(),
+            (4, 9, capability)
+        );
+        let changed = ContextChanged {
+            context_id: 9,
+            state: CONTEXT_STATE_REVOKED,
+            reason_mask: CONTEXT_CHANGED_EXPLICIT_REVOCATION,
+        };
+        assert_eq!(
+            parse_context_changed(&context_changed(changed).unwrap()).unwrap(),
+            changed
+        );
+        assert!(parse_object_id(&delegate_context(5, 9), "context ID").is_ok());
+        assert!(parse_object_id(&revoke_context(6, 9), "context ID").is_ok());
+    }
+
+    #[test]
+    fn context_schemas_reject_unbounded_labels_capabilities_and_masks() {
+        let request = CreateContextRequest {
+            context_id: 2,
+            parent_context_id: 1,
+            class_mask: CONTEXT_CLASS_MASK,
+            label: "x".repeat(MAX_CONTEXT_LABEL_BYTES + 1),
+            expiry_us: 0,
+            quotas: ContextQuotas {
+                maximum_sources: 1,
+                maximum_nodes: 1,
+                maximum_retained_pixels: 1,
+                maximum_media_bytes: 1,
+                maximum_media_connections: 1,
+            },
+        };
+        assert!(create_context(1, &request).is_err());
+        let mut malformed = context_capability(1, 2, &[0; CONTEXT_CAPABILITY_BYTES]);
+        let last = malformed.len() - 1;
+        malformed.remove(last);
+        assert!(parse_context_capability(&malformed).is_err());
+        assert!(
+            context_changed(ContextChanged {
+                context_id: 2,
+                state: CONTEXT_STATE_ACTIVE,
+                reason_mask: 1 << 12,
+            })
+            .is_err()
+        );
     }
 
     #[test]
