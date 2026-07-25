@@ -1729,6 +1729,29 @@ pub fn welcome_preserving(
     accepted_features: &[u64],
     preserved_fields: &[PreservedField],
 ) -> Vec<u8> {
+    welcome_preserving_at_scene_revision(
+        request_id,
+        session_id,
+        session_tag,
+        root_context_id,
+        display,
+        accepted_features,
+        SceneRevision::default(),
+        preserved_fields,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn welcome_preserving_at_scene_revision(
+    request_id: u64,
+    session_id: u64,
+    session_tag: &[u8; 16],
+    root_context_id: u64,
+    display: DisplayChanged,
+    accepted_features: &[u64],
+    initial_scene_revision: SceneRevision,
+    preserved_fields: &[PreservedField],
+) -> Vec<u8> {
     const BASE_PROFILES: &[&str] = &[
         PROFILE_AUDIO_ACCESS_UNIT,
         PROFILE_IMAGE_PNG_JPEG,
@@ -1761,7 +1784,7 @@ pub fn welcome_preserving(
             selected_major: u64::from(VIVID_MAJOR),
             selected_minor: u64::from(VIVID_MINOR),
             accepted_features,
-            initial_scene_revision: 0,
+            initial_scene_revision: initial_scene_revision.get(),
             preserved_fields,
         },
     )
@@ -5435,6 +5458,28 @@ mod tests {
 
     #[test]
     fn observability_existing_message_extensions_round_trip() {
+        let tag = [3; 16];
+        let welcome = parse_welcome(&welcome_preserving_at_scene_revision(
+            3,
+            4,
+            &tag,
+            5,
+            DisplayChanged {
+                display_generation: 1,
+                viewport_width: 800,
+                viewport_height: 600,
+                grid_columns: 80,
+                grid_rows: 30,
+                cell_width: 10,
+                cell_height: 20,
+            },
+            &[FEATURE_OBSERVABILITY_CORE_V1],
+            SceneRevision::new(23),
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(welcome.initial_scene_revision, SceneRevision::new(23));
+
         let support =
             parse_capability_support(&capability_support(7, true, "hardware", 9)).unwrap();
         assert_eq!(
