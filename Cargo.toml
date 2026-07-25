@@ -27,3 +27,7 @@ zstd-safe = { version = "7.2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ruzstd = "0.8"
+
+[[bench]]
+name = "stage0"
+harness = false
