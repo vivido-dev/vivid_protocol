@@ -16,6 +16,65 @@ pub enum Value {
     Null,
 }
 
+/// One unknown entry retained from a canonical CBOR map.
+///
+/// The value bytes borrow the original input so relays can forward an extension without parsing
+/// it into a dynamic value tree or changing its canonical representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreservedEntry<'a> {
+    pub key: u64,
+    pub encoded_value: &'a [u8],
+}
+
+/// An owned preserved entry for message objects that outlive their decode buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservedField {
+    pub key: u64,
+    pub encoded_value: Vec<u8>,
+}
+
+impl PreservedEntry<'_> {
+    pub fn to_owned(self) -> PreservedField {
+        PreservedField {
+            key: self.key,
+            encoded_value: self.encoded_value.to_vec(),
+        }
+    }
+}
+
+/// A canonical map split into parsed known fields and byte-exact unknown fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservingMap<'a> {
+    known: Vec<(u64, Value, &'a [u8])>,
+    preserved: Vec<PreservedEntry<'a>>,
+}
+
+impl<'a> PreservingMap<'a> {
+    pub fn known_value(&self, key: u64) -> Option<&Value> {
+        self.known
+            .iter()
+            .find_map(|(entry_key, value, _)| (*entry_key == key).then_some(value))
+    }
+
+    pub fn encoded_known_value(&self, key: u64) -> Option<&'a [u8]> {
+        self.known
+            .iter()
+            .find_map(|(entry_key, _, bytes)| (*entry_key == key).then_some(*bytes))
+    }
+
+    pub fn preserved(&self) -> &[PreservedEntry<'a>] {
+        &self.preserved
+    }
+
+    pub fn preserved_owned(&self) -> Vec<PreservedField> {
+        self.preserved
+            .iter()
+            .copied()
+            .map(PreservedEntry::to_owned)
+            .collect()
+    }
+}
+
 impl Value {
     pub fn map_value(&self, key: u64) -> Option<&Value> {
         let Self::Map(entries) = self else {
@@ -149,6 +208,10 @@ impl Encoder {
             self.bytes.extend_from_slice(&value.to_be_bytes());
         }
     }
+
+    pub(crate) fn canonical_value(&mut self, value: &[u8]) {
+        self.bytes.extend_from_slice(value);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +239,58 @@ pub fn encode_into(output: &mut Vec<u8>, value: &Value) -> Result<(), EncodeErro
     let result = encode_value(&mut encoder, value, 0);
     *output = encoder.into_vec();
     result
+}
+
+/// Merge parsed known entries with byte-exact preserved entries in canonical key order.
+pub fn encode_preserving_map(
+    known: &[(u64, Value)],
+    preserved: &[PreservedField],
+) -> Result<Vec<u8>, EncodeError> {
+    validate_container_length(
+        known
+            .len()
+            .checked_add(preserved.len())
+            .ok_or_else(|| EncodeError("CBOR map length overflows".into()))?,
+    )?;
+    if known.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        || preserved.windows(2).any(|pair| pair[0].key >= pair[1].key)
+    {
+        return Err(EncodeError("CBOR map keys are not strictly sorted".into()));
+    }
+    for entry in preserved {
+        decode_at_depth(&entry.encoded_value, 1)
+            .map_err(|error| EncodeError(format!("invalid preserved CBOR value: {error}")))?;
+    }
+
+    let mut encoder = Encoder::new();
+    encoder.map(known.len() + preserved.len());
+    let mut known_index = 0;
+    let mut preserved_index = 0;
+    while known_index < known.len() || preserved_index < preserved.len() {
+        let take_known = match (known.get(known_index), preserved.get(preserved_index)) {
+            (Some((known_key, _)), Some(preserved)) if *known_key == preserved.key => {
+                return Err(EncodeError(
+                    "known and preserved CBOR map keys collide".into(),
+                ));
+            }
+            (Some((known_key, _)), Some(preserved)) => *known_key < preserved.key,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_known {
+            let (key, value) = &known[known_index];
+            encoder.u64(*key);
+            encode_value(&mut encoder, value, 1)?;
+            known_index += 1;
+        } else {
+            let entry = &preserved[preserved_index];
+            encoder.u64(entry.key);
+            encoder.canonical_value(&entry.encoded_value);
+            preserved_index += 1;
+        }
+    }
+    Ok(encoder.into_vec())
 }
 
 fn encode_value(encoder: &mut Encoder, value: &Value, depth: usize) -> Result<(), EncodeError> {
@@ -247,12 +362,63 @@ impl Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 pub fn decode(bytes: &[u8]) -> Result<Value, DecodeError> {
+    decode_at_depth(bytes, 0)
+}
+
+fn decode_at_depth(bytes: &[u8], depth: usize) -> Result<Value, DecodeError> {
     let mut decoder = Decoder { bytes, offset: 0 };
-    let value = decoder.value(0)?;
+    let value = decoder.value(depth)?;
     if decoder.offset != bytes.len() {
         return Err(DecodeError("trailing bytes after CBOR value".into()));
     }
     Ok(value)
+}
+
+/// Decode a canonical numeric-keyed map while retaining unknown values as borrowed byte slices.
+pub fn decode_preserving_map<'a>(
+    bytes: &'a [u8],
+    known_keys: &[u64],
+) -> Result<PreservingMap<'a>, DecodeError> {
+    if known_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(DecodeError(
+            "known CBOR map keys are not strictly sorted".into(),
+        ));
+    }
+    let mut decoder = Decoder { bytes, offset: 0 };
+    let initial = decoder.byte()?;
+    if initial >> 5 != 5 {
+        return Err(DecodeError("CBOR value is not a map".into()));
+    }
+    let length = decoder.container_length(initial & 0x1f, 2)?;
+    let mut known = Vec::with_capacity(length.min(known_keys.len()));
+    let mut preserved = Vec::with_capacity(length.saturating_sub(known_keys.len()));
+    let mut previous = None;
+    for _ in 0..length {
+        let key = match decoder.value(1)? {
+            Value::Unsigned(key) => key,
+            _ => {
+                return Err(DecodeError(
+                    "CBOR map key is not an unsigned integer".into(),
+                ));
+            }
+        };
+        if previous.is_some_and(|previous| previous >= key) {
+            return Err(DecodeError("CBOR map keys are not strictly sorted".into()));
+        }
+        previous = Some(key);
+        let start = decoder.offset;
+        let value = decoder.value(1)?;
+        let encoded_value = &bytes[start..decoder.offset];
+        if known_keys.binary_search(&key).is_ok() {
+            known.push((key, value, encoded_value));
+        } else {
+            preserved.push(PreservedEntry { key, encoded_value });
+        }
+    }
+    if decoder.offset != bytes.len() {
+        return Err(DecodeError("trailing bytes after CBOR value".into()));
+    }
+    Ok(PreservingMap { known, preserved })
 }
 
 struct Decoder<'a> {
@@ -493,5 +659,57 @@ mod tests {
         assert!(decode(&[0x99, 0x10, 0x01]).is_err());
         assert!(decode(&[0x99, 0x10, 0x00]).is_err());
         assert!(decode(&[0xb9, 0x10, 0x00]).is_err());
+    }
+
+    #[test]
+    fn preserving_map_round_trips_interleaved_unknown_values_exactly() {
+        let bytes = [
+            0xa5, 0x00, 0x01, 0x02, 0x82, 0xf5, 0xf6, 0x04, 0x64, b'v', b'i', b'v', b'i', 0x07,
+            0xa1, 0x00, 0x18, 0x2a, 0x09, 0x19, 0x10, 0x00,
+        ];
+        let decoded = decode_preserving_map(&bytes, &[0, 4, 9]).unwrap();
+        assert_eq!(
+            decoded.known_value(4).and_then(Value::as_text),
+            Some("vivi")
+        );
+        assert_eq!(
+            decoded
+                .preserved()
+                .iter()
+                .map(|entry| (entry.key, entry.encoded_value))
+                .collect::<Vec<_>>(),
+            vec![(2, &bytes[4..7] as &[u8]), (7, &bytes[14..18] as &[u8])]
+        );
+        let known = vec![
+            (0, decoded.known_value(0).unwrap().clone()),
+            (4, decoded.known_value(4).unwrap().clone()),
+            (9, decoded.known_value(9).unwrap().clone()),
+        ];
+        assert_eq!(
+            encode_preserving_map(&known, &decoded.preserved_owned()).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn preserving_map_rejects_malformed_unknown_value() {
+        assert!(decode_preserving_map(&[0xa2, 0x00, 0x01, 0x02, 0x82, 0xf5], &[0]).is_err());
+    }
+
+    #[test]
+    fn preserving_map_rejects_known_unknown_collisions_and_combined_limit() {
+        let preserved = vec![PreservedField {
+            key: 1,
+            encoded_value: vec![0],
+        }];
+        assert!(encode_preserving_map(&[(1, Value::Unsigned(1))], &preserved).is_err());
+
+        let too_many = (0..=MAX_CONTAINER_LENGTH)
+            .map(|key| PreservedField {
+                key: key as u64,
+                encoded_value: vec![0],
+            })
+            .collect::<Vec<_>>();
+        assert!(encode_preserving_map(&[], &too_many).is_err());
     }
 }

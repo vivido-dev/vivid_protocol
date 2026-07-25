@@ -22,8 +22,9 @@ The crate provides:
 
 - directional connection limits, ordered record framing, endpoint parsing, split
   `ConnectionReader`/cloneable `ConnectionWriter` handles, and the 64 MiB ceiling;
-- deterministic, bounded CBOR, typed control-message schemas, complete `PlayRequest` parsing, and
-  conservative RTT-based initial-buffer calculation;
+- deterministic, bounded CBOR with byte-exact negotiation-extension preservation, typed
+  control-message schemas, complete `PlayRequest` parsing, and conservative RTT-based
+  initial-buffer calculation;
 - raw/zstd RGBA raster, straight or premultiplied alpha, and PNG/JPEG image bodies;
 - portable H.264/HEVC/VP9/AV1 video and MP3/AAC/ALAC/PCM/Opus/Vorbis/FLAC audio access units,
   including media sequence and trim metadata validation;
@@ -72,14 +73,15 @@ multiplexers that do not preserve authenticated Vivid anchors are not supported.
 
 ## Compatibility
 
-Vivid Protocol 1.0 uses the version-1.0 `VIVD` preface. The Opus, Vorbis, and FLAC
-packetizations extend the existing audio feature rather than allocating new feature IDs, so an
-older presenter rejects unsupported configurations through the normal `CREATE_AUDIO` error path.
-The crate declares Rust 1.85 compatibility.
+Vivid Protocol 1.1 uses the version-1.1 `VIVD` preface. A well-formed version mismatch receives one
+fatal, session-level `UNSUPPORTED_VERSION` record that reports the receiver's supported version;
+malformed prefaces remain a silent close. `HELLO` and `WELCOME` preserve unknown canonical CBOR
+entries byte-for-byte so relays do not erase future negotiation extensions. The crate declares
+Rust 1.85 compatibility.
 
 `PLAY` carries start PTS, minimum buffer, maximum latency, 32.32 rate, late policy, loop count, and
 start policy. `PING`/`PONG` are bidirectional correlated session records. Playback telemetry,
-derived media tickets, audio batching, and alternate packet framing are not part of Vivid 1.0.
+derived media tickets, audio batching, and alternate packet framing are not part of Vivid 1.1.
 
 ## License
 

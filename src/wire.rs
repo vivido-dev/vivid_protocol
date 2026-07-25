@@ -112,6 +112,60 @@ impl Preface {
             initiator_tx_body_limit,
         })
     }
+
+    /// Decode the structurally stable preface and classify only a well-formed version mismatch.
+    pub fn classify(bytes: [u8; PREFACE_SIZE]) -> io::Result<PrefaceClassification> {
+        let preface = Self::decode(bytes)?;
+        if (preface.major, preface.minor) == (VIVID_MAJOR, VIVID_MINOR) {
+            Ok(PrefaceClassification::Accepted(preface))
+        } else {
+            Ok(PrefaceClassification::UnsupportedVersion(preface))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefaceClassification {
+    Accepted(Preface),
+    UnsupportedVersion(Preface),
+}
+
+/// Build the one record a receiver may send for a structurally valid version mismatch.
+pub fn unsupported_version_record() -> Vec<u8> {
+    let body = crate::messages::unsupported_version_error();
+    let header = RecordHeader {
+        body_length: body.len() as u32,
+        record_type: crate::messages::ERROR,
+        flags: 0,
+        object_id: 0,
+        sequence: 1,
+    };
+    let mut record = Vec::with_capacity(HEADER_SIZE + body.len());
+    record.extend_from_slice(&header.encode());
+    record.extend_from_slice(&body);
+    record
+}
+
+/// Validate an accepted preface, emitting one typed rejection only for a version mismatch.
+#[cfg(feature = "native")]
+pub fn accept_preface<W: Write + ?Sized>(
+    bytes: [u8; PREFACE_SIZE],
+    writer: &mut W,
+) -> io::Result<Preface> {
+    match Preface::classify(bytes)? {
+        PrefaceClassification::Accepted(preface) => Ok(preface),
+        PrefaceClassification::UnsupportedVersion(preface) => {
+            writer.write_all(&unsupported_version_record())?;
+            writer.flush()?;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "unsupported Vivid version {}.{}; local version is {}.{}",
+                    preface.major, preface.minor, VIVID_MAJOR, VIVID_MINOR
+                ),
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,8 +508,18 @@ pub struct Connection {
 #[cfg(feature = "native")]
 impl Connection {
     pub fn open(endpoint: &Endpoint, kind: ConnectionKind) -> io::Result<Self> {
+        Self::open_version(endpoint, kind, VIVID_MAJOR, VIVID_MINOR)
+    }
+
+    /// Open a fresh connection using a version the caller has explicitly selected.
+    pub fn open_version(
+        endpoint: &Endpoint,
+        kind: ConnectionKind,
+        major: u8,
+        minor: u8,
+    ) -> io::Result<Self> {
         let (reader, writer) = endpoint.connect()?;
-        Self::new(Some(reader), WriterIo::Live(writer), kind)
+        Self::new_version(Some(reader), WriterIo::Live(writer), kind, major, minor)
     }
 
     /// Start an initiator-side Vivid connection over an already authenticated transport.
@@ -487,6 +551,16 @@ impl Connection {
         io: WriterIo,
         kind: ConnectionKind,
     ) -> io::Result<Self> {
+        Self::new_version(reader, io, kind, VIVID_MAJOR, VIVID_MINOR)
+    }
+
+    fn new_version(
+        reader: Option<Box<dyn Read + Send>>,
+        io: WriterIo,
+        kind: ConnectionKind,
+        major: u8,
+        minor: u8,
+    ) -> io::Result<Self> {
         let body_limit = if kind == ConnectionKind::Control {
             super::CONTROL_MAX_RECORD_BODY
         } else {
@@ -501,7 +575,12 @@ impl Connection {
                 unflushed_records: 0,
             })),
         };
-        writer.write_raw_preface(&encode_preface(kind, DEFAULT_MAX_RECORD_BODY))?;
+        writer.write_raw_preface(&encode_preface_version(
+            kind,
+            DEFAULT_MAX_RECORD_BODY,
+            major,
+            minor,
+        ))?;
         Ok(Self {
             reader: reader.map(|io| ConnectionReader {
                 io,
@@ -821,10 +900,19 @@ impl RecordHeader {
 }
 
 pub fn encode_preface(kind: ConnectionKind, maximum: u32) -> [u8; PREFACE_SIZE] {
+    encode_preface_version(kind, maximum, VIVID_MAJOR, VIVID_MINOR)
+}
+
+pub fn encode_preface_version(
+    kind: ConnectionKind,
+    maximum: u32,
+    major: u8,
+    minor: u8,
+) -> [u8; PREFACE_SIZE] {
     let mut bytes = [0_u8; PREFACE_SIZE];
     bytes[0..4].copy_from_slice(MAGIC);
-    bytes[4] = VIVID_MAJOR;
-    bytes[5] = VIVID_MINOR;
+    bytes[4] = major;
+    bytes[5] = minor;
     bytes[6] = kind as u8;
     bytes[7] = 0;
     bytes[8..12].copy_from_slice(&maximum.to_be_bytes());
@@ -915,7 +1003,7 @@ mod tests {
     fn preface_matches_vivid_layout() {
         let preface = encode_preface(ConnectionKind::Video, 0x0102_0304);
         assert_eq!(&preface[0..4], b"VIVD");
-        assert_eq!(preface[4..8], [1, 0, 1, 0]);
+        assert_eq!(preface[4..8], [1, 1, 1, 0]);
         assert_eq!(preface[8..12], [1, 2, 3, 4]);
         assert_eq!(preface[12..16], [0; 4]);
         assert_eq!(
@@ -937,6 +1025,34 @@ mod tests {
         let mut preface = encode_preface(ConnectionKind::Control, 1024);
         preface[7] = 1;
         assert!(Preface::decode(preface).is_err());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn version_mismatch_emits_one_typed_error_but_malformed_magic_is_silent() {
+        let mut mismatched = encode_preface(ConnectionKind::Control, 4096);
+        mismatched[5] = VIVID_MINOR.wrapping_add(1);
+        let mut output = Vec::new();
+        let error = accept_preface(mismatched, &mut output).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let header = RecordHeader::decode(output[..HEADER_SIZE].try_into().unwrap());
+        assert_eq!(header.record_type, crate::messages::ERROR);
+        assert_eq!(header.object_id, 0);
+        assert_eq!(header.sequence, 1);
+        assert_eq!(output.len(), HEADER_SIZE + header.body_length as usize);
+        let reply = crate::messages::parse_error_reply(&output[HEADER_SIZE..]).unwrap();
+        assert_eq!(reply.code, crate::messages::ERROR_UNSUPPORTED_VERSION);
+        assert!(reply.fatal);
+        assert_eq!(
+            reply.supported_version,
+            Some((u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR)))
+        );
+
+        let mut malformed = encode_preface(ConnectionKind::Control, 4096);
+        malformed[0] = b'X';
+        let mut silent = Vec::new();
+        assert!(accept_preface(malformed, &mut silent).is_err());
+        assert!(silent.is_empty());
     }
 
     #[test]

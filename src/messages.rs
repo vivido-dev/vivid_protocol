@@ -1,11 +1,11 @@
-//! Normative Vivid 1.0 numeric registry and deterministic control schemas.
+//! Normative Vivid 1.1 numeric registry and deterministic control schemas.
 
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 
-use super::cbor::{self, Encoder, Value};
+use super::cbor::{self, Encoder, PreservedField, PreservingMap, Value};
 use super::{VIVID_MAJOR, VIVID_MINOR};
 
 pub const HELLO: u16 = 0x0001;
@@ -99,6 +99,10 @@ pub const FEATURE_AUDIO_ACCESS_UNIT_V1: u64 = 14;
 pub const FEATURE_NODE_CLIP_RECT_V1: u64 = 15;
 pub const FEATURE_DECODER_DESCRIPTION_V1: u64 = 16;
 pub const FEATURE_DESKTOP_INPUT_V1: u64 = 17;
+pub const FEATURE_DELEGATED_CONTEXT_V1: u64 = 21;
+
+pub const AUTHENTICATION_WINDOW_ROOT: u64 = 0;
+pub const AUTHENTICATION_DELEGATED_CONTEXT: u64 = 1;
 
 /// Negotiate a HELLO feature request against a presenter's supported set.
 ///
@@ -254,6 +258,7 @@ pub struct Welcome {
     pub session_id: u64,
     pub session_tag: Vec<u8>,
     pub root_context_id: u64,
+    pub capability_generation: u64,
     pub display_generation: u64,
     pub viewport_width: u32,
     pub viewport_height: u32,
@@ -266,6 +271,8 @@ pub struct Welcome {
     pub selected_major: u64,
     pub selected_minor: u64,
     pub accepted_features: Vec<u64>,
+    pub initial_scene_revision: u64,
+    pub preserved_fields: Vec<PreservedField>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +300,8 @@ pub struct SourceReady {
 pub struct ErrorReply {
     pub code: u64,
     pub request_id: u64,
+    pub fatal: bool,
+    pub supported_version: Option<(u64, u64)>,
     pub diagnostic: String,
 }
 
@@ -596,6 +605,35 @@ pub struct Hello {
     pub required_features: Vec<u64>,
     pub optional_features: Vec<u64>,
     pub maximum_record_body: u32,
+    pub authentication_kind: u64,
+    pub preserved_fields: Vec<PreservedField>,
+}
+
+impl Hello {
+    /// Check whether this implementation can honor the semantics of the recognized
+    /// authentication-kind field.
+    pub fn validate_authentication_kind(
+        &self,
+        supports_delegated_context: bool,
+    ) -> Result<(), u64> {
+        match self.authentication_kind {
+            AUTHENTICATION_WINDOW_ROOT => Ok(()),
+            AUTHENTICATION_DELEGATED_CONTEXT
+                if supports_delegated_context
+                    && (self
+                        .required_features
+                        .binary_search(&FEATURE_DELEGATED_CONTEXT_V1)
+                        .is_ok()
+                        || self
+                            .optional_features
+                            .binary_search(&FEATURE_DELEGATED_CONTEXT_V1)
+                            .is_ok()) =>
+            {
+                Ok(())
+            }
+            AUTHENTICATION_DELEGATED_CONTEXT | 2..=u64::MAX => Err(FEATURE_DELEGATED_CONTEXT_V1),
+        }
+    }
 }
 
 /// Configurable HELLO encoder input. This is used by bridges and presenters that are not Vivi and
@@ -611,6 +649,8 @@ pub struct HelloConfig<'a> {
     pub required_features: &'a [u64],
     pub optional_features: &'a [u64],
     pub maximum_record_body: u32,
+    pub authentication_kind: u64,
+    pub preserved_fields: &'a [PreservedField],
 }
 
 /// Configurable WELCOME encoder input for virtual or alternate presenters.
@@ -625,6 +665,8 @@ pub struct WelcomeConfig<'a> {
     pub selected_major: u64,
     pub selected_minor: u64,
     pub accepted_features: &'a [u64],
+    pub initial_scene_revision: u64,
+    pub preserved_fields: &'a [PreservedField],
 }
 
 #[derive(Debug, Clone)]
@@ -784,35 +826,88 @@ pub fn hello(request_id: u64, token: &str) -> Vec<u8> {
             required_features: REQUIRED,
             optional_features: OPTIONAL,
             maximum_record_body: super::CONTROL_MAX_RECORD_BODY,
+            authentication_kind: AUTHENTICATION_WINDOW_ROOT,
+            preserved_fields: &[],
         },
     )
 }
 
 pub fn encode_hello(request_id: u64, config: &HelloConfig<'_>) -> Vec<u8> {
-    envelope(request_id, None, None, |encoder| {
-        encoder.map(10);
-        key_u64(encoder, 0, config.minimum_major);
-        key_u64(encoder, 1, config.minimum_minor);
-        key_u64(encoder, 2, config.maximum_major);
-        key_u64(encoder, 3, config.maximum_minor);
-        encoder.u64(4);
-        encoder.text(config.token);
-        encoder.u64(5);
-        encoder.text(config.producer);
-        encoder.u64(6);
-        encoder.text(config.producer_version);
-        encoder.u64(7);
-        encoder.array(config.required_features.len());
-        for feature in config.required_features {
-            encoder.u64(*feature);
+    try_encode_hello(request_id, config).expect("HELLO contains invalid preserved CBOR")
+}
+
+pub fn try_encode_hello(request_id: u64, config: &HelloConfig<'_>) -> io::Result<Vec<u8>> {
+    try_encode_hello_for_version(
+        request_id,
+        config,
+        u64::from(VIVID_MAJOR),
+        u64::from(VIVID_MINOR),
+    )
+}
+
+/// Encode the version-specific negotiation surface for an explicitly selected fresh connection.
+pub fn try_encode_hello_for_version(
+    request_id: u64,
+    config: &HelloConfig<'_>,
+    major: u64,
+    minor: u64,
+) -> io::Result<Vec<u8>> {
+    if (major, minor) != (1, 0)
+        && (major, minor) != (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("this codec does not implement Vivid {major}.{minor}"),
+        ));
+    }
+    let known = vec![
+        (0, Value::Unsigned(config.minimum_major)),
+        (1, Value::Unsigned(config.minimum_minor)),
+        (2, Value::Unsigned(config.maximum_major)),
+        (3, Value::Unsigned(config.maximum_minor)),
+        (4, Value::Text(config.token.to_owned())),
+        (5, Value::Text(config.producer.to_owned())),
+        (6, Value::Text(config.producer_version.to_owned())),
+        (
+            7,
+            Value::Array(
+                config
+                    .required_features
+                    .iter()
+                    .copied()
+                    .map(Value::Unsigned)
+                    .collect(),
+            ),
+        ),
+        (
+            8,
+            Value::Array(
+                config
+                    .optional_features
+                    .iter()
+                    .copied()
+                    .map(Value::Unsigned)
+                    .collect(),
+            ),
+        ),
+        (9, Value::Unsigned(u64::from(config.maximum_record_body))),
+    ];
+    let mut known = known;
+    if (major, minor) == (1, 0) {
+        if config.authentication_kind != AUTHENTICATION_WINDOW_ROOT
+            || !config.preserved_fields.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Vivid 1.0 cannot carry authentication-kind or preserved HELLO extensions",
+            ));
         }
-        encoder.u64(8);
-        encoder.array(config.optional_features.len());
-        for feature in config.optional_features {
-            encoder.u64(*feature);
-        }
-        key_u64(encoder, 9, u64::from(config.maximum_record_body));
-    })
+    } else {
+        known.push((10, Value::Unsigned(config.authentication_kind)));
+    }
+    let payload =
+        cbor::encode_preserving_map(&known, config.preserved_fields).map_err(invalid_data)?;
+    Ok(envelope_encoded_payload(request_id, &payload))
 }
 
 pub fn create_raster(request_id: u64, source_id: u64, width: u32, height: u32) -> Vec<u8> {
@@ -1174,39 +1269,92 @@ pub fn welcome(
             selected_major: u64::from(VIVID_MAJOR),
             selected_minor: u64::from(VIVID_MINOR),
             accepted_features,
+            initial_scene_revision: 0,
+            preserved_fields: &[],
         },
     )
 }
 
 pub fn encode_welcome(request_id: u64, config: &WelcomeConfig<'_>) -> Vec<u8> {
-    envelope(request_id, None, None, |encoder| {
-        encoder.map(16);
-        key_u64(encoder, 0, config.session_id);
-        encoder.u64(1);
-        encoder.bytes(config.session_tag);
-        key_u64(encoder, 2, config.root_context_id);
-        key_u64(encoder, 3, config.capability_generation);
-        key_u64(encoder, 4, config.display.display_generation);
-        key_u64(encoder, 5, u64::from(config.display.viewport_width));
-        key_u64(encoder, 6, u64::from(config.display.viewport_height));
-        key_u64(encoder, 7, u64::from(config.display.grid_columns));
-        key_u64(encoder, 8, u64::from(config.display.grid_rows));
-        key_u64(encoder, 9, u64::from(config.display.cell_width));
-        key_u64(encoder, 10, u64::from(config.display.cell_height));
-        key_u64(encoder, 11, u64::from(config.maximum_control_body));
-        encoder.u64(12);
-        encoder.array(config.accepted_profiles.len());
-        for profile in config.accepted_profiles {
-            encoder.text(profile);
+    try_encode_welcome(request_id, config).expect("WELCOME contains invalid preserved CBOR")
+}
+
+pub fn try_encode_welcome(request_id: u64, config: &WelcomeConfig<'_>) -> io::Result<Vec<u8>> {
+    try_encode_welcome_for_version(
+        request_id,
+        config,
+        u64::from(VIVID_MAJOR),
+        u64::from(VIVID_MINOR),
+    )
+}
+
+pub fn try_encode_welcome_for_version(
+    request_id: u64,
+    config: &WelcomeConfig<'_>,
+    major: u64,
+    minor: u64,
+) -> io::Result<Vec<u8>> {
+    if (major, minor) != (1, 0)
+        && (major, minor) != (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("this codec does not implement Vivid {major}.{minor}"),
+        ));
+    }
+    let mut known = vec![
+        (0, Value::Unsigned(config.session_id)),
+        (1, Value::Bytes(config.session_tag.to_vec())),
+        (2, Value::Unsigned(config.root_context_id)),
+        (3, Value::Unsigned(config.capability_generation)),
+        (4, Value::Unsigned(config.display.display_generation)),
+        (5, Value::Unsigned(u64::from(config.display.viewport_width))),
+        (
+            6,
+            Value::Unsigned(u64::from(config.display.viewport_height)),
+        ),
+        (7, Value::Unsigned(u64::from(config.display.grid_columns))),
+        (8, Value::Unsigned(u64::from(config.display.grid_rows))),
+        (9, Value::Unsigned(u64::from(config.display.cell_width))),
+        (10, Value::Unsigned(u64::from(config.display.cell_height))),
+        (11, Value::Unsigned(u64::from(config.maximum_control_body))),
+        (
+            12,
+            Value::Array(
+                config
+                    .accepted_profiles
+                    .iter()
+                    .map(|profile| Value::Text((*profile).to_owned()))
+                    .collect(),
+            ),
+        ),
+        (13, Value::Unsigned(config.selected_major)),
+        (14, Value::Unsigned(config.selected_minor)),
+        (
+            15,
+            Value::Array(
+                config
+                    .accepted_features
+                    .iter()
+                    .copied()
+                    .map(Value::Unsigned)
+                    .collect(),
+            ),
+        ),
+    ];
+    if (major, minor) == (1, 0) {
+        if !config.preserved_fields.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Vivid 1.0 cannot carry preserved WELCOME extensions",
+            ));
         }
-        key_u64(encoder, 13, config.selected_major);
-        key_u64(encoder, 14, config.selected_minor);
-        encoder.u64(15);
-        encoder.array(config.accepted_features.len());
-        for feature in config.accepted_features {
-            encoder.u64(*feature);
-        }
-    })
+    } else {
+        known.push((16, Value::Unsigned(config.initial_scene_revision)));
+    }
+    let payload =
+        cbor::encode_preserving_map(&known, config.preserved_fields).map_err(invalid_data)?;
+    Ok(envelope_encoded_payload(request_id, &payload))
 }
 
 pub fn display_changed(request_id: u64, display: DisplayChanged) -> Vec<u8> {
@@ -1328,6 +1476,23 @@ pub fn error(request_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
     })
 }
 
+/// Encode the one fatal session-level error permitted before `HELLO`.
+pub fn unsupported_version_error() -> Vec<u8> {
+    envelope(0, None, None, |encoder| {
+        encoder.map(5);
+        key_u64(encoder, 0, ERROR_UNSUPPORTED_VERSION);
+        key_u64(encoder, 1, 0);
+        encoder.u64(2);
+        encoder.map(2);
+        key_u64(encoder, 11, u64::from(VIVID_MAJOR));
+        key_u64(encoder, 12, u64::from(VIVID_MINOR));
+        encoder.u64(4);
+        encoder.bool(true);
+        encoder.u64(5);
+        encoder.text("unsupported Vivid version");
+    })
+}
+
 pub fn credit(bytes: u64, packets: u64, fragments: u64) -> Vec<u8> {
     let mut output = Vec::new();
     credit_into(&mut output, bytes, packets, fragments);
@@ -1443,9 +1608,10 @@ pub fn decode_control(body: &[u8]) -> io::Result<ControlEnvelope> {
 }
 
 pub fn parse_hello(body: &[u8]) -> io::Result<(u64, Hello)> {
-    let envelope = decode_control(body)?;
-    let payload = &envelope.payload;
-    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])?;
+    const KNOWN_FIELDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let (request_id, decoded) = decode_preserving_payload(body, KNOWN_FIELDS)?;
+    let payload_value = preserving_known_value(&decoded, KNOWN_FIELDS);
+    let payload = &payload_value;
     let maximum_record_body = u32::try_from(required_u64(payload, 9, "maximum record body")?)
         .map_err(|_| {
             io::Error::new(
@@ -1464,6 +1630,12 @@ pub fn parse_hello(body: &[u8]) -> io::Result<(u64, Hello)> {
         required_features: feature_array(payload, 7, "required features")?,
         optional_features: feature_array(payload, 8, "optional features")?,
         maximum_record_body,
+        authentication_kind: payload
+            .map_value(10)
+            .map(|_| required_u64(payload, 10, "authentication kind"))
+            .transpose()?
+            .unwrap_or(AUTHENTICATION_WINDOW_ROOT),
+        preserved_fields: decoded.preserved_owned(),
     };
     if (hello.minimum_major, hello.minimum_minor) > (hello.maximum_major, hello.maximum_minor) {
         return Err(invalid("HELLO Vivid version range is reversed"));
@@ -1480,7 +1652,7 @@ pub fn parse_hello(body: &[u8]) -> io::Result<(u64, Hello)> {
     {
         return Err(invalid("HELLO required and optional feature sets overlap"));
     }
-    Ok((envelope.request_id, hello))
+    Ok((request_id, hello))
 }
 
 pub fn parse_create_raster(body: &[u8]) -> io::Result<(ControlEnvelope, RasterSourceConfig)> {
@@ -2188,31 +2360,56 @@ pub fn parse_attach_channel(body: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 pub fn parse_welcome(body: &[u8]) -> io::Result<Welcome> {
-    let (_, payload) = decode_envelope(body)?;
-    reject_unknown_fields(
-        &payload,
-        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    )?;
+    parse_welcome_for_version(body, u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR))
+}
+
+pub fn parse_welcome_for_version(body: &[u8], major: u64, minor: u64) -> io::Result<Welcome> {
+    const V1_0_FIELDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    const V1_1_FIELDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let known_fields = match (major, minor) {
+        (1, 0) => V1_0_FIELDS,
+        current if current == (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR)) => V1_1_FIELDS,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("this codec does not implement Vivid {major}.{minor}"),
+            ));
+        }
+    };
+    let (_, decoded) = decode_preserving_payload(body, known_fields)?;
+    if (major, minor) == (1, 0) && !decoded.preserved().is_empty() {
+        return Err(invalid("Vivid 1.0 WELCOME contains a reserved field"));
+    }
+    let payload_value = preserving_known_value(&decoded, known_fields);
+    let payload = &payload_value;
     let welcome = Welcome {
-        session_id: required_u64(&payload, 0, "session ID")?,
-        session_tag: required_bytes(&payload, 1, "session tag")?.to_vec(),
-        root_context_id: required_u64(&payload, 2, "root context ID")?,
-        display_generation: required_u64(&payload, 4, "display generation")?,
-        viewport_width: required_u32(&payload, 5, "viewport width")?,
-        viewport_height: required_u32(&payload, 6, "viewport height")?,
-        grid_columns: required_u64(&payload, 7, "grid columns")?,
-        grid_rows: required_u64(&payload, 8, "grid rows")?,
-        cell_width: required_u32(&payload, 9, "cell width")?,
-        cell_height: required_u32(&payload, 10, "cell height")?,
-        maximum_control_body: required_u32(&payload, 11, "maximum control body")?,
-        accepted_profiles: text_array(&payload, 12, "accepted profiles")?,
-        selected_major: required_u64(&payload, 13, "selected Vivid major version")?,
-        selected_minor: required_u64(&payload, 14, "selected Vivid minor version")?,
-        accepted_features: feature_array(&payload, 15, "accepted features")?,
+        session_id: required_u64(payload, 0, "session ID")?,
+        session_tag: required_bytes(payload, 1, "session tag")?.to_vec(),
+        root_context_id: required_u64(payload, 2, "root context ID")?,
+        capability_generation: required_u64(payload, 3, "capability generation")?,
+        display_generation: required_u64(payload, 4, "display generation")?,
+        viewport_width: required_u32(payload, 5, "viewport width")?,
+        viewport_height: required_u32(payload, 6, "viewport height")?,
+        grid_columns: required_u64(payload, 7, "grid columns")?,
+        grid_rows: required_u64(payload, 8, "grid rows")?,
+        cell_width: required_u32(payload, 9, "cell width")?,
+        cell_height: required_u32(payload, 10, "cell height")?,
+        maximum_control_body: required_u32(payload, 11, "maximum control body")?,
+        accepted_profiles: text_array(payload, 12, "accepted profiles")?,
+        selected_major: required_u64(payload, 13, "selected Vivid major version")?,
+        selected_minor: required_u64(payload, 14, "selected Vivid minor version")?,
+        accepted_features: feature_array(payload, 15, "accepted features")?,
+        initial_scene_revision: if (major, minor) == (1, 0) {
+            0
+        } else {
+            required_u64(payload, 16, "initial scene revision")?
+        },
+        preserved_fields: decoded.preserved_owned(),
     };
     if welcome.session_id == 0
         || welcome.root_context_id == 0
         || welcome.session_tag.len() != 16
+        || welcome.capability_generation == 0
         || welcome.viewport_width == 0
         || welcome.viewport_height == 0
         || welcome.grid_columns == 0
@@ -2221,10 +2418,9 @@ pub fn parse_welcome(body: &[u8]) -> io::Result<Welcome> {
         || welcome.cell_height == 0
         || welcome.maximum_control_body == 0
         || welcome.maximum_control_body > super::CONTROL_MAX_RECORD_BODY
-        || (welcome.selected_major, welcome.selected_minor)
-            != (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR))
+        || (welcome.selected_major, welcome.selected_minor) != (major, minor)
     {
-        return Err(invalid("WELCOME contains an invalid mandatory 1.0 field"));
+        return Err(invalid("WELCOME contains an invalid mandatory field"));
     }
     Ok(welcome)
 }
@@ -2399,7 +2595,7 @@ pub fn parse_error(body: &[u8]) -> io::Result<String> {
 
 pub fn parse_error_reply(body: &[u8]) -> io::Result<ErrorReply> {
     let (envelope_request_id, payload) = decode_envelope(body)?;
-    reject_unknown_fields(&payload, &[0, 1, 4, 5])?;
+    reject_unknown_fields(&payload, &[0, 1, 2, 4, 5])?;
     let code = required_u64(&payload, 0, "error code")?;
     let request_id = required_u64(&payload, 1, "failed request ID")?;
     if request_id != envelope_request_id {
@@ -2410,9 +2606,25 @@ pub fn parse_error_reply(body: &[u8]) -> io::Result<ErrorReply> {
         .map(|_| bounded_text(&payload, 5, "error diagnostic", 4096))
         .transpose()?
         .unwrap_or("no diagnostic");
+    let fatal = payload
+        .map_value(4)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| invalid("missing error fatal flag"))?;
+    let supported_version = match payload.map_value(2) {
+        Some(detail) => {
+            reject_unknown_fields(detail, &[11, 12])?;
+            Some((
+                required_u64(detail, 11, "supported Vivid major version")?,
+                required_u64(detail, 12, "supported Vivid minor version")?,
+            ))
+        }
+        None => None,
+    };
     Ok(ErrorReply {
         code,
         request_id,
+        fatal,
+        supported_version,
         diagnostic: diagnostic.to_owned(),
     })
 }
@@ -2546,6 +2758,60 @@ fn envelope_into(
     encoder.u64(3);
     payload(&mut encoder);
     *output = encoder.into_vec();
+}
+
+fn envelope_encoded_payload(request_id: u64, payload: &[u8]) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.map(2);
+    key_u64(&mut encoder, 0, request_id);
+    encoder.u64(3);
+    encoder.canonical_value(payload);
+    encoder.into_vec()
+}
+
+fn decode_preserving_payload<'a>(
+    body: &'a [u8],
+    known_payload_fields: &[u64],
+) -> io::Result<(u64, PreservingMap<'a>)> {
+    let envelope = cbor::decode_preserving_map(body, &[0, 1, 2, 3]).map_err(invalid_data)?;
+    if !envelope.preserved().is_empty() {
+        return Err(invalid("control envelope contains a reserved field"));
+    }
+    let request_id = envelope
+        .known_value(0)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid("missing request ID"))?;
+    for (key, description) in [(1, "transaction ID"), (2, "display generation")] {
+        if envelope
+            .known_value(key)
+            .is_some_and(|value| value.as_u64().is_none())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{description} is not unsigned"),
+            ));
+        }
+    }
+    let payload = envelope
+        .encoded_known_value(3)
+        .ok_or_else(|| invalid("missing control payload"))?;
+    let payload =
+        cbor::decode_preserving_map(payload, known_payload_fields).map_err(invalid_data)?;
+    Ok((request_id, payload))
+}
+
+fn preserving_known_value(decoded: &PreservingMap<'_>, known_fields: &[u64]) -> Value {
+    Value::Map(
+        known_fields
+            .iter()
+            .filter_map(|key| {
+                decoded
+                    .known_value(*key)
+                    .cloned()
+                    .map(|value| (*key, value))
+            })
+            .collect(),
+    )
 }
 
 fn decode_envelope(body: &[u8]) -> io::Result<(u64, Value)> {
@@ -2827,6 +3093,8 @@ mod tests {
                 required_features: &[FEATURE_NODE_CLIP_RECT_V1],
                 optional_features: &[],
                 maximum_record_body: 4096,
+                authentication_kind: AUTHENTICATION_WINDOW_ROOT,
+                preserved_fields: &[],
             },
         );
         let (_, hello) = parse_hello(&body).unwrap();
@@ -2848,6 +3116,69 @@ mod tests {
         assert_eq!(hello.required_features, [FEATURE_NODE_CLIP_RECT_V1]);
         assert!(hello.optional_features.is_empty());
         assert_eq!(hello.maximum_record_body, 4096);
+    }
+
+    #[test]
+    fn hello_preserves_unknown_fields_and_distinguishes_unsupported_known_semantics() {
+        let preserved = vec![PreservedField {
+            key: 12,
+            encoded_value: vec![0xa1, 0x00, 0x82, 0xf5, 0xf6],
+        }];
+        let body = encode_hello(
+            7,
+            &HelloConfig {
+                minimum_major: 1,
+                minimum_minor: 1,
+                maximum_major: 1,
+                maximum_minor: 1,
+                token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                producer: "future-producer",
+                producer_version: "2.0",
+                required_features: &[],
+                optional_features: &[],
+                maximum_record_body: 4096,
+                authentication_kind: AUTHENTICATION_WINDOW_ROOT,
+                preserved_fields: &preserved,
+            },
+        );
+        let envelope = cbor::decode_preserving_map(&body, &[0, 3]).unwrap();
+        assert_eq!(
+            envelope.encoded_known_value(3).unwrap().first(),
+            Some(&0xac),
+            "HELLO payload count must include preserved entries"
+        );
+        let (request_id, hello) = parse_hello(&body).unwrap();
+        assert_eq!(hello.preserved_fields, preserved);
+        assert_eq!(hello.validate_authentication_kind(false), Ok(()));
+        let reencoded = encode_hello(
+            request_id,
+            &HelloConfig {
+                minimum_major: hello.minimum_major,
+                minimum_minor: hello.minimum_minor,
+                maximum_major: hello.maximum_major,
+                maximum_minor: hello.maximum_minor,
+                token: &hello.token,
+                producer: &hello.producer,
+                producer_version: &hello.producer_version,
+                required_features: &hello.required_features,
+                optional_features: &hello.optional_features,
+                maximum_record_body: hello.maximum_record_body,
+                authentication_kind: hello.authentication_kind,
+                preserved_fields: &hello.preserved_fields,
+            },
+        );
+        assert_eq!(reencoded, body);
+
+        let delegated = Hello {
+            authentication_kind: AUTHENTICATION_DELEGATED_CONTEXT,
+            required_features: vec![FEATURE_DELEGATED_CONTEXT_V1],
+            ..hello
+        };
+        assert_eq!(
+            delegated.validate_authentication_kind(false),
+            Err(FEATURE_DELEGATED_CONTEXT_V1)
+        );
+        assert_eq!(delegated.validate_authentication_kind(true), Ok(()));
     }
 
     #[test]
@@ -2972,7 +3303,7 @@ mod tests {
     }
 
     #[test]
-    fn welcome_and_source_ready_require_vivid_1_0_fields() {
+    fn welcome_and_source_ready_require_vivid_1_1_fields() {
         let display = DisplayChanged {
             display_generation: 3,
             viewport_width: 800,
@@ -3005,8 +3336,10 @@ mod tests {
                 maximum_control_body: super::super::CONTROL_MAX_RECORD_BODY,
                 accepted_profiles: &[],
                 selected_major: 1,
-                selected_minor: 1,
+                selected_minor: 0,
                 accepted_features: &features,
+                initial_scene_revision: 0,
+                preserved_fields: &[],
             },
         );
         assert!(parse_welcome(&unsupported).is_err());
@@ -3049,6 +3382,82 @@ mod tests {
         .unwrap();
         assert_eq!(ready.max_media_body, 1234);
         assert_eq!(ready.source_id, 11);
+    }
+
+    #[test]
+    fn welcome_preserves_unknown_fields_byte_exactly() {
+        let display = DisplayChanged {
+            display_generation: 3,
+            viewport_width: 800,
+            viewport_height: 600,
+            grid_columns: 80,
+            grid_rows: 24,
+            cell_width: 10,
+            cell_height: 25,
+        };
+        let preserved = vec![PreservedField {
+            key: 19,
+            encoded_value: vec![0x82, 0x18, 0x2a, 0xf5],
+        }];
+        let body = encode_welcome(
+            7,
+            &WelcomeConfig {
+                session_id: 9,
+                session_tag: &[1; 16],
+                root_context_id: 10,
+                capability_generation: 2,
+                display,
+                maximum_control_body: super::super::CONTROL_MAX_RECORD_BODY,
+                accepted_profiles: &[],
+                selected_major: 1,
+                selected_minor: 1,
+                accepted_features: &[],
+                initial_scene_revision: 42,
+                preserved_fields: &preserved,
+            },
+        );
+        let parsed = parse_welcome(&body).unwrap();
+        assert_eq!(parsed.initial_scene_revision, 42);
+        assert_eq!(parsed.preserved_fields, preserved);
+        let session_tag: &[u8; 16] = parsed.session_tag.as_slice().try_into().unwrap();
+        let reencoded = encode_welcome(
+            7,
+            &WelcomeConfig {
+                session_id: parsed.session_id,
+                session_tag,
+                root_context_id: parsed.root_context_id,
+                capability_generation: parsed.capability_generation,
+                display: DisplayChanged {
+                    display_generation: parsed.display_generation,
+                    viewport_width: parsed.viewport_width,
+                    viewport_height: parsed.viewport_height,
+                    grid_columns: parsed.grid_columns as u32,
+                    grid_rows: parsed.grid_rows as u32,
+                    cell_width: parsed.cell_width,
+                    cell_height: parsed.cell_height,
+                },
+                maximum_control_body: parsed.maximum_control_body,
+                accepted_profiles: &[],
+                selected_major: parsed.selected_major,
+                selected_minor: parsed.selected_minor,
+                accepted_features: &parsed.accepted_features,
+                initial_scene_revision: parsed.initial_scene_revision,
+                preserved_fields: &parsed.preserved_fields,
+            },
+        );
+        assert_eq!(reencoded, body);
+    }
+
+    #[test]
+    fn unsupported_version_error_is_fatal_and_structured() {
+        let parsed = parse_error_reply(&unsupported_version_error()).unwrap();
+        assert_eq!(parsed.code, ERROR_UNSUPPORTED_VERSION);
+        assert_eq!(parsed.request_id, 0);
+        assert!(parsed.fatal);
+        assert_eq!(
+            parsed.supported_version,
+            Some((u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR)))
+        );
     }
 
     #[test]
