@@ -10,6 +10,7 @@ pub mod anchor;
 pub mod cbor;
 pub mod media;
 pub mod messages;
+pub mod revision;
 pub mod wire;
 
 /// Version of the Vivid wire protocol, used by both the connection preface and HELLO/WELCOME.

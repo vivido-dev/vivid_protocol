@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
 use super::cbor::{self, Encoder, PreservedField, PreservingMap, Value};
+use super::revision::{ObservationSequence, SceneRevision, SourceRevision};
 use super::{VIVID_MAJOR, VIVID_MINOR};
 
 pub const HELLO: u16 = 0x0001;
@@ -210,6 +211,88 @@ pub const ERROR_NOT_VISIBLE: u64 = 23;
 pub const ERROR_CANCELLED: u64 = 24;
 
 pub const MAX_ERROR_DETAIL_BYTES: usize = 4096;
+pub const MAX_STATUS_REPLY_BODY: usize = 65_536;
+pub const MAX_SCENE_CURSOR_BYTES: usize = 64;
+
+pub const OBSERVE_SOURCE_TRANSITIONS: u64 = 1 << 0;
+pub const OBSERVE_SCENE_CHANGES: u64 = 1 << 1;
+pub const OBSERVE_PLAYBACK_TRANSITIONS: u64 = 1 << 2;
+pub const OBSERVATION_CLASS_MASK: u64 =
+    OBSERVE_SOURCE_TRANSITIONS | OBSERVE_SCENE_CHANGES | OBSERVE_PLAYBACK_TRANSITIONS;
+
+pub const SOURCE_CHANGED_LIFECYCLE: u64 = 1 << 0;
+pub const SOURCE_CHANGED_EPOCH: u64 = 1 << 1;
+pub const SOURCE_CHANGED_PLAYBACK: u64 = 1 << 2;
+pub const SOURCE_CHANGED_ATTACHMENT: u64 = 1 << 3;
+pub const SOURCE_CHANGED_VISIBILITY: u64 = 1 << 4;
+pub const SOURCE_CHANGED_CAPTURE_POLICY: u64 = 1 << 5;
+pub const SOURCE_CHANGED_DESCRIPTOR: u64 = 1 << 6;
+pub const SOURCE_CHANGED_MILESTONES: u64 = 1 << 7;
+pub const SOURCE_CHANGED_CREDIT_ACCOUNTING: u64 = 1 << 8;
+pub const SOURCE_CHANGED_FIELD_MASK: u64 = (1 << 9) - 1;
+
+pub const SCENE_CHANGED_PRODUCER_COMMIT: u64 = 1 << 0;
+pub const SCENE_CHANGED_SOURCE_LOSS: u64 = 1 << 1;
+pub const SCENE_CHANGED_ANCHOR_GONE: u64 = 1 << 2;
+pub const SCENE_CHANGED_CONTEXT_REVOKED: u64 = 1 << 3;
+pub const SCENE_CHANGED_POLICY_TEARDOWN: u64 = 1 << 4;
+pub const SCENE_CHANGED_REASON_MASK: u64 = (1 << 5) - 1;
+
+pub const PLAYBACK_IDLE: u64 = 0;
+pub const PLAYBACK_BUFFERING: u64 = 1;
+pub const PLAYBACK_PLAYING: u64 = 2;
+pub const PLAYBACK_PAUSED: u64 = 3;
+pub const PLAYBACK_ENDED: u64 = 4;
+pub const PLAYBACK_LOST: u64 = 5;
+
+pub const EOS_NOT_RECEIVED: u64 = 0;
+pub const EOS_ACCEPTED: u64 = 1;
+pub const EOS_APPLIED: u64 = 2;
+
+pub const SOURCE_KIND_VIDEO: u64 = 1;
+pub const SOURCE_KIND_RASTER: u64 = 2;
+pub const SOURCE_KIND_IMAGE: u64 = 3;
+pub const SOURCE_KIND_AUDIO: u64 = 4;
+
+pub const SOURCE_LIFECYCLE_CREATED: u64 = 0;
+pub const SOURCE_LIFECYCLE_ATTACHED: u64 = 1;
+pub const SOURCE_LIFECYCLE_ACTIVE: u64 = 2;
+pub const SOURCE_LIFECYCLE_PAUSED: u64 = 3;
+pub const SOURCE_LIFECYCLE_ENDED: u64 = 4;
+pub const SOURCE_LIFECYCLE_LOST: u64 = 5;
+pub const SOURCE_LIFECYCLE_TOMBSTONE: u64 = 6;
+
+pub const ATTACHMENT_NEVER: u64 = 0;
+pub const ATTACHMENT_ATTACHED: u64 = 1;
+pub const ATTACHMENT_CLOSED: u64 = 2;
+
+pub const MILESTONE_MEDIA_ATTACHED: u64 = 1 << 0;
+pub const MILESTONE_FIRST_MEDIA_RECORD: u64 = 1 << 1;
+pub const MILESTONE_DECODER_INITIALIZED: u64 = 1 << 2;
+pub const MILESTONE_RANDOM_ACCESS_ACCEPTED: u64 = 1 << 3;
+pub const MILESTONE_FIRST_DECODED_OUTPUT: u64 = 1 << 4;
+pub const MILESTONE_FIRST_VISIBLE_PRESENTATION: u64 = 1 << 5;
+pub const MILESTONE_PLAYBACK_STARTED: u64 = 1 << 6;
+pub const MILESTONE_EOS_ACCEPTED: u64 = 1 << 7;
+pub const MILESTONE_PLAYBACK_ENDED: u64 = 1 << 8;
+pub const MILESTONE_SOURCE_LOST: u64 = 1 << 9;
+pub const MILESTONE_MASK: u64 = (1 << 10) - 1;
+
+pub const QUEUE_DEPTH_EMPTY: u64 = 0;
+pub const QUEUE_DEPTH_LOW: u64 = 1;
+pub const QUEUE_DEPTH_MODERATE: u64 = 2;
+pub const QUEUE_DEPTH_HIGH: u64 = 3;
+pub const QUEUE_DEPTH_CAPACITY: u64 = 4;
+
+pub const WAIT_SOURCE_REVISION: u64 = 1;
+pub const WAIT_FIRST_VISIBLE_PRESENTATION: u64 = 2;
+pub const WAIT_RASTER_FRAME: u64 = 3;
+pub const WAIT_VIDEO_PTS: u64 = 4;
+pub const WAIT_PLAYBACK_STARTED: u64 = 5;
+pub const WAIT_PLAYBACK_ENDED: u64 = 6;
+pub const WAIT_MEDIA_ATTACHED: u64 = 7;
+pub const WAIT_MEDIA_CLOSED: u64 = 8;
+pub const WAIT_SOURCE_LOST: u64 = 9;
 
 pub const ERROR_DETAIL_LIMIT_ID: u64 = 0;
 pub const ERROR_DETAIL_CURRENT: u64 = 1;
@@ -339,7 +422,7 @@ pub struct Welcome {
     pub selected_major: u64,
     pub selected_minor: u64,
     pub accepted_features: Vec<u64>,
-    pub initial_scene_revision: u64,
+    pub initial_scene_revision: SceneRevision,
     pub preserved_fields: Vec<PreservedField>,
 }
 
@@ -362,6 +445,180 @@ pub struct SourceReady {
     pub packet_credits: u64,
     pub fragment_credits: u64,
     pub max_media_body: u32,
+    pub rolling_byte_window: u64,
+    pub rolling_packet_window: u64,
+    pub initial_source_revision: SourceRevision,
+    pub media_connection_required: bool,
+    pub delta_operation_limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilitySupport {
+    pub supported: bool,
+    pub decoder: String,
+    pub capability_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapsChanged {
+    pub capability_generation: u64,
+    pub reason_mask: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceChanged {
+    pub source_id: u64,
+    pub source_revision: SourceRevision,
+    pub changed_fields: u64,
+    pub observation_sequence: ObservationSequence,
+    pub first_lost_sequence: Option<ObservationSequence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneChanged {
+    pub scene_revision: SceneRevision,
+    pub reason_mask: u64,
+    pub observation_sequence: ObservationSequence,
+    pub first_lost_sequence: Option<ObservationSequence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackSnapshot {
+    pub state: u64,
+    pub clock_pts_us: i64,
+    pub epoch: u32,
+    pub buffered_ahead_us: u64,
+    pub underrun_count: u64,
+    pub late_drop_count: u64,
+    pub eos_state: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackState {
+    pub source_id: u64,
+    pub snapshot: PlaybackSnapshot,
+    pub source_revision: SourceRevision,
+    pub observation_sequence: ObservationSequence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceStatus {
+    pub source_id: u64,
+    pub source_revision: SourceRevision,
+    pub kind: u64,
+    pub lifecycle: u64,
+    pub epoch: u32,
+    pub attachment_state: u64,
+    pub attachment_generation: u64,
+    pub last_media_id: u64,
+    pub last_media_sequence: u64,
+    pub last_decoded_pts_us: i64,
+    pub last_presented_pts_us: i64,
+    pub last_presentation_id: u64,
+    pub visible: bool,
+    pub capture_policy: u64,
+    pub linked_source_id: u64,
+    pub milestones: u64,
+    pub outstanding_byte_credit: u64,
+    pub outstanding_packet_credit: u64,
+    pub ingress_queue_depth: u64,
+    pub descriptor: Option<Value>,
+    pub playback: Option<PlaybackSnapshot>,
+    pub terminal_loss_code: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneQuery {
+    pub expected_revision: Option<SceneRevision>,
+    pub cursor: Option<SceneCursor>,
+    pub maximum_nodes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneCursor {
+    pub scene_revision: SceneRevision,
+    pub offset: u64,
+}
+
+impl SceneCursor {
+    const VERSION: u8 = 1;
+    const ENCODED_BYTES: usize = 17;
+
+    pub fn encode(self) -> [u8; Self::ENCODED_BYTES] {
+        let mut encoded = [0; Self::ENCODED_BYTES];
+        encoded[0] = Self::VERSION;
+        encoded[1..9].copy_from_slice(&self.scene_revision.get().to_be_bytes());
+        encoded[9..17].copy_from_slice(&self.offset.to_be_bytes());
+        encoded
+    }
+
+    pub fn decode(encoded: &[u8]) -> io::Result<Self> {
+        if encoded.len() > MAX_SCENE_CURSOR_BYTES
+            || encoded.len() != Self::ENCODED_BYTES
+            || encoded[0] != Self::VERSION
+        {
+            return Err(invalid("scene cursor has an invalid version or length"));
+        }
+        Ok(Self {
+            scene_revision: SceneRevision::new(u64::from_be_bytes(
+                encoded[1..9].try_into().unwrap(),
+            )),
+            offset: u64::from_be_bytes(encoded[9..17].try_into().unwrap()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneStatus {
+    pub scene_revision: SceneRevision,
+    pub nodes: Vec<ParsedSceneNode>,
+    pub cursor: Option<SceneCursor>,
+    pub total_nodes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchorStatus {
+    pub anchor_id: u64,
+    pub state: u64,
+    pub column: u64,
+    pub row: u64,
+    pub visible: bool,
+    pub display_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitsStatus {
+    pub maximum_sources: u64,
+    pub maximum_nodes: u64,
+    pub maximum_transactions: u64,
+    pub maximum_anchors: u64,
+    pub maximum_control_body: u64,
+    pub maximum_media_body: u64,
+    pub maximum_waits: u64,
+    pub maximum_pending_requests: u64,
+    pub rolling_byte_window: u64,
+    pub rolling_packet_window: u64,
+    pub retained_pixel_budget: u64,
+    pub current_sources: u64,
+    pub current_nodes: u64,
+    pub current_retained_pixels: u64,
+    pub image_cache_budget: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitSource {
+    pub source_id: u64,
+    pub condition: u64,
+    pub value: Option<u64>,
+    pub timeout_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitSatisfied {
+    pub source_id: u64,
+    pub source_revision: SourceRevision,
+    pub condition: u64,
+    pub observed_value: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -935,6 +1192,8 @@ pub struct SourceLost {
     pub source_id: u64,
     pub code: u64,
     pub diagnostic: String,
+    pub final_source_revision: SourceRevision,
+    pub detail: ErrorDetail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1228,21 +1487,44 @@ pub fn parse_audio_support(body: &[u8]) -> io::Result<bool> {
 }
 
 pub fn video_support(request_id: u64, supported: bool, decoder: &str) -> Vec<u8> {
+    capability_support(request_id, supported, decoder, 1)
+}
+
+pub fn capability_support(
+    request_id: u64,
+    supported: bool,
+    decoder: &str,
+    capability_generation: u64,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(2);
+        encoder.map(3);
         encoder.u64(0);
         encoder.bool(supported);
         encoder.u64(1);
         encoder.text(decoder);
+        key_u64(encoder, 2, capability_generation);
     })
 }
 
 pub fn parse_video_support(body: &[u8]) -> io::Result<bool> {
+    Ok(parse_capability_support(body)?.supported)
+}
+
+pub fn parse_capability_support(body: &[u8]) -> io::Result<CapabilitySupport> {
     let (_, payload) = decode_envelope(body)?;
-    payload
-        .map_value(0)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| invalid("VIDEO_SUPPORT is missing its supported flag"))
+    reject_unknown_fields(&payload, &[0, 1, 2])?;
+    let support = CapabilitySupport {
+        supported: payload
+            .map_value(0)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid("support reply is missing its supported flag"))?,
+        decoder: bounded_text(&payload, 1, "decoder name", 4096)?.to_owned(),
+        capability_generation: required_u64(&payload, 2, "capability generation")?,
+    };
+    if support.capability_generation == 0 {
+        return Err(invalid("capability generation is zero"));
+    }
+    Ok(support)
 }
 
 pub fn begin_transaction(request_id: u64, transaction_id: u64) -> Vec<u8> {
@@ -1587,16 +1869,57 @@ pub fn source_ready(
     credits: Credits,
     max_media_body: u32,
 ) -> Vec<u8> {
-    envelope(request_id, None, None, |encoder| {
-        encoder.map(6);
-        key_u64(encoder, 0, source_id);
-        encoder.u64(1);
-        encoder.bytes(ticket);
-        key_u64(encoder, 2, credits.bytes);
-        key_u64(encoder, 3, credits.packets);
-        key_u64(encoder, 4, credits.fragments);
-        key_u64(encoder, 5, u64::from(max_media_body));
-    })
+    source_ready_with_observability(
+        request_id,
+        &SourceReady {
+            source_id,
+            media_ticket: ticket.to_vec(),
+            byte_credits: credits.bytes,
+            packet_credits: credits.packets,
+            fragment_credits: credits.fragments,
+            max_media_body,
+            rolling_byte_window: credits.bytes,
+            rolling_packet_window: credits.packets,
+            initial_source_revision: SourceRevision::ZERO,
+            media_connection_required: true,
+            delta_operation_limit: None,
+        },
+    )
+    .expect("baseline SOURCE_READY is valid")
+}
+
+pub fn source_ready_with_observability(
+    request_id: u64,
+    ready: &SourceReady,
+) -> io::Result<Vec<u8>> {
+    validate_source_ready(ready)?;
+    let include_media = ready.media_connection_required;
+    let field_count = 4
+        + 5 * usize::from(include_media)
+        + usize::from(!ready.media_connection_required)
+        + usize::from(ready.delta_operation_limit.is_some());
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(field_count);
+        key_u64(encoder, 0, ready.source_id);
+        if include_media {
+            encoder.u64(1);
+            encoder.bytes(&ready.media_ticket);
+            key_u64(encoder, 2, ready.byte_credits);
+            key_u64(encoder, 3, ready.packet_credits);
+            key_u64(encoder, 4, ready.fragment_credits);
+            key_u64(encoder, 5, u64::from(ready.max_media_body));
+        }
+        key_u64(encoder, 6, ready.rolling_byte_window);
+        key_u64(encoder, 7, ready.rolling_packet_window);
+        key_u64(encoder, 8, ready.initial_source_revision.get());
+        if !ready.media_connection_required {
+            encoder.u64(9);
+            encoder.bool(false);
+        }
+        if let Some(limit) = ready.delta_operation_limit {
+            key_u64(encoder, 10, limit);
+        }
+    }))
 }
 
 pub fn pause(request_id: u64, source_id: u64) -> Vec<u8> {
@@ -1655,13 +1978,308 @@ pub fn need_keyframe(
 }
 
 pub fn source_lost(source_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
-    envelope(0, None, None, |encoder| {
-        encoder.map(3);
+    source_lost_with_observability(
+        source_id,
+        code,
+        diagnostic,
+        SourceRevision::ZERO,
+        &ErrorDetail::new(),
+    )
+    .expect("baseline SOURCE_LOST is valid")
+}
+
+pub fn source_lost_with_observability(
+    source_id: u64,
+    code: u64,
+    diagnostic: &str,
+    final_source_revision: SourceRevision,
+    detail: &ErrorDetail,
+) -> io::Result<Vec<u8>> {
+    if source_id == 0 {
+        return Err(invalid("SOURCE_LOST source ID is zero"));
+    }
+    let encoded_detail = (!detail.is_empty()).then(|| detail.encoded()).transpose()?;
+    Ok(envelope(0, None, None, |encoder| {
+        encoder.map(4 + usize::from(encoded_detail.is_some()));
         key_u64(encoder, 0, source_id);
         key_u64(encoder, 1, code);
         encoder.u64(2);
         encoder.text(truncate_utf8(diagnostic, 4096));
+        key_u64(encoder, 3, final_source_revision.get());
+        if let Some(detail) = &encoded_detail {
+            encoder.u64(4);
+            encoder.canonical_value(detail);
+        }
+    }))
+}
+
+pub fn caps_changed(capability_generation: u64, reason_mask: u64) -> io::Result<Vec<u8>> {
+    if capability_generation == 0 || reason_mask & !0x0f != 0 {
+        return Err(invalid(
+            "CAPS_CHANGED contains an invalid generation or reason mask",
+        ));
+    }
+    Ok(envelope(0, None, None, |encoder| {
+        encoder.map(2);
+        key_u64(encoder, 0, capability_generation);
+        key_u64(encoder, 1, reason_mask);
+    }))
+}
+
+pub fn presented(request_id: u64, scene_revision: SceneRevision) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(1);
+        key_u64(encoder, 0, scene_revision.get());
     })
+}
+
+pub fn set_observation(request_id: u64, class_mask: u64) -> io::Result<Vec<u8>> {
+    if class_mask & !OBSERVATION_CLASS_MASK != 0 {
+        return Err(invalid("SET_OBSERVATION contains unknown class bits"));
+    }
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(1);
+        key_u64(encoder, 0, class_mask);
+    }))
+}
+
+pub fn source_changed(event: SourceChanged) -> io::Result<Vec<u8>> {
+    if event.source_id == 0
+        || event.changed_fields == 0
+        || event.changed_fields & !SOURCE_CHANGED_FIELD_MASK != 0
+    {
+        return Err(invalid(
+            "SOURCE_CHANGED contains invalid source or field bits",
+        ));
+    }
+    Ok(envelope(0, None, None, |encoder| {
+        encoder.map(4 + usize::from(event.first_lost_sequence.is_some()));
+        key_u64(encoder, 0, event.source_id);
+        key_u64(encoder, 1, event.source_revision.get());
+        key_u64(encoder, 2, event.changed_fields);
+        key_u64(encoder, 3, event.observation_sequence.get());
+        if let Some(first_lost) = event.first_lost_sequence {
+            key_u64(encoder, 4, first_lost.get());
+        }
+    }))
+}
+
+pub fn scene_changed(event: SceneChanged) -> io::Result<Vec<u8>> {
+    if event.reason_mask == 0 || event.reason_mask & !SCENE_CHANGED_REASON_MASK != 0 {
+        return Err(invalid("SCENE_CHANGED contains invalid reason bits"));
+    }
+    Ok(envelope(0, None, None, |encoder| {
+        encoder.map(3 + usize::from(event.first_lost_sequence.is_some()));
+        key_u64(encoder, 0, event.scene_revision.get());
+        key_u64(encoder, 1, event.reason_mask);
+        key_u64(encoder, 2, event.observation_sequence.get());
+        if let Some(first_lost) = event.first_lost_sequence {
+            key_u64(encoder, 3, first_lost.get());
+        }
+    }))
+}
+
+pub fn playback_state(event: PlaybackState) -> io::Result<Vec<u8>> {
+    validate_playback_snapshot(event.snapshot)?;
+    if event.source_id == 0 {
+        return Err(invalid("PLAYBACK_STATE source ID is zero"));
+    }
+    Ok(envelope(0, None, None, |encoder| {
+        encoder.map(10);
+        key_u64(encoder, 0, event.source_id);
+        encode_playback_snapshot_fields(encoder, event.snapshot);
+        key_u64(encoder, 8, event.source_revision.get());
+        key_u64(encoder, 9, event.observation_sequence.get());
+    }))
+}
+
+pub fn query_source(request_id: u64, source_id: u64) -> io::Result<Vec<u8>> {
+    if source_id == 0 {
+        return Err(invalid("QUERY_SOURCE source ID is zero"));
+    }
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(1);
+        key_u64(encoder, 0, source_id);
+    }))
+}
+
+pub fn source_status(request_id: u64, status: &SourceStatus) -> io::Result<Vec<u8>> {
+    validate_source_status(status)?;
+    let mut entries = vec![
+        (0, Value::Unsigned(status.source_id)),
+        (1, Value::Unsigned(status.source_revision.get())),
+        (2, Value::Unsigned(status.kind)),
+        (3, Value::Unsigned(status.lifecycle)),
+        (4, Value::Unsigned(u64::from(status.epoch))),
+        (5, Value::Unsigned(status.attachment_state)),
+        (6, Value::Unsigned(status.attachment_generation)),
+        (7, Value::Unsigned(status.last_media_id)),
+        (8, Value::Unsigned(status.last_media_sequence)),
+        (9, signed_value(status.last_decoded_pts_us)),
+        (10, signed_value(status.last_presented_pts_us)),
+        (11, Value::Unsigned(status.last_presentation_id)),
+        (12, Value::Bool(status.visible)),
+        (13, Value::Unsigned(status.capture_policy)),
+        (14, Value::Unsigned(status.linked_source_id)),
+        (15, Value::Unsigned(status.milestones)),
+        (16, Value::Unsigned(status.outstanding_byte_credit)),
+        (17, Value::Unsigned(status.outstanding_packet_credit)),
+        (18, Value::Unsigned(status.ingress_queue_depth)),
+    ];
+    if let Some(descriptor) = &status.descriptor {
+        entries.push((19, descriptor.clone()));
+    }
+    if let Some(playback) = status.playback {
+        entries.push((20, playback_snapshot_value(playback)));
+    }
+    if let Some(code) = status.terminal_loss_code {
+        entries.push((21, Value::Unsigned(code)));
+    }
+    bounded_status_envelope(request_id, Value::Map(entries))
+}
+
+pub fn query_scene(request_id: u64, query: &SceneQuery) -> io::Result<Vec<u8>> {
+    if query.maximum_nodes == Some(0) {
+        return Err(invalid("QUERY_SCENE maximum node count is zero"));
+    }
+    if let (Some(expected), Some(cursor)) = (query.expected_revision, query.cursor)
+        && expected != cursor.scene_revision
+    {
+        return Err(invalid(
+            "QUERY_SCENE cursor revision contradicts expected revision",
+        ));
+    }
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(
+            usize::from(query.expected_revision.is_some())
+                + usize::from(query.cursor.is_some())
+                + usize::from(query.maximum_nodes.is_some()),
+        );
+        if let Some(revision) = query.expected_revision {
+            key_u64(encoder, 0, revision.get());
+        }
+        if let Some(cursor) = query.cursor {
+            encoder.u64(1);
+            encoder.bytes(&cursor.encode());
+        }
+        if let Some(maximum_nodes) = query.maximum_nodes {
+            key_u64(encoder, 2, maximum_nodes);
+        }
+    }))
+}
+
+pub fn scene_status(request_id: u64, status: &SceneStatus) -> io::Result<Vec<u8>> {
+    if status.nodes.len() > MAX_SCENE_NODES || status.total_nodes < status.nodes.len() as u64 {
+        return Err(invalid("SCENE_STATUS contains an invalid node count"));
+    }
+    let nodes = status
+        .nodes
+        .iter()
+        .map(scene_node_value)
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut entries = vec![
+        (0, Value::Unsigned(status.scene_revision.get())),
+        (1, Value::Array(nodes)),
+    ];
+    if let Some(cursor) = status.cursor {
+        if cursor.scene_revision != status.scene_revision {
+            return Err(invalid("SCENE_STATUS cursor is bound to another revision"));
+        }
+        entries.push((2, Value::Bytes(cursor.encode().to_vec())));
+    }
+    entries.push((3, Value::Unsigned(status.total_nodes)));
+    bounded_status_envelope(request_id, Value::Map(entries))
+}
+
+pub fn query_anchor(request_id: u64, anchor_id: u64) -> io::Result<Vec<u8>> {
+    if anchor_id == 0 {
+        return Err(invalid("QUERY_ANCHOR anchor ID is zero"));
+    }
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(1);
+        key_u64(encoder, 0, anchor_id);
+    }))
+}
+
+pub fn anchor_status(request_id: u64, status: AnchorStatus) -> io::Result<Vec<u8>> {
+    validate_anchor_status(status)?;
+    bounded_status_envelope(
+        request_id,
+        Value::Map(vec![
+            (0, Value::Unsigned(status.anchor_id)),
+            (1, Value::Unsigned(status.state)),
+            (2, Value::Unsigned(status.column)),
+            (3, Value::Unsigned(status.row)),
+            (4, Value::Bool(status.visible)),
+            (5, Value::Unsigned(status.display_generation)),
+        ]),
+    )
+}
+
+pub fn query_limits(request_id: u64) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| encoder.map(0))
+}
+
+pub fn limits_status(request_id: u64, status: LimitsStatus) -> io::Result<Vec<u8>> {
+    let mut entries = vec![
+        (0, Value::Unsigned(status.maximum_sources)),
+        (1, Value::Unsigned(status.maximum_nodes)),
+        (2, Value::Unsigned(status.maximum_transactions)),
+        (3, Value::Unsigned(status.maximum_anchors)),
+        (4, Value::Unsigned(status.maximum_control_body)),
+        (5, Value::Unsigned(status.maximum_media_body)),
+        (6, Value::Unsigned(status.maximum_waits)),
+        (7, Value::Unsigned(status.maximum_pending_requests)),
+        (8, Value::Unsigned(status.rolling_byte_window)),
+        (9, Value::Unsigned(status.rolling_packet_window)),
+        (10, Value::Unsigned(status.retained_pixel_budget)),
+        (11, Value::Unsigned(status.current_sources)),
+        (12, Value::Unsigned(status.current_nodes)),
+        (13, Value::Unsigned(status.current_retained_pixels)),
+    ];
+    if let Some(cache_budget) = status.image_cache_budget {
+        entries.push((14, Value::Unsigned(cache_budget)));
+    }
+    bounded_status_envelope(request_id, Value::Map(entries))
+}
+
+pub fn wait_source(request_id: u64, wait: WaitSource) -> io::Result<Vec<u8>> {
+    validate_wait_source(wait)?;
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(3 + usize::from(wait.value.is_some()));
+        key_u64(encoder, 0, wait.source_id);
+        key_u64(encoder, 1, wait.condition);
+        if let Some(value) = wait.value {
+            key_u64(encoder, 2, value);
+        }
+        key_u64(encoder, 3, wait.timeout_us);
+    }))
+}
+
+pub fn wait_satisfied(request_id: u64, satisfied: WaitSatisfied) -> io::Result<Vec<u8>> {
+    validate_wait_condition(satisfied.condition, None, false)?;
+    if satisfied.source_id == 0 {
+        return Err(invalid("WAIT_SATISFIED source ID is zero"));
+    }
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(3 + usize::from(satisfied.observed_value.is_some()));
+        key_u64(encoder, 0, satisfied.source_id);
+        key_u64(encoder, 1, satisfied.source_revision.get());
+        key_u64(encoder, 2, satisfied.condition);
+        if let Some(value) = satisfied.observed_value {
+            key_u64(encoder, 3, value);
+        }
+    }))
+}
+
+pub fn cancel_wait(request_id: u64, wait_request_id: u64) -> io::Result<Vec<u8>> {
+    if wait_request_id == 0 {
+        return Err(invalid("CANCEL_WAIT request ID is zero"));
+    }
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(1);
+        key_u64(encoder, 0, wait_request_id);
+    }))
 }
 
 pub fn ok(request_id: u64) -> Vec<u8> {
@@ -2621,9 +3239,9 @@ pub fn parse_welcome_for_version(body: &[u8], major: u64, minor: u64) -> io::Res
         selected_minor: required_u64(payload, 14, "selected Vivid minor version")?,
         accepted_features: feature_array(payload, 15, "accepted features")?,
         initial_scene_revision: if (major, minor) == (1, 0) {
-            0
+            SceneRevision::ZERO
         } else {
-            required_u64(payload, 16, "initial scene revision")?
+            SceneRevision::new(required_u64(payload, 16, "initial scene revision")?)
         },
         preserved_fields: decoded.preserved_owned(),
     };
@@ -2661,24 +3279,59 @@ pub fn parse_display_changed(body: &[u8]) -> io::Result<DisplayChanged> {
 
 pub fn parse_source_ready(body: &[u8]) -> io::Result<SourceReady> {
     let (_, payload) = decode_envelope(body)?;
-    reject_unknown_fields(&payload, &[0, 1, 2, 3, 4, 5])?;
+    reject_unknown_fields(&payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
+    let media_connection_required = match payload.map_value(9) {
+        None => true,
+        Some(Value::Bool(false)) => false,
+        Some(_) => {
+            return Err(invalid(
+                "SOURCE_READY media-connection flag must be absent or false",
+            ));
+        }
+    };
     let ready = SourceReady {
         source_id: required_u64(&payload, 0, "source ID")?,
-        media_ticket: required_bytes(&payload, 1, "media ticket")?.to_vec(),
-        byte_credits: required_u64(&payload, 2, "byte credits")?,
-        packet_credits: required_u64(&payload, 3, "packet credits")?,
+        media_ticket: if media_connection_required {
+            required_bytes(&payload, 1, "media ticket")?.to_vec()
+        } else {
+            Vec::new()
+        },
+        byte_credits: if media_connection_required {
+            required_u64(&payload, 2, "byte credits")?
+        } else {
+            0
+        },
+        packet_credits: if media_connection_required {
+            required_u64(&payload, 3, "packet credits")?
+        } else {
+            0
+        },
         fragment_credits: payload.map_value(4).and_then(Value::as_u64).unwrap_or(0),
-        max_media_body: required_u32(&payload, 5, "maximum media body")?,
+        max_media_body: if media_connection_required {
+            required_u32(&payload, 5, "maximum media body")?
+        } else {
+            0
+        },
+        rolling_byte_window: required_u64(&payload, 6, "rolling byte window")?,
+        rolling_packet_window: required_u64(&payload, 7, "rolling packet window")?,
+        initial_source_revision: SourceRevision::new(required_u64(
+            &payload,
+            8,
+            "initial source revision",
+        )?),
+        media_connection_required,
+        delta_operation_limit: optional_u64(&payload, 10, "delta operation limit")?,
     };
-    if ready.source_id == 0
-        || ready.media_ticket.len() != 32
-        || ready.max_media_body == 0
-        || ready.max_media_body > super::HARD_MAX_RECORD_BODY
-        || ready.byte_credits < u64::from(ready.max_media_body)
-        || ready.packet_credits == 0
+    if !media_connection_required
+        && [1_u64, 2, 3, 4, 5]
+            .into_iter()
+            .any(|key| payload.map_value(key).is_some())
     {
-        return Err(invalid("SOURCE_READY contains invalid limits or credits"));
+        return Err(invalid(
+            "SOURCE_READY cache hit contains media connection fields",
+        ));
     }
+    validate_source_ready(&ready)?;
     Ok(ready)
 }
 
@@ -2713,12 +3366,351 @@ pub fn parse_need_keyframe(body: &[u8]) -> io::Result<NeedKeyframe> {
 
 pub fn parse_source_lost(body: &[u8]) -> io::Result<SourceLost> {
     let (_, payload) = decode_envelope(body)?;
-    reject_unknown_fields(&payload, &[0, 1, 2])?;
+    reject_unknown_fields(&payload, &[0, 1, 2, 3, 4])?;
     Ok(SourceLost {
         source_id: required_u64(&payload, 0, "source ID")?,
         code: required_u64(&payload, 1, "source-loss code")?,
         diagnostic: bounded_text(&payload, 2, "source-loss diagnostic", 4096)?.to_owned(),
+        final_source_revision: SourceRevision::new(required_u64(
+            &payload,
+            3,
+            "final source revision",
+        )?),
+        detail: match payload.map_value(4) {
+            Some(detail) => ErrorDetail::parse(detail)?,
+            None => ErrorDetail::new(),
+        },
     })
+}
+
+pub fn parse_caps_changed(body: &[u8]) -> io::Result<CapsChanged> {
+    let envelope = parse_unsolicited(body, &[0, 1])?;
+    let changed = CapsChanged {
+        capability_generation: required_u64(&envelope.payload, 0, "capability generation")?,
+        reason_mask: required_u64(&envelope.payload, 1, "capability change reason")?,
+    };
+    if changed.capability_generation == 0 || changed.reason_mask & !0x0f != 0 {
+        return Err(invalid(
+            "CAPS_CHANGED contains an invalid generation or reason mask",
+        ));
+    }
+    Ok(changed)
+}
+
+pub fn parse_presented(body: &[u8]) -> io::Result<(u64, SceneRevision)> {
+    let (request_id, payload) = decode_envelope(body)?;
+    reject_unknown_fields(&payload, &[0])?;
+    Ok((
+        request_id,
+        SceneRevision::new(required_u64(&payload, 0, "scene revision")?),
+    ))
+}
+
+pub fn parse_set_observation(body: &[u8]) -> io::Result<(ControlEnvelope, u64)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0])?;
+    let mask = required_u64(&envelope.payload, 0, "observation class mask")?;
+    if mask & !OBSERVATION_CLASS_MASK != 0 {
+        return Err(invalid("SET_OBSERVATION contains unknown class bits"));
+    }
+    Ok((envelope, mask))
+}
+
+pub fn parse_source_changed(body: &[u8]) -> io::Result<SourceChanged> {
+    let envelope = parse_unsolicited(body, &[0, 1, 2, 3, 4])?;
+    let event = SourceChanged {
+        source_id: required_u64(&envelope.payload, 0, "source ID")?,
+        source_revision: SourceRevision::new(required_u64(
+            &envelope.payload,
+            1,
+            "source revision",
+        )?),
+        changed_fields: required_u64(&envelope.payload, 2, "changed fields")?,
+        observation_sequence: ObservationSequence::new(required_u64(
+            &envelope.payload,
+            3,
+            "observation sequence",
+        )?),
+        first_lost_sequence: optional_u64(&envelope.payload, 4, "first lost observation sequence")?
+            .map(ObservationSequence::new),
+    };
+    if event.source_id == 0
+        || event.changed_fields == 0
+        || event.changed_fields & !SOURCE_CHANGED_FIELD_MASK != 0
+    {
+        return Err(invalid(
+            "SOURCE_CHANGED contains invalid source or field bits",
+        ));
+    }
+    Ok(event)
+}
+
+pub fn parse_scene_changed(body: &[u8]) -> io::Result<SceneChanged> {
+    let envelope = parse_unsolicited(body, &[0, 1, 2, 3])?;
+    let event = SceneChanged {
+        scene_revision: SceneRevision::new(required_u64(&envelope.payload, 0, "scene revision")?),
+        reason_mask: required_u64(&envelope.payload, 1, "scene change reason")?,
+        observation_sequence: ObservationSequence::new(required_u64(
+            &envelope.payload,
+            2,
+            "observation sequence",
+        )?),
+        first_lost_sequence: optional_u64(&envelope.payload, 3, "first lost observation sequence")?
+            .map(ObservationSequence::new),
+    };
+    if event.reason_mask == 0 || event.reason_mask & !SCENE_CHANGED_REASON_MASK != 0 {
+        return Err(invalid("SCENE_CHANGED contains invalid reason bits"));
+    }
+    Ok(event)
+}
+
+pub fn parse_playback_state(body: &[u8]) -> io::Result<PlaybackState> {
+    let envelope = parse_unsolicited(body, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])?;
+    let event = PlaybackState {
+        source_id: required_u64(&envelope.payload, 0, "source ID")?,
+        snapshot: parse_playback_snapshot(&envelope.payload)?,
+        source_revision: SourceRevision::new(required_u64(
+            &envelope.payload,
+            8,
+            "source revision",
+        )?),
+        observation_sequence: ObservationSequence::new(required_u64(
+            &envelope.payload,
+            9,
+            "observation sequence",
+        )?),
+    };
+    if event.source_id == 0 {
+        return Err(invalid("PLAYBACK_STATE source ID is zero"));
+    }
+    Ok(event)
+}
+
+pub fn parse_query_source(body: &[u8]) -> io::Result<(ControlEnvelope, u64)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0])?;
+    let source_id = required_u64(&envelope.payload, 0, "source ID")?;
+    if source_id == 0 {
+        return Err(invalid("QUERY_SOURCE source ID is zero"));
+    }
+    Ok((envelope, source_id))
+}
+
+pub fn parse_source_status(body: &[u8]) -> io::Result<(u64, SourceStatus)> {
+    let (request_id, payload) = decode_envelope(body)?;
+    reject_unknown_fields(
+        &payload,
+        &[
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+        ],
+    )?;
+    let descriptor = payload.map_value(19).cloned();
+    if descriptor
+        .as_ref()
+        .is_some_and(|value| !matches!(value, Value::Map(_)))
+    {
+        return Err(invalid("SOURCE_STATUS descriptor is not a map"));
+    }
+    let status = SourceStatus {
+        source_id: required_u64(&payload, 0, "source ID")?,
+        source_revision: SourceRevision::new(required_u64(&payload, 1, "source revision")?),
+        kind: required_u64(&payload, 2, "source kind")?,
+        lifecycle: required_u64(&payload, 3, "source lifecycle")?,
+        epoch: required_u32(&payload, 4, "source epoch")?,
+        attachment_state: required_u64(&payload, 5, "attachment state")?,
+        attachment_generation: required_u64(&payload, 6, "attachment generation")?,
+        last_media_id: required_u64(&payload, 7, "last media ID")?,
+        last_media_sequence: required_u64(&payload, 8, "last media sequence")?,
+        last_decoded_pts_us: required_i64(&payload, 9, "last decoded PTS")?,
+        last_presented_pts_us: required_i64(&payload, 10, "last presented PTS")?,
+        last_presentation_id: required_u64(&payload, 11, "last presentation ID")?,
+        visible: payload
+            .map_value(12)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid("SOURCE_STATUS visibility is missing"))?,
+        capture_policy: required_u64(&payload, 13, "capture policy")?,
+        linked_source_id: required_u64(&payload, 14, "linked source ID")?,
+        milestones: required_u64(&payload, 15, "milestones")?,
+        outstanding_byte_credit: required_u64(&payload, 16, "outstanding byte credit")?,
+        outstanding_packet_credit: required_u64(&payload, 17, "outstanding packet credit")?,
+        ingress_queue_depth: required_u64(&payload, 18, "ingress queue depth")?,
+        descriptor,
+        playback: payload
+            .map_value(20)
+            .map(|value| {
+                reject_unknown_fields(value, &[1, 2, 3, 4, 5, 6, 7])?;
+                parse_playback_snapshot(value)
+            })
+            .transpose()?,
+        terminal_loss_code: optional_u64(&payload, 21, "terminal loss code")?,
+    };
+    validate_source_status(&status)?;
+    Ok((request_id, status))
+}
+
+pub fn parse_query_scene(body: &[u8]) -> io::Result<(ControlEnvelope, SceneQuery)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0, 1, 2])?;
+    let query = SceneQuery {
+        expected_revision: optional_u64(&envelope.payload, 0, "expected scene revision")?
+            .map(SceneRevision::new),
+        cursor: envelope
+            .payload
+            .map_value(1)
+            .map(|_| required_bytes(&envelope.payload, 1, "scene cursor"))
+            .transpose()?
+            .map(SceneCursor::decode)
+            .transpose()?,
+        maximum_nodes: optional_u64(&envelope.payload, 2, "maximum node entries")?,
+    };
+    if query.maximum_nodes == Some(0) {
+        return Err(invalid("QUERY_SCENE maximum node count is zero"));
+    }
+    if let (Some(expected), Some(cursor)) = (query.expected_revision, query.cursor)
+        && expected != cursor.scene_revision
+    {
+        return Err(invalid(
+            "QUERY_SCENE cursor revision contradicts expected revision",
+        ));
+    }
+    Ok((envelope, query))
+}
+
+pub fn parse_scene_status(body: &[u8]) -> io::Result<(u64, SceneStatus)> {
+    let (request_id, payload) = decode_envelope(body)?;
+    reject_unknown_fields(&payload, &[0, 1, 2, 3])?;
+    let revision = SceneRevision::new(required_u64(&payload, 0, "scene revision")?);
+    let node_values = payload
+        .map_value(1)
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("SCENE_STATUS nodes are not an array"))?;
+    if node_values.len() > MAX_SCENE_NODES {
+        return Err(invalid("SCENE_STATUS exceeds the node limit"));
+    }
+    let nodes = node_values
+        .iter()
+        .map(parse_scene_node_value)
+        .collect::<io::Result<Vec<_>>>()?;
+    let cursor = payload
+        .map_value(2)
+        .map(|_| required_bytes(&payload, 2, "scene cursor"))
+        .transpose()?
+        .map(SceneCursor::decode)
+        .transpose()?;
+    if cursor.is_some_and(|cursor| cursor.scene_revision != revision) {
+        return Err(invalid("SCENE_STATUS cursor is bound to another revision"));
+    }
+    let status = SceneStatus {
+        scene_revision: revision,
+        nodes,
+        cursor,
+        total_nodes: required_u64(&payload, 3, "total node count")?,
+    };
+    if status.total_nodes < status.nodes.len() as u64 {
+        return Err(invalid("SCENE_STATUS page exceeds total node count"));
+    }
+    Ok((request_id, status))
+}
+
+pub fn parse_query_anchor(body: &[u8]) -> io::Result<(ControlEnvelope, u64)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0])?;
+    let anchor_id = required_u64(&envelope.payload, 0, "anchor ID")?;
+    if anchor_id == 0 {
+        return Err(invalid("QUERY_ANCHOR anchor ID is zero"));
+    }
+    Ok((envelope, anchor_id))
+}
+
+pub fn parse_anchor_status(body: &[u8]) -> io::Result<(u64, AnchorStatus)> {
+    let (request_id, payload) = decode_envelope(body)?;
+    reject_unknown_fields(&payload, &[0, 1, 2, 3, 4, 5])?;
+    let status = AnchorStatus {
+        anchor_id: required_u64(&payload, 0, "anchor ID")?,
+        state: required_u64(&payload, 1, "anchor state")?,
+        column: required_u64(&payload, 2, "anchor column")?,
+        row: required_u64(&payload, 3, "anchor row")?,
+        visible: payload
+            .map_value(4)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid("ANCHOR_STATUS visibility is missing"))?,
+        display_generation: required_u64(&payload, 5, "display generation")?,
+    };
+    validate_anchor_status(status)?;
+    Ok((request_id, status))
+}
+
+pub fn parse_query_limits(body: &[u8]) -> io::Result<ControlEnvelope> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[])?;
+    Ok(envelope)
+}
+
+pub fn parse_limits_status(body: &[u8]) -> io::Result<(u64, LimitsStatus)> {
+    let (request_id, payload) = decode_envelope(body)?;
+    reject_unknown_fields(
+        &payload,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    )?;
+    Ok((
+        request_id,
+        LimitsStatus {
+            maximum_sources: required_u64(&payload, 0, "maximum sources")?,
+            maximum_nodes: required_u64(&payload, 1, "maximum nodes")?,
+            maximum_transactions: required_u64(&payload, 2, "maximum transactions")?,
+            maximum_anchors: required_u64(&payload, 3, "maximum anchors")?,
+            maximum_control_body: required_u64(&payload, 4, "maximum control body")?,
+            maximum_media_body: required_u64(&payload, 5, "maximum media body")?,
+            maximum_waits: required_u64(&payload, 6, "maximum waits")?,
+            maximum_pending_requests: required_u64(&payload, 7, "maximum pending requests")?,
+            rolling_byte_window: required_u64(&payload, 8, "rolling byte window")?,
+            rolling_packet_window: required_u64(&payload, 9, "rolling packet window")?,
+            retained_pixel_budget: required_u64(&payload, 10, "retained pixel budget")?,
+            current_sources: required_u64(&payload, 11, "current sources")?,
+            current_nodes: required_u64(&payload, 12, "current nodes")?,
+            current_retained_pixels: required_u64(&payload, 13, "current retained pixels")?,
+            image_cache_budget: optional_u64(&payload, 14, "image cache budget")?,
+        },
+    ))
+}
+
+pub fn parse_wait_source(body: &[u8]) -> io::Result<(ControlEnvelope, WaitSource)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0, 1, 2, 3])?;
+    let wait = WaitSource {
+        source_id: required_u64(&envelope.payload, 0, "source ID")?,
+        condition: required_u64(&envelope.payload, 1, "wait condition")?,
+        value: optional_u64(&envelope.payload, 2, "wait condition value")?,
+        timeout_us: required_u64(&envelope.payload, 3, "wait timeout")?,
+    };
+    validate_wait_source(wait)?;
+    Ok((envelope, wait))
+}
+
+pub fn parse_wait_satisfied(body: &[u8]) -> io::Result<(u64, WaitSatisfied)> {
+    let (request_id, payload) = decode_envelope(body)?;
+    reject_unknown_fields(&payload, &[0, 1, 2, 3])?;
+    let satisfied = WaitSatisfied {
+        source_id: required_u64(&payload, 0, "source ID")?,
+        source_revision: SourceRevision::new(required_u64(&payload, 1, "source revision")?),
+        condition: required_u64(&payload, 2, "wait condition")?,
+        observed_value: optional_u64(&payload, 3, "observed value")?,
+    };
+    validate_wait_condition(satisfied.condition, None, false)?;
+    if satisfied.source_id == 0 {
+        return Err(invalid("WAIT_SATISFIED source ID is zero"));
+    }
+    Ok((request_id, satisfied))
+}
+
+pub fn parse_cancel_wait(body: &[u8]) -> io::Result<(ControlEnvelope, u64)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0])?;
+    let wait_request_id = required_u64(&envelope.payload, 0, "wait request ID")?;
+    if wait_request_id == 0 {
+        return Err(invalid("CANCEL_WAIT request ID is zero"));
+    }
+    Ok((envelope, wait_request_id))
 }
 
 pub fn parse_credit(body: &[u8]) -> io::Result<Credits> {
@@ -2873,6 +3865,9 @@ pub fn name(record_type: u16) -> &'static str {
         GOODBYE => "GOODBYE",
         DISPLAY_CHANGED => "DISPLAY_CHANGED",
         CAPS_CHANGED => "CAPS_CHANGED",
+        SET_OBSERVATION => "SET_OBSERVATION",
+        QUERY_LIMITS => "QUERY_LIMITS",
+        LIMITS_STATUS => "LIMITS_STATUS",
         PROBE_VIDEO_CONFIG => "PROBE_VIDEO_CONFIG",
         VIDEO_SUPPORT => "VIDEO_SUPPORT",
         CREATE_IMAGE => "CREATE_IMAGE",
@@ -2885,6 +3880,14 @@ pub fn name(record_type: u16) -> &'static str {
         PROBE_AUDIO_CONFIG => "PROBE_AUDIO_CONFIG",
         AUDIO_SUPPORT => "AUDIO_SUPPORT",
         CREATE_AUDIO => "CREATE_AUDIO",
+        QUERY_SOURCE => "QUERY_SOURCE",
+        SOURCE_STATUS => "SOURCE_STATUS",
+        SOURCE_CHANGED => "SOURCE_CHANGED",
+        WAIT_SOURCE => "WAIT_SOURCE",
+        WAIT_SATISFIED => "WAIT_SATISFIED",
+        CANCEL_WAIT => "CANCEL_WAIT",
+        SET_SOURCE_POLICY => "SET_SOURCE_POLICY",
+        UPDATE_SOURCE_DESCRIPTOR => "UPDATE_SOURCE_DESCRIPTOR",
         BEGIN_TXN => "BEGIN_TXN",
         CREATE_NODE => "CREATE_NODE",
         UPDATE_NODE => "UPDATE_NODE",
@@ -2895,6 +3898,11 @@ pub fn name(record_type: u16) -> &'static str {
         ANCHOR_READY => "ANCHOR_READY",
         ANCHOR_GONE => "ANCHOR_GONE",
         BARRIER_REACHED => "BARRIER_REACHED",
+        QUERY_SCENE => "QUERY_SCENE",
+        SCENE_STATUS => "SCENE_STATUS",
+        SCENE_CHANGED => "SCENE_CHANGED",
+        QUERY_ANCHOR => "QUERY_ANCHOR",
+        ANCHOR_STATUS => "ANCHOR_STATUS",
         PLAY => "PLAY",
         PAUSE => "PAUSE",
         STEP => "STEP",
@@ -2907,6 +3915,7 @@ pub fn name(record_type: u16) -> &'static str {
         VISIBILITY => "VISIBILITY",
         QUALITY_HINT => "QUALITY_HINT",
         NEED_KEYFRAME => "NEED_KEYFRAME",
+        NEED_FULL_FRAME => "NEED_FULL_FRAME",
         BLOB_OFFER => "BLOB_OFFER",
         BLOB_HAVE => "BLOB_HAVE",
         BLOB_NEED => "BLOB_NEED",
@@ -2916,6 +3925,8 @@ pub fn name(record_type: u16) -> &'static str {
         DELEGATE_CONTEXT => "DELEGATE_CONTEXT",
         REVOKE_CONTEXT => "REVOKE_CONTEXT",
         CONTEXT_CHANGED => "CONTEXT_CHANGED",
+        CONTEXT_READY => "CONTEXT_READY",
+        CONTEXT_CAPABILITY => "CONTEXT_CAPABILITY",
         KEY_INPUT => "KEY_INPUT",
         POINTER_MOTION => "POINTER_MOTION",
         POINTER_BUTTON => "POINTER_BUTTON",
@@ -3047,11 +4058,238 @@ fn decode_envelope(body: &[u8]) -> io::Result<(u64, Value)> {
     Ok((envelope.request_id, envelope.payload))
 }
 
+fn bounded_status_envelope(request_id: u64, payload: Value) -> io::Result<Vec<u8>> {
+    let payload = cbor::encode(&payload).map_err(invalid_data)?;
+    let encoded = envelope_encoded_payload(request_id, &payload);
+    if encoded.len() > MAX_STATUS_REPLY_BODY {
+        return Err(invalid("status reply exceeds 65,536 encoded bytes"));
+    }
+    Ok(encoded)
+}
+
+fn signed_value(value: i64) -> Value {
+    if value >= 0 {
+        Value::Unsigned(value as u64)
+    } else {
+        Value::Negative(value)
+    }
+}
+
+fn validate_playback_snapshot(snapshot: PlaybackSnapshot) -> io::Result<()> {
+    if snapshot.state > PLAYBACK_LOST || snapshot.eos_state > EOS_APPLIED {
+        return Err(invalid("playback snapshot contains an invalid state"));
+    }
+    Ok(())
+}
+
+fn encode_playback_snapshot_fields(encoder: &mut Encoder, snapshot: PlaybackSnapshot) {
+    key_u64(encoder, 1, snapshot.state);
+    key_i64(encoder, 2, snapshot.clock_pts_us);
+    key_u64(encoder, 3, u64::from(snapshot.epoch));
+    key_u64(encoder, 4, snapshot.buffered_ahead_us);
+    key_u64(encoder, 5, snapshot.underrun_count);
+    key_u64(encoder, 6, snapshot.late_drop_count);
+    key_u64(encoder, 7, snapshot.eos_state);
+}
+
+fn playback_snapshot_value(snapshot: PlaybackSnapshot) -> Value {
+    Value::Map(vec![
+        (1, Value::Unsigned(snapshot.state)),
+        (2, signed_value(snapshot.clock_pts_us)),
+        (3, Value::Unsigned(u64::from(snapshot.epoch))),
+        (4, Value::Unsigned(snapshot.buffered_ahead_us)),
+        (5, Value::Unsigned(snapshot.underrun_count)),
+        (6, Value::Unsigned(snapshot.late_drop_count)),
+        (7, Value::Unsigned(snapshot.eos_state)),
+    ])
+}
+
+fn parse_playback_snapshot(value: &Value) -> io::Result<PlaybackSnapshot> {
+    let snapshot = PlaybackSnapshot {
+        state: required_u64(value, 1, "playback state")?,
+        clock_pts_us: required_i64(value, 2, "playback clock PTS")?,
+        epoch: required_u32(value, 3, "playback epoch")?,
+        buffered_ahead_us: required_u64(value, 4, "buffered-ahead duration")?,
+        underrun_count: required_u64(value, 5, "underrun count")?,
+        late_drop_count: required_u64(value, 6, "late-drop count")?,
+        eos_state: required_u64(value, 7, "EOS state")?,
+    };
+    validate_playback_snapshot(snapshot)?;
+    Ok(snapshot)
+}
+
+fn validate_source_ready(ready: &SourceReady) -> io::Result<()> {
+    if ready.source_id == 0 {
+        return Err(invalid("SOURCE_READY source ID is zero"));
+    }
+    if ready.media_connection_required {
+        if ready.media_ticket.len() != 32
+            || ready.max_media_body == 0
+            || ready.max_media_body > super::HARD_MAX_RECORD_BODY
+            || ready.byte_credits < u64::from(ready.max_media_body)
+            || ready.packet_credits == 0
+            || ready.rolling_byte_window < ready.byte_credits
+            || ready.rolling_packet_window < ready.packet_credits
+        {
+            return Err(invalid("SOURCE_READY contains invalid limits or credits"));
+        }
+    } else if !ready.media_ticket.is_empty()
+        || ready.byte_credits != 0
+        || ready.packet_credits != 0
+        || ready.fragment_credits != 0
+        || ready.max_media_body != 0
+    {
+        return Err(invalid(
+            "SOURCE_READY without a media connection retains media fields",
+        ));
+    }
+    if ready
+        .delta_operation_limit
+        .is_some_and(|limit| !(1..=16).contains(&limit))
+    {
+        return Err(invalid(
+            "SOURCE_READY delta operation limit is outside 1 through 16",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_status(status: &SourceStatus) -> io::Result<()> {
+    if status.source_id == 0
+        || !(SOURCE_KIND_VIDEO..=SOURCE_KIND_AUDIO).contains(&status.kind)
+        || status.lifecycle > SOURCE_LIFECYCLE_TOMBSTONE
+        || status.attachment_state > ATTACHMENT_CLOSED
+        || status.milestones & !MILESTONE_MASK != 0
+        || status.ingress_queue_depth > QUEUE_DEPTH_CAPACITY
+        || (status.lifecycle == SOURCE_LIFECYCLE_TOMBSTONE) != status.terminal_loss_code.is_some()
+    {
+        return Err(invalid("SOURCE_STATUS contains an invalid state field"));
+    }
+    if status
+        .descriptor
+        .as_ref()
+        .is_some_and(|value| !matches!(value, Value::Map(_)))
+    {
+        return Err(invalid("SOURCE_STATUS descriptor is not a map"));
+    }
+    if let Some(playback) = status.playback {
+        validate_playback_snapshot(playback)?;
+    }
+    Ok(())
+}
+
+fn validate_anchor_status(status: AnchorStatus) -> io::Result<()> {
+    if status.anchor_id == 0 || status.state > 2 {
+        return Err(invalid("ANCHOR_STATUS contains an invalid ID or state"));
+    }
+    if status.state != 1 && (status.column != 0 || status.row != 0 || status.visible) {
+        return Err(invalid(
+            "ANCHOR_STATUS non-ready state contains ready-only geometry",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wait_condition(
+    condition: u64,
+    value: Option<u64>,
+    enforce_value_presence: bool,
+) -> io::Result<()> {
+    if !(WAIT_SOURCE_REVISION..=WAIT_SOURCE_LOST).contains(&condition) {
+        return Err(invalid("WAIT_SOURCE condition is unknown"));
+    }
+    if enforce_value_presence {
+        let requires_value = matches!(
+            condition,
+            WAIT_SOURCE_REVISION | WAIT_RASTER_FRAME | WAIT_VIDEO_PTS
+        );
+        if requires_value != value.is_some() {
+            return Err(invalid(
+                "WAIT_SOURCE condition value violates its conditional rule",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_wait_source(wait: WaitSource) -> io::Result<()> {
+    if wait.source_id == 0 || wait.timeout_us == 0 {
+        return Err(invalid("WAIT_SOURCE source ID or timeout is zero"));
+    }
+    validate_wait_condition(wait.condition, wait.value, true)
+}
+
+fn scene_node_value(node: &ParsedSceneNode) -> io::Result<Value> {
+    validate_scene_rect(node.node.x, node.node.y, node.node.width, node.node.height)?;
+    let mut fields = vec![
+        (0, Value::Unsigned(node.node.node_id)),
+        (1, Value::Unsigned(node.node.source_id)),
+        (2, Value::Unsigned(node.node.context_id)),
+        (
+            3,
+            Value::Unsigned(if node.node.anchor_id.is_some() {
+                COORDINATE_ANCHOR_CELL
+            } else {
+                COORDINATE_GRID_CELL
+            }),
+        ),
+        (4, signed_value(node.node.x)),
+        (5, signed_value(node.node.y)),
+        (6, signed_value(node.node.width)),
+        (7, signed_value(node.node.height)),
+        (8, Value::Unsigned(FIT_CONTAIN)),
+        (9, Value::Unsigned(SAMPLING_LINEAR)),
+        (10, Value::Unsigned(node.node.text_layer)),
+        (11, signed_value(node.node.z_index)),
+        (12, Value::Unsigned(BLEND_SOURCE_OVER)),
+        (13, Value::Bool(node.node.visible)),
+    ];
+    if let Some(anchor_id) = node.node.anchor_id {
+        fields.push((14, Value::Unsigned(anchor_id)));
+    }
+    if let Some(clip) = node.clip {
+        validate_scene_rect(clip.x, clip.y, clip.width, clip.height)?;
+        fields.extend([
+            (15, signed_value(clip.x)),
+            (16, signed_value(clip.y)),
+            (17, signed_value(clip.width)),
+            (18, signed_value(clip.height)),
+        ]);
+    }
+    Ok(Value::Map(fields))
+}
+
+fn parse_scene_node_value(value: &Value) -> io::Result<ParsedSceneNode> {
+    reject_unknown_fields(
+        value,
+        &[
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        ],
+    )?;
+    let payload = cbor::encode(value).map_err(invalid_data)?;
+    let envelope = envelope_encoded_payload(0, &payload);
+    parse_scene_node(&envelope).map(|(_, node)| node)
+}
+
 fn required_u64(value: &Value, key: u64, description: &str) -> io::Result<u64> {
     value
         .map_value(key)
         .and_then(Value::as_u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {description}")))
+}
+
+fn optional_u64(value: &Value, key: u64, description: &str) -> io::Result<Option<u64>> {
+    value
+        .map_value(key)
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{description} is not unsigned"),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn reject_unknown_fields(value: &Value, allowed: &[u64]) -> io::Result<()> {
@@ -3645,7 +4883,7 @@ mod tests {
             },
         );
         let parsed = parse_welcome(&body).unwrap();
-        assert_eq!(parsed.initial_scene_revision, 42);
+        assert_eq!(parsed.initial_scene_revision, SceneRevision::new(42));
         assert_eq!(parsed.preserved_fields, preserved);
         let session_tag: &[u8; 16] = parsed.session_tag.as_slice().try_into().unwrap();
         let reencoded = encode_welcome(
@@ -3669,7 +4907,7 @@ mod tests {
                 selected_major: parsed.selected_major,
                 selected_minor: parsed.selected_minor,
                 accepted_features: &parsed.accepted_features,
-                initial_scene_revision: parsed.initial_scene_revision,
+                initial_scene_revision: parsed.initial_scene_revision.get(),
                 preserved_fields: &parsed.preserved_fields,
             },
         );
@@ -4193,6 +5431,344 @@ mod tests {
         streaminfo[10..18].copy_from_slice(&packed.to_be_bytes());
         validate_flac_streaminfo(&streaminfo, 48_000, 2).unwrap();
         assert!(validate_flac_streaminfo(&streaminfo[..33], 48_000, 2).is_err());
+    }
+
+    #[test]
+    fn observability_existing_message_extensions_round_trip() {
+        let support =
+            parse_capability_support(&capability_support(7, true, "hardware", 9)).unwrap();
+        assert_eq!(
+            support,
+            CapabilitySupport {
+                supported: true,
+                decoder: "hardware".into(),
+                capability_generation: 9,
+            }
+        );
+        assert_eq!(
+            parse_caps_changed(&caps_changed(10, 0b0101).unwrap()).unwrap(),
+            CapsChanged {
+                capability_generation: 10,
+                reason_mask: 0b0101,
+            }
+        );
+        assert_eq!(
+            parse_presented(&presented(11, SceneRevision::new(12))).unwrap(),
+            (11, SceneRevision::new(12))
+        );
+
+        let regular = SourceReady {
+            source_id: 4,
+            media_ticket: vec![0x42; 32],
+            byte_credits: 4096,
+            packet_credits: 4,
+            fragment_credits: 0,
+            max_media_body: 1024,
+            rolling_byte_window: 8192,
+            rolling_packet_window: 8,
+            initial_source_revision: SourceRevision::new(1),
+            media_connection_required: true,
+            delta_operation_limit: None,
+        };
+        let parsed =
+            parse_source_ready(&source_ready_with_observability(8, &regular).unwrap()).unwrap();
+        assert_eq!(parsed.rolling_byte_window, 8192);
+        assert_eq!(parsed.rolling_packet_window, 8);
+        assert_eq!(parsed.initial_source_revision, SourceRevision::new(1));
+        assert!(parsed.media_connection_required);
+
+        let cache_hit = SourceReady {
+            source_id: 5,
+            media_ticket: Vec::new(),
+            byte_credits: 0,
+            packet_credits: 0,
+            fragment_credits: 0,
+            max_media_body: 0,
+            rolling_byte_window: 0,
+            rolling_packet_window: 0,
+            initial_source_revision: SourceRevision::new(2),
+            media_connection_required: false,
+            delta_operation_limit: None,
+        };
+        let parsed =
+            parse_source_ready(&source_ready_with_observability(9, &cache_hit).unwrap()).unwrap();
+        assert!(!parsed.media_connection_required);
+        assert!(parsed.media_ticket.is_empty());
+
+        let legacy_ready = envelope(8, None, None, |encoder| {
+            encoder.map(6);
+            key_u64(encoder, 0, 4);
+            encoder.u64(1);
+            encoder.bytes(&[0x42; 32]);
+            key_u64(encoder, 2, 4096);
+            key_u64(encoder, 3, 4);
+            key_u64(encoder, 4, 0);
+            key_u64(encoder, 5, 1024);
+        });
+        assert!(parse_source_ready(&legacy_ready).is_err());
+
+        let detail = ErrorDetail::limit(LIMIT_SOURCES, 65, 64);
+        let lost = parse_source_lost(
+            &source_lost_with_observability(
+                4,
+                ERROR_LIMIT_EXCEEDED,
+                "source lost",
+                SourceRevision::new(7),
+                &detail,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(lost.final_source_revision, SourceRevision::new(7));
+        assert_eq!(lost.detail, detail);
+    }
+
+    #[test]
+    fn observation_change_events_round_trip_with_gap_information() {
+        let (_, mask) =
+            parse_set_observation(&set_observation(10, OBSERVATION_CLASS_MASK).unwrap()).unwrap();
+        assert_eq!(mask, OBSERVATION_CLASS_MASK);
+
+        let source = SourceChanged {
+            source_id: 8,
+            source_revision: SourceRevision::new(12),
+            changed_fields: SOURCE_CHANGED_PLAYBACK | SOURCE_CHANGED_MILESTONES,
+            observation_sequence: ObservationSequence::new(20),
+            first_lost_sequence: Some(ObservationSequence::new(17)),
+        };
+        assert_eq!(
+            parse_source_changed(&source_changed(source).unwrap()).unwrap(),
+            source
+        );
+
+        let scene = SceneChanged {
+            scene_revision: SceneRevision::new(13),
+            reason_mask: SCENE_CHANGED_SOURCE_LOSS,
+            observation_sequence: ObservationSequence::new(21),
+            first_lost_sequence: Some(ObservationSequence::new(19)),
+        };
+        assert_eq!(
+            parse_scene_changed(&scene_changed(scene).unwrap()).unwrap(),
+            scene
+        );
+
+        let playback = PlaybackState {
+            source_id: 8,
+            snapshot: PlaybackSnapshot {
+                state: PLAYBACK_PLAYING,
+                clock_pts_us: -5,
+                epoch: 2,
+                buffered_ahead_us: 50_000,
+                underrun_count: 1,
+                late_drop_count: 2,
+                eos_state: EOS_ACCEPTED,
+            },
+            source_revision: SourceRevision::new(14),
+            observation_sequence: ObservationSequence::new(22),
+        };
+        assert_eq!(
+            parse_playback_state(&playback_state(playback).unwrap()).unwrap(),
+            playback
+        );
+    }
+
+    fn sample_source_status() -> SourceStatus {
+        SourceStatus {
+            source_id: 9,
+            source_revision: SourceRevision::new(4),
+            kind: SOURCE_KIND_VIDEO,
+            lifecycle: SOURCE_LIFECYCLE_ACTIVE,
+            epoch: 3,
+            attachment_state: ATTACHMENT_ATTACHED,
+            attachment_generation: 2,
+            last_media_id: 50,
+            last_media_sequence: 51,
+            last_decoded_pts_us: 52,
+            last_presented_pts_us: 53,
+            last_presentation_id: 54,
+            visible: true,
+            capture_policy: 0,
+            linked_source_id: 0,
+            milestones: MILESTONE_MEDIA_ATTACHED
+                | MILESTONE_FIRST_MEDIA_RECORD
+                | MILESTONE_DECODER_INITIALIZED,
+            outstanding_byte_credit: 4096,
+            outstanding_packet_credit: 4,
+            ingress_queue_depth: QUEUE_DEPTH_LOW,
+            descriptor: Some(Value::Map(vec![(0, Value::Unsigned(1))])),
+            playback: Some(PlaybackSnapshot {
+                state: PLAYBACK_PLAYING,
+                clock_pts_us: 53,
+                epoch: 3,
+                buffered_ahead_us: 20_000,
+                underrun_count: 0,
+                late_drop_count: 1,
+                eos_state: EOS_NOT_RECEIVED,
+            }),
+            terminal_loss_code: None,
+        }
+    }
+
+    #[test]
+    fn bounded_status_queries_and_revision_bound_scene_cursor_round_trip() {
+        let (envelope, source_id) = parse_query_source(&query_source(1, 9).unwrap()).unwrap();
+        assert_eq!((envelope.request_id, source_id), (1, 9));
+        let source = sample_source_status();
+        let encoded = source_status(1, &source).unwrap();
+        assert!(encoded.len() < MAX_STATUS_REPLY_BODY);
+        assert_eq!(parse_source_status(&encoded).unwrap(), (1, source));
+
+        let cursor = SceneCursor {
+            scene_revision: SceneRevision::new(7),
+            offset: 20,
+        };
+        assert_eq!(SceneCursor::decode(&cursor.encode()).unwrap(), cursor);
+        let query = SceneQuery {
+            expected_revision: Some(SceneRevision::new(7)),
+            cursor: Some(cursor),
+            maximum_nodes: Some(10),
+        };
+        let (envelope, parsed_query) = parse_query_scene(&query_scene(2, &query).unwrap()).unwrap();
+        assert_eq!(envelope.request_id, 2);
+        assert_eq!(parsed_query, query);
+        assert!(
+            query_scene(
+                2,
+                &SceneQuery {
+                    expected_revision: Some(SceneRevision::new(8)),
+                    ..query.clone()
+                }
+            )
+            .is_err()
+        );
+
+        let node = ParsedSceneNode {
+            node: ParsedNodeConfig {
+                node_id: 1,
+                source_id: 9,
+                context_id: 1,
+                x: 0,
+                y: 0,
+                width: 10_i64 << 32,
+                height: 5_i64 << 32,
+                text_layer: TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
+                z_index: 0,
+                visible: true,
+                anchor_id: None,
+            },
+            clip: None,
+        };
+        let status = SceneStatus {
+            scene_revision: SceneRevision::new(7),
+            nodes: vec![node],
+            cursor: Some(SceneCursor {
+                scene_revision: SceneRevision::new(7),
+                offset: 1,
+            }),
+            total_nodes: 2,
+        };
+        let encoded = scene_status(2, &status).unwrap();
+        assert!(encoded.len() < MAX_STATUS_REPLY_BODY);
+        assert_eq!(parse_scene_status(&encoded).unwrap(), (2, status));
+
+        let mut oversized = sample_source_status();
+        oversized.descriptor = Some(Value::Map(vec![(
+            0,
+            Value::Text("x".repeat(MAX_STATUS_REPLY_BODY)),
+        )]));
+        assert!(source_status(3, &oversized).is_err());
+    }
+
+    #[test]
+    fn anchor_limits_and_wait_schemas_round_trip() {
+        let (_, anchor_id) = parse_query_anchor(&query_anchor(4, 5).unwrap()).unwrap();
+        assert_eq!(anchor_id, 5);
+        let anchor = AnchorStatus {
+            anchor_id: 5,
+            state: 1,
+            column: 6,
+            row: 7,
+            visible: true,
+            display_generation: 8,
+        };
+        assert_eq!(
+            parse_anchor_status(&anchor_status(4, anchor).unwrap()).unwrap(),
+            (4, anchor)
+        );
+
+        assert_eq!(parse_query_limits(&query_limits(5)).unwrap().request_id, 5);
+        let limits = LimitsStatus {
+            maximum_sources: 64,
+            maximum_nodes: 256,
+            maximum_transactions: 8,
+            maximum_anchors: 128,
+            maximum_control_body: 1 << 20,
+            maximum_media_body: 16 << 20,
+            maximum_waits: 32,
+            maximum_pending_requests: 64,
+            rolling_byte_window: 4 << 20,
+            rolling_packet_window: 32,
+            retained_pixel_budget: 64 << 20,
+            current_sources: 2,
+            current_nodes: 3,
+            current_retained_pixels: 1 << 20,
+            image_cache_budget: Some(32 << 20),
+        };
+        assert_eq!(
+            parse_limits_status(&limits_status(5, limits).unwrap()).unwrap(),
+            (5, limits)
+        );
+
+        for condition in WAIT_SOURCE_REVISION..=WAIT_SOURCE_LOST {
+            let value = matches!(
+                condition,
+                WAIT_SOURCE_REVISION | WAIT_RASTER_FRAME | WAIT_VIDEO_PTS
+            )
+            .then_some(10);
+            let wait = WaitSource {
+                source_id: 9,
+                condition,
+                value,
+                timeout_us: 1_000_000,
+            };
+            let (_, parsed) = parse_wait_source(&wait_source(6, wait).unwrap()).unwrap();
+            assert_eq!(parsed, wait);
+            if value.is_some() {
+                assert!(
+                    wait_source(
+                        6,
+                        WaitSource {
+                            value: None,
+                            ..wait
+                        }
+                    )
+                    .is_err()
+                );
+            } else {
+                assert!(
+                    wait_source(
+                        6,
+                        WaitSource {
+                            value: Some(1),
+                            ..wait
+                        }
+                    )
+                    .is_err()
+                );
+            }
+        }
+
+        let satisfied = WaitSatisfied {
+            source_id: 9,
+            source_revision: SourceRevision::new(8),
+            condition: WAIT_VIDEO_PTS,
+            observed_value: Some(55),
+        };
+        assert_eq!(
+            parse_wait_satisfied(&wait_satisfied(6, satisfied).unwrap()).unwrap(),
+            (6, satisfied)
+        );
+        assert_eq!(parse_cancel_wait(&cancel_wait(7, 6).unwrap()).unwrap().1, 6);
     }
 
     fn validate_registry<T>(
