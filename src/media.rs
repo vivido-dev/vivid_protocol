@@ -1,4 +1,4 @@
-use std::io;
+use std::{borrow::Cow, io};
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 use std::io::Cursor;
@@ -11,11 +11,16 @@ pub const VIDEO_PACKET_KEY: u32 = 1 << 0;
 pub const VIDEO_PACKET_DELTA: u32 = 1 << 1;
 pub const RASTER_FRAME_FULL: u32 = 1 << 0;
 pub const RASTER_FRAME_ZSTD: u32 = 1 << 1;
+pub const RASTER_FRAME_DELTA: u32 = 1 << 2;
+pub const RASTER_DELTA_OVERWRITE: u32 = 1;
+pub const RASTER_DELTA_COPY: u32 = 2;
+pub const RASTER_DELTA_OPERATION_LIMIT: u32 = 16;
 
 const VIDEO_PACKET_PREFIX_SIZE: usize = 48;
 const AUDIO_PACKET_PREFIX_SIZE: usize = 48;
 const RASTER_FRAME_PREFIX_SIZE: usize = 48;
 const RASTER_RECT_SIZE: usize = 24;
+const RASTER_DELTA_OPERATION_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedVideoPacket<'a> {
@@ -51,6 +56,55 @@ pub struct ParsedRasterFrame<'a> {
     pub height: u32,
     pub compressed: bool,
     pub pixels: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RasterDeltaOperation<'a> {
+    Overwrite {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        rgba: &'a [u8],
+    },
+    Copy {
+        destination_x: u32,
+        destination_y: u32,
+        width: u32,
+        height: u32,
+        source_x: u32,
+        source_y: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedRasterDeltaOperation<'a> {
+    Overwrite {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        rgba: Cow<'a, [u8]>,
+    },
+    Copy {
+        destination_x: u32,
+        destination_y: u32,
+        width: u32,
+        height: u32,
+        source_x: u32,
+        source_y: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedRasterDeltaFrame<'a> {
+    pub epoch: u32,
+    pub frame_id: u64,
+    pub base_frame_id: u64,
+    pub pts_us: i64,
+    pub duration_us: u64,
+    pub compressed: bool,
+    pub operations: Vec<ParsedRasterDeltaOperation<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +409,183 @@ pub fn raster_frame_body_with_compression(
     Ok(body)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn raster_delta_frame_body(
+    epoch: u32,
+    frame_id: u64,
+    base_frame_id: u64,
+    pts_us: i64,
+    duration_us: u64,
+    source_width: u32,
+    source_height: u32,
+    effective_operation_limit: u32,
+    operations: &[RasterDeltaOperation<'_>],
+    compress: bool,
+) -> io::Result<Vec<u8>> {
+    validate_delta_operation_limit(effective_operation_limit, io::ErrorKind::InvalidInput)?;
+    if frame_id == 0 || base_frame_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "delta frame and base IDs must be nonzero",
+        ));
+    }
+    if source_width == 0 || source_height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "delta source dimensions are empty",
+        ));
+    }
+    let count = u32::try_from(operations.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many raster delta operations",
+        )
+    })?;
+    if count == 0 || count > effective_operation_limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raster delta operation count is outside the effective limit",
+        ));
+    }
+
+    let descriptor_bytes = operations
+        .len()
+        .checked_mul(RASTER_DELTA_OPERATION_SIZE)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "delta body overflow"))?;
+    let payload_start = RASTER_FRAME_PREFIX_SIZE
+        .checked_add(descriptor_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "delta body overflow"))?;
+    let mut descriptors = vec![0_u8; descriptor_bytes];
+    let mut payloads: Vec<Cow<'_, [u8]>> = Vec::new();
+    let mut payload_length = 0_usize;
+
+    for (index, operation) in operations.iter().enumerate() {
+        let descriptor = &mut descriptors
+            [index * RASTER_DELTA_OPERATION_SIZE..(index + 1) * RASTER_DELTA_OPERATION_SIZE];
+        match operation {
+            RasterDeltaOperation::Overwrite {
+                x,
+                y,
+                width,
+                height,
+                rgba,
+            } => {
+                validate_raster_rectangle(
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    source_width,
+                    source_height,
+                    io::ErrorKind::InvalidInput,
+                )?;
+                let expected = rgba8_pixel_len(*width, *height)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+                    as usize;
+                if rgba.len() != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "delta overwrite RGBA length does not match its rectangle",
+                    ));
+                }
+                let payload =
+                    if compress {
+                        #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+                        {
+                            Cow::Owned(zstd::bulk::compress(rgba, 1).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?)
+                        }
+                        #[cfg(any(not(feature = "native"), target_arch = "wasm32"))]
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "zstd raster compression requires the native feature",
+                            ));
+                        }
+                    } else {
+                        Cow::Borrowed(*rgba)
+                    };
+                let encoded_length = u32::try_from(payload.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "delta overwrite is too large")
+                })?;
+                payload_length = payload_length.checked_add(payload.len()).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "delta body overflow")
+                })?;
+                put_u32(descriptor, 0, RASTER_DELTA_OVERWRITE);
+                put_u32(descriptor, 4, *x);
+                put_u32(descriptor, 8, *y);
+                put_u32(descriptor, 12, *width);
+                put_u32(descriptor, 16, *height);
+                put_u32(descriptor, 20, 0);
+                put_u32(descriptor, 24, 0);
+                put_u32(descriptor, 28, encoded_length);
+                payloads.push(payload);
+            }
+            RasterDeltaOperation::Copy {
+                destination_x,
+                destination_y,
+                width,
+                height,
+                source_x,
+                source_y,
+            } => {
+                validate_raster_rectangle(
+                    *destination_x,
+                    *destination_y,
+                    *width,
+                    *height,
+                    source_width,
+                    source_height,
+                    io::ErrorKind::InvalidInput,
+                )?;
+                validate_raster_rectangle(
+                    *source_x,
+                    *source_y,
+                    *width,
+                    *height,
+                    source_width,
+                    source_height,
+                    io::ErrorKind::InvalidInput,
+                )?;
+                put_u32(descriptor, 0, RASTER_DELTA_COPY);
+                put_u32(descriptor, 4, *destination_x);
+                put_u32(descriptor, 8, *destination_y);
+                put_u32(descriptor, 12, *width);
+                put_u32(descriptor, 16, *height);
+                put_u32(descriptor, 20, *source_x);
+                put_u32(descriptor, 24, *source_y);
+                put_u32(descriptor, 28, 0);
+            }
+        }
+    }
+
+    let body_length = payload_start
+        .checked_add(payload_length)
+        .filter(|length| *length <= HARD_MAX_RECORD_BODY as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "delta frame too large"))?;
+    let mut body = Vec::with_capacity(body_length);
+    body.resize(RASTER_FRAME_PREFIX_SIZE, 0);
+    put_u32(&mut body, 0, epoch);
+    put_u32(
+        &mut body,
+        4,
+        RASTER_FRAME_DELTA | if compress { RASTER_FRAME_ZSTD } else { 0 },
+    );
+    put_u64(&mut body, 8, frame_id);
+    put_u64(&mut body, 16, base_frame_id);
+    put_i64(&mut body, 24, pts_us);
+    put_u64(&mut body, 32, duration_us);
+    put_u32(&mut body, 40, count);
+    put_u32(&mut body, 44, 0);
+    body.extend_from_slice(&descriptors);
+    for payload in payloads {
+        body.extend_from_slice(&payload);
+    }
+    debug_assert_eq!(body.len(), body_length);
+    Ok(body)
+}
+
 pub fn parse_video_packet(body: &[u8]) -> io::Result<ParsedVideoPacket<'_>> {
     if body.len() < VIDEO_PACKET_PREFIX_SIZE {
         return Err(invalid("video packet is shorter than its 48-byte prefix"));
@@ -451,18 +682,224 @@ pub fn parse_full_raster_frame(body: &[u8]) -> io::Result<ParsedRasterFrame<'_>>
     })
 }
 
+pub fn parse_delta_raster_frame(
+    body: &[u8],
+    source_width: u32,
+    source_height: u32,
+    effective_operation_limit: u32,
+) -> io::Result<ParsedRasterDeltaFrame<'_>> {
+    validate_delta_operation_limit(effective_operation_limit, io::ErrorKind::InvalidData)?;
+    if source_width == 0 || source_height == 0 {
+        return Err(invalid("delta source dimensions are empty"));
+    }
+    if body.len() < RASTER_FRAME_PREFIX_SIZE {
+        return Err(invalid("raster delta is shorter than its frame header"));
+    }
+    let flags = read_u32(body, 4)?;
+    if flags != RASTER_FRAME_DELTA && flags != RASTER_FRAME_DELTA | RASTER_FRAME_ZSTD {
+        return Err(invalid("unsupported raster delta flags"));
+    }
+    let base_frame_id = read_u64(body, 16)?;
+    if base_frame_id == 0 {
+        return Err(invalid("raster delta has a zero base frame ID"));
+    }
+    if read_u32(body, 44)? != 0 {
+        return Err(invalid("raster delta reserved header field is nonzero"));
+    }
+    let count = read_u32(body, 40)?;
+    if count == 0 || count > effective_operation_limit {
+        return Err(invalid(
+            "raster delta operation count is outside the effective limit",
+        ));
+    }
+    let descriptor_bytes = usize::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(RASTER_DELTA_OPERATION_SIZE))
+        .ok_or_else(|| invalid("raster delta operation array overflows"))?;
+    let payload_start = RASTER_FRAME_PREFIX_SIZE
+        .checked_add(descriptor_bytes)
+        .filter(|offset| *offset <= body.len())
+        .ok_or_else(|| invalid("raster delta operation array exceeds its body"))?;
+    let compressed = flags & RASTER_FRAME_ZSTD != 0;
+
+    struct ValidatedOperation {
+        kind: u32,
+        destination_x: u32,
+        destination_y: u32,
+        width: u32,
+        height: u32,
+        source_x: u32,
+        source_y: u32,
+        payload_start: usize,
+        payload_end: usize,
+        expected_length: usize,
+    }
+
+    let mut validated = Vec::with_capacity(count as usize);
+    let mut payload_offset = payload_start;
+    for index in 0..count as usize {
+        let offset = RASTER_FRAME_PREFIX_SIZE + index * RASTER_DELTA_OPERATION_SIZE;
+        let kind = read_u32(body, offset)?;
+        let destination_x = read_u32(body, offset + 4)?;
+        let destination_y = read_u32(body, offset + 8)?;
+        let width = read_u32(body, offset + 12)?;
+        let height = read_u32(body, offset + 16)?;
+        let source_x = read_u32(body, offset + 20)?;
+        let source_y = read_u32(body, offset + 24)?;
+        let payload_length = read_u32(body, offset + 28)? as usize;
+        validate_raster_rectangle(
+            destination_x,
+            destination_y,
+            width,
+            height,
+            source_width,
+            source_height,
+            io::ErrorKind::InvalidData,
+        )?;
+        let expected_length = rgba8_pixel_len(width, height)
+            .map_err(|_| invalid("raster delta rectangle dimensions overflow"))?
+            as usize;
+        match kind {
+            RASTER_DELTA_OVERWRITE => {
+                if source_x != 0 || source_y != 0 {
+                    return Err(invalid(
+                        "raster delta overwrite reserved source fields are nonzero",
+                    ));
+                }
+                if !compressed && payload_length != expected_length {
+                    return Err(invalid(
+                        "raster delta overwrite length does not match its rectangle",
+                    ));
+                }
+            }
+            RASTER_DELTA_COPY => {
+                if payload_length != 0 {
+                    return Err(invalid("raster delta copy has a nonzero payload length"));
+                }
+                validate_raster_rectangle(
+                    source_x,
+                    source_y,
+                    width,
+                    height,
+                    source_width,
+                    source_height,
+                    io::ErrorKind::InvalidData,
+                )?;
+            }
+            _ => return Err(invalid("raster delta has an unknown operation kind")),
+        }
+        let payload_end = payload_offset
+            .checked_add(payload_length)
+            .filter(|end| *end <= body.len())
+            .ok_or_else(|| invalid("raster delta overwrite payload exceeds its body"))?;
+        validated.push(ValidatedOperation {
+            kind,
+            destination_x,
+            destination_y,
+            width,
+            height,
+            source_x,
+            source_y,
+            payload_start: payload_offset,
+            payload_end,
+            expected_length,
+        });
+        payload_offset = payload_end;
+    }
+    if payload_offset != body.len() {
+        return Err(invalid("raster delta has trailing bytes"));
+    }
+
+    let mut operations = Vec::with_capacity(validated.len());
+    for operation in validated {
+        if operation.kind == RASTER_DELTA_OVERWRITE {
+            let encoded = &body[operation.payload_start..operation.payload_end];
+            let rgba = if compressed {
+                if is_zstd_skippable_frame(encoded) {
+                    return Err(invalid("zstd skippable frames are forbidden"));
+                }
+                Cow::Owned(decode_zstd_pixels(encoded, operation.expected_length)?)
+            } else {
+                Cow::Borrowed(encoded)
+            };
+            operations.push(ParsedRasterDeltaOperation::Overwrite {
+                x: operation.destination_x,
+                y: operation.destination_y,
+                width: operation.width,
+                height: operation.height,
+                rgba,
+            });
+        } else {
+            operations.push(ParsedRasterDeltaOperation::Copy {
+                destination_x: operation.destination_x,
+                destination_y: operation.destination_y,
+                width: operation.width,
+                height: operation.height,
+                source_x: operation.source_x,
+                source_y: operation.source_y,
+            });
+        }
+    }
+    Ok(ParsedRasterDeltaFrame {
+        epoch: read_u32(body, 0)?,
+        frame_id: read_u64(body, 8)?,
+        base_frame_id,
+        pts_us: read_i64(body, 24)?,
+        duration_us: read_u64(body, 32)?,
+        compressed,
+        operations,
+    })
+}
+
 pub fn decode_raster_pixels(frame: ParsedRasterFrame<'_>) -> io::Result<Vec<u8>> {
     let expected = rgba8_pixel_len(frame.width, frame.height)
         .map_err(|_| invalid("raster dimensions overflow"))? as usize;
     if !frame.compressed {
         return Ok(frame.pixels.to_vec());
     }
-    if frame.pixels.len() < 4
-        || u32::from_le_bytes(frame.pixels[..4].try_into().unwrap()) == 0x184d2a50
-    {
+    if is_zstd_skippable_frame(frame.pixels) {
         return Err(invalid("zstd skippable frames are forbidden"));
     }
     decode_zstd_pixels(frame.pixels, expected)
+}
+
+fn is_zstd_skippable_frame(bytes: &[u8]) -> bool {
+    bytes.len() < 4
+        || u32::from_le_bytes(bytes[..4].try_into().unwrap()) & 0xffff_fff0 == 0x184d_2a50
+}
+
+fn validate_delta_operation_limit(limit: u32, kind: io::ErrorKind) -> io::Result<()> {
+    if !(1..=RASTER_DELTA_OPERATION_LIMIT).contains(&limit) {
+        return Err(io::Error::new(
+            kind,
+            "raster delta operation limit is outside 1 through 16",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_raster_rectangle(
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    source_width: u32,
+    source_height: u32,
+    kind: io::ErrorKind,
+) -> io::Result<()> {
+    if width == 0
+        || height == 0
+        || x.checked_add(width)
+            .is_none_or(|right| right > source_width)
+        || y.checked_add(height)
+            .is_none_or(|bottom| bottom > source_height)
+    {
+        return Err(io::Error::new(
+            kind,
+            "raster delta rectangle is empty, overflows, or exceeds the source",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
@@ -915,6 +1352,219 @@ mod tests {
         let parsed = parse_full_raster_frame(&body).unwrap();
         assert_eq!((parsed.width, parsed.height), (2, 1));
         assert_eq!(parsed.pixels, &[0; 8]);
+    }
+
+    fn mixed_delta_body(compress: bool) -> Vec<u8> {
+        raster_delta_frame_body(
+            3,
+            9,
+            8,
+            -10,
+            16_667,
+            4,
+            3,
+            4,
+            &[
+                RasterDeltaOperation::Copy {
+                    destination_x: 0,
+                    destination_y: 1,
+                    width: 4,
+                    height: 2,
+                    source_x: 0,
+                    source_y: 0,
+                },
+                RasterDeltaOperation::Overwrite {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                    rgba: &[7; 16],
+                },
+            ],
+            compress,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn raster_delta_round_trip_preserves_order_without_payload_offsets() {
+        let body = mixed_delta_body(false);
+        assert_eq!(body.len(), 48 + 2 * 32 + 16);
+        assert_eq!(
+            u32::from_be_bytes(body[4..8].try_into().unwrap()),
+            RASTER_FRAME_DELTA
+        );
+        assert_eq!(u64::from_be_bytes(body[16..24].try_into().unwrap()), 8);
+        assert_eq!(u32::from_be_bytes(body[40..44].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_be_bytes(body[48 + 28..48 + 32].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_be_bytes(body[80 + 28..80 + 32].try_into().unwrap()),
+            16
+        );
+        assert_eq!(&body[112..], &[7; 16]);
+
+        let parsed = parse_delta_raster_frame(&body, 4, 3, 4).unwrap();
+        assert_eq!(
+            (parsed.epoch, parsed.frame_id, parsed.base_frame_id),
+            (3, 9, 8)
+        );
+        assert_eq!((parsed.pts_us, parsed.duration_us), (-10, 16_667));
+        assert!(!parsed.compressed);
+        assert_eq!(
+            parsed.operations[0],
+            ParsedRasterDeltaOperation::Copy {
+                destination_x: 0,
+                destination_y: 1,
+                width: 4,
+                height: 2,
+                source_x: 0,
+                source_y: 0,
+            }
+        );
+        assert_eq!(
+            parsed.operations[1],
+            ParsedRasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+                rgba: Cow::Borrowed(&[7; 16]),
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn raster_delta_zstd_validates_and_decodes_each_overwrite_frame() {
+        let body = mixed_delta_body(true);
+        let parsed = parse_delta_raster_frame(&body, 4, 3, 2).unwrap();
+        assert!(parsed.compressed);
+        match &parsed.operations[1] {
+            ParsedRasterDeltaOperation::Overwrite { rgba, .. } => {
+                assert_eq!(rgba.as_ref(), &[7; 16]);
+                assert!(matches!(rgba, Cow::Owned(_)));
+            }
+            _ => panic!("second operation should be an overwrite"),
+        }
+
+        let mut concatenated = body;
+        let second = zstd::bulk::compress(&[7; 16], 1).unwrap();
+        concatenated.extend_from_slice(&second);
+        let length = u32::from_be_bytes(concatenated[108..112].try_into().unwrap())
+            + u32::try_from(second.len()).unwrap();
+        concatenated[108..112].copy_from_slice(&length.to_be_bytes());
+        assert!(parse_delta_raster_frame(&concatenated, 4, 3, 2).is_err());
+    }
+
+    #[test]
+    fn raster_delta_rejects_invalid_header_and_operation_counts() {
+        let baseline = mixed_delta_body(false);
+        let mut malformed = baseline.clone();
+        malformed[4..8].copy_from_slice(&(RASTER_FRAME_FULL | RASTER_FRAME_DELTA).to_be_bytes());
+        assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
+
+        let mut malformed = baseline.clone();
+        malformed[16..24].copy_from_slice(&0_u64.to_be_bytes());
+        assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
+
+        let mut malformed = baseline.clone();
+        malformed[44..48].copy_from_slice(&1_u32.to_be_bytes());
+        assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
+
+        let mut malformed = baseline.clone();
+        malformed[40..44].copy_from_slice(&0_u32.to_be_bytes());
+        assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
+        assert!(parse_delta_raster_frame(&baseline, 4, 3, 1).is_err());
+        assert!(parse_delta_raster_frame(&baseline, 4, 3, 17).is_err());
+        assert!(parse_delta_raster_frame(&baseline[..79], 4, 3, 4).is_err());
+    }
+
+    #[test]
+    fn raster_delta_rejects_every_malformed_rectangle_form() {
+        let baseline = mixed_delta_body(false);
+        for (offset, value) in [
+            (48, 3_u32),    // unknown copy operation kind
+            (60, 0),        // zero destination width
+            (56, u32::MAX), // overflowing destination Y
+            (52, u32::MAX), // overflowing destination X
+            (68, u32::MAX), // overflowing copy source X
+            (72, u32::MAX), // overflowing copy source Y
+        ] {
+            let mut malformed = baseline.clone();
+            malformed[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+            assert!(
+                parse_delta_raster_frame(&malformed, 4, 3, 4).is_err(),
+                "field at offset {offset} unexpectedly passed"
+            );
+        }
+
+        let mut overwrite_reserved = baseline.clone();
+        overwrite_reserved[100..104].copy_from_slice(&1_u32.to_be_bytes());
+        assert!(parse_delta_raster_frame(&overwrite_reserved, 4, 3, 4).is_err());
+
+        let mut copy_payload = baseline.clone();
+        copy_payload[76..80].copy_from_slice(&1_u32.to_be_bytes());
+        assert!(parse_delta_raster_frame(&copy_payload, 4, 3, 4).is_err());
+    }
+
+    #[test]
+    fn raster_delta_rejects_payload_length_mismatch_and_trailing_bytes() {
+        let baseline = mixed_delta_body(false);
+        for length in [15_u32, 17, u32::MAX] {
+            let mut malformed = baseline.clone();
+            malformed[108..112].copy_from_slice(&length.to_be_bytes());
+            assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
+        }
+        let mut trailing = baseline;
+        trailing.push(0);
+        assert!(parse_delta_raster_frame(&trailing, 4, 3, 4).is_err());
+    }
+
+    #[test]
+    fn raster_delta_builder_rejects_invalid_inputs_before_encoding() {
+        let overwrite = RasterDeltaOperation::Overwrite {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            rgba: &[0; 4],
+        };
+        for (frame, base, width, height, limit) in [
+            (0, 1, 1, 1, 1),
+            (1, 0, 1, 1, 1),
+            (1, 1, 0, 1, 1),
+            (1, 1, 1, 0, 1),
+            (1, 1, 1, 1, 0),
+            (1, 1, 1, 1, 17),
+        ] {
+            assert!(
+                raster_delta_frame_body(
+                    0,
+                    frame,
+                    base,
+                    0,
+                    0,
+                    width,
+                    height,
+                    limit,
+                    &[overwrite],
+                    false,
+                )
+                .is_err()
+            );
+        }
+        assert!(raster_delta_frame_body(0, 1, 1, 0, 0, 1, 1, 1, &[], false).is_err());
+        let wrong_length = RasterDeltaOperation::Overwrite {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            rgba: &[0; 3],
+        };
+        assert!(raster_delta_frame_body(0, 1, 1, 0, 0, 1, 1, 1, &[wrong_length], false).is_err());
     }
 
     #[test]

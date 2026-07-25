@@ -151,6 +151,12 @@ pub fn negotiate_features(
     optional: &[u64],
     mut supported: impl FnMut(u64) -> bool,
 ) -> Result<Vec<u64>, u64> {
+    if let Some(dependent) = required.iter().find(|feature| {
+        feature_prerequisite(**feature)
+            .is_some_and(|prerequisite| !required.contains(&prerequisite))
+    }) {
+        return Err(*dependent);
+    }
     if let Some(missing) = required.iter().find(|feature| !supported(**feature)) {
         return Err(*missing);
     }
@@ -162,11 +168,25 @@ pub fn negotiate_features(
         .collect();
     accepted.sort_unstable();
     accepted.dedup();
+    let accepted_with_prerequisites = accepted.clone();
+    accepted.retain(|feature| {
+        feature_prerequisite(*feature)
+            .is_none_or(|prerequisite| accepted_with_prerequisites.contains(&prerequisite))
+    });
     Ok(accepted)
+}
+
+fn feature_prerequisite(feature: u64) -> Option<u64> {
+    match feature {
+        FEATURE_RASTER_DELTA_V1 => Some(FEATURE_RASTER_RGBA8),
+        FEATURE_IMAGE_CACHE_V1 => Some(FEATURE_ENCODED_IMAGE_V1),
+        _ => None,
+    }
 }
 
 pub const PROFILE_RASTER_RGBA8: &str = "raster-rgba8-full-v1";
 pub const PROFILE_RASTER_ZSTD: &str = "raster-zstd-full-v1";
+pub const PROFILE_RASTER_DELTA: &str = "raster-delta-v1";
 pub const PROFILE_IMAGE_PNG_JPEG: &str = "image-png-jpeg-v1";
 pub const PROFILE_VIDEO_ACCESS_UNIT: &str = "video-access-unit-v1";
 pub const PROFILE_TEXT_ANCHOR_V2: &str = "text-anchor-cell-v2";
@@ -402,6 +422,8 @@ pub const PIXEL_FORMAT_RGBA8: u64 = 1;
 pub const ALPHA_STRAIGHT: u64 = 1;
 pub const ALPHA_PREMULTIPLIED: u64 = 2;
 pub const RASTER_FULL_FRAME: u64 = 0;
+pub const RASTER_FULL_FRAME_AND_DELTA: u64 = 1;
+pub const RASTER_DELTA_OPERATION_LIMIT_MAX: u32 = 16;
 pub const COMPRESSION_NONE: u64 = 0;
 pub const COMPRESSION_RAW_OR_ZSTD: u64 = 1;
 pub const RETENTION_NONE: u64 = 0;
@@ -1305,6 +1327,12 @@ pub struct RasterSourceConfig {
     pub compression_mode: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RasterUpdateConfig {
+    pub mode: u64,
+    pub operation_limit: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageSourceConfig {
     pub source_id: u64,
@@ -1366,6 +1394,17 @@ pub struct NeedKeyframe {
     pub reason: u64,
     pub last_packet_id: Option<u64>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeedFullFrame {
+    pub source_id: u64,
+    pub reason: u64,
+}
+
+pub const NEED_FULL_FRAME_BASE_UNAVAILABLE: u64 = 1;
+pub const NEED_FULL_FRAME_DAMAGE_BUDGET: u64 = 2;
+pub const NEED_FULL_FRAME_RENDERER_RESET: u64 = 3;
+pub const NEED_FULL_FRAME_POLICY_CHANGE: u64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceLost {
@@ -1443,6 +1482,7 @@ pub fn hello(request_id: u64, token: &str) -> Vec<u8> {
         FEATURE_DECODER_DESCRIPTION_V1,
         FEATURE_OBSERVABILITY_CORE_V1,
         FEATURE_ATOMIC_CONTROL_V1,
+        FEATURE_RASTER_DELTA_V1,
     ];
     encode_hello(
         request_id,
@@ -1558,6 +1598,23 @@ pub fn create_raster_config(request_id: u64, config: &RasterSourceConfig) -> Vec
     create_raster_with_policy(request_id, config, 0)
 }
 
+pub fn create_raster_delta_config(
+    request_id: u64,
+    config: &RasterSourceConfig,
+    operation_limit: u32,
+) -> io::Result<Vec<u8>> {
+    create_raster_with_update_extensions(
+        request_id,
+        config,
+        RasterUpdateConfig {
+            mode: RASTER_FULL_FRAME_AND_DELTA,
+            operation_limit,
+        },
+        0,
+        None,
+    )
+}
+
 pub fn create_raster_with_policy(
     request_id: u64,
     config: &RasterSourceConfig,
@@ -1572,15 +1629,36 @@ pub fn create_raster_with_extensions(
     capture_policy: u64,
     descriptor: Option<&SourceDescriptor>,
 ) -> Vec<u8> {
-    envelope(request_id, None, None, |encoder| {
+    create_raster_with_update_extensions(
+        request_id,
+        config,
+        RasterUpdateConfig {
+            mode: RASTER_FULL_FRAME,
+            operation_limit: 1,
+        },
+        capture_policy,
+        descriptor,
+    )
+    .expect("the full-frame raster update mode is valid")
+}
+
+pub fn create_raster_with_update_extensions(
+    request_id: u64,
+    config: &RasterSourceConfig,
+    update: RasterUpdateConfig,
+    capture_policy: u64,
+    descriptor: Option<&SourceDescriptor>,
+) -> io::Result<Vec<u8>> {
+    validate_raster_update(update)?;
+    Ok(envelope(request_id, None, None, |encoder| {
         encoder.map(9 + usize::from(capture_policy != 0) + usize::from(descriptor.is_some()));
         key_u64(encoder, 0, config.source_id);
         key_u64(encoder, 1, u64::from(config.width));
         key_u64(encoder, 2, u64::from(config.height));
         key_u64(encoder, 3, PIXEL_FORMAT_RGBA8);
         key_u64(encoder, 4, config.alpha_mode);
-        key_u64(encoder, 5, RASTER_FULL_FRAME);
-        key_u64(encoder, 6, 1);
+        key_u64(encoder, 5, update.mode);
+        key_u64(encoder, 6, u64::from(update.operation_limit));
         key_u64(encoder, 7, config.compression_mode);
         key_u64(encoder, 8, RETENTION_NONE);
         if capture_policy != 0 {
@@ -1590,7 +1668,7 @@ pub fn create_raster_with_extensions(
             encoder.u64(10);
             encode_source_descriptor(encoder, descriptor);
         }
-    })
+    }))
 }
 
 pub fn create_image(request_id: u64, config: &ImageSourceConfig) -> Vec<u8> {
@@ -2140,6 +2218,12 @@ pub fn welcome_preserving_at_generations(
             .unwrap_or_else(|index| index);
         profiles.insert(index, PROFILE_NODE_CLIP_RECT);
     }
+    if accepted_features.contains(&FEATURE_RASTER_DELTA_V1) {
+        let index = profiles
+            .binary_search(&PROFILE_RASTER_DELTA)
+            .unwrap_or_else(|index| index);
+        profiles.insert(index, PROFILE_RASTER_DELTA);
+    }
     encode_welcome(
         request_id,
         &WelcomeConfig {
@@ -2371,6 +2455,15 @@ pub fn need_keyframe(
             key_u64(encoder, 3, id);
         }
     })
+}
+
+pub fn need_full_frame(source_id: u64, reason: u64) -> io::Result<Vec<u8>> {
+    validate_need_full_frame(NeedFullFrame { source_id, reason })?;
+    Ok(envelope(0, None, None, |encoder| {
+        encoder.map(2);
+        key_u64(encoder, 0, source_id);
+        key_u64(encoder, 1, reason);
+    }))
 }
 
 pub fn source_lost(source_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
@@ -3146,6 +3239,32 @@ pub fn parse_create_raster_with_extensions(
     u64,
     Option<SourceDescriptor>,
 )> {
+    let (envelope, config, update, capture_policy, descriptor) =
+        parse_create_raster_with_update_extensions(body)?;
+    if update.mode != RASTER_FULL_FRAME {
+        return Err(invalid(
+            "delta raster creation requires the update-aware parser",
+        ));
+    }
+    Ok((envelope, config, capture_policy, descriptor))
+}
+
+pub fn parse_create_raster_with_update(
+    body: &[u8],
+) -> io::Result<(ControlEnvelope, RasterSourceConfig, RasterUpdateConfig)> {
+    parse_create_raster_with_update_extensions(body)
+        .map(|(envelope, config, update, _, _)| (envelope, config, update))
+}
+
+pub fn parse_create_raster_with_update_extensions(
+    body: &[u8],
+) -> io::Result<(
+    ControlEnvelope,
+    RasterSourceConfig,
+    RasterUpdateConfig,
+    u64,
+    Option<SourceDescriptor>,
+)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
     reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
@@ -3159,10 +3278,12 @@ pub fn parse_create_raster_with_extensions(
     if config.source_id == 0 {
         return Err(invalid("raster source ID is zero"));
     }
+    let update = RasterUpdateConfig {
+        mode: required_u64(payload, 5, "raster mode")?,
+        operation_limit: required_u32(payload, 6, "rectangle limit")?,
+    };
     if required_u64(payload, 3, "pixel format")? != PIXEL_FORMAT_RGBA8
         || !matches!(config.alpha_mode, ALPHA_STRAIGHT | ALPHA_PREMULTIPLIED)
-        || required_u64(payload, 5, "raster mode")? != RASTER_FULL_FRAME
-        || required_u64(payload, 6, "rectangle limit")? != 1
         || !matches!(
             config.compression_mode,
             COMPRESSION_NONE | COMPRESSION_RAW_OR_ZSTD
@@ -3171,6 +3292,7 @@ pub fn parse_create_raster_with_extensions(
     {
         return Err(invalid("unsupported raster configuration"));
     }
+    validate_raster_update(update)?;
     if config.width == 0 || config.height == 0 || config.width > 8192 || config.height > 8192 {
         return Err(invalid("raster dimensions are outside Vivid v1 limits"));
     }
@@ -3180,7 +3302,7 @@ pub fn parse_create_raster_with_extensions(
         .map_value(10)
         .map(parse_source_descriptor)
         .transpose()?;
-    Ok((envelope, config, capture_policy, descriptor))
+    Ok((envelope, config, update, capture_policy, descriptor))
 }
 
 pub fn parse_create_image(body: &[u8]) -> io::Result<(ControlEnvelope, ImageSourceConfig)> {
@@ -4178,6 +4300,16 @@ pub fn parse_need_keyframe(body: &[u8]) -> io::Result<NeedKeyframe> {
     })
 }
 
+pub fn parse_need_full_frame(body: &[u8]) -> io::Result<NeedFullFrame> {
+    let envelope = parse_unsolicited(body, &[0, 1])?;
+    let need = NeedFullFrame {
+        source_id: required_u64(&envelope.payload, 0, "source ID")?,
+        reason: required_u64(&envelope.payload, 1, "full-frame reason")?,
+    };
+    validate_need_full_frame(need)?;
+    Ok(need)
+}
+
 pub fn parse_source_lost(body: &[u8]) -> io::Result<SourceLost> {
     let (_, payload) = decode_envelope(body)?;
     reject_unknown_fields(&payload, &[0, 1, 2, 3, 4])?;
@@ -5077,6 +5209,55 @@ fn validate_source_ready(ready: &SourceReady) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_raster_update(update: RasterUpdateConfig) -> io::Result<()> {
+    match update.mode {
+        RASTER_FULL_FRAME if update.operation_limit == 1 => Ok(()),
+        RASTER_FULL_FRAME_AND_DELTA
+            if (1..=RASTER_DELTA_OPERATION_LIMIT_MAX).contains(&update.operation_limit) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid(
+            "raster update mode or operation limit is outside the Vivid 1.1 schema",
+        )),
+    }
+}
+
+pub fn validate_raster_source_features(
+    config: &RasterSourceConfig,
+    update: RasterUpdateConfig,
+    accepted_features: &[u64],
+) -> io::Result<()> {
+    validate_raster_update(update)?;
+    if !accepted_features.contains(&FEATURE_RASTER_RGBA8)
+        || (config.alpha_mode == ALPHA_PREMULTIPLIED
+            && !accepted_features.contains(&FEATURE_RASTER_PREMULTIPLIED_ALPHA))
+        || (config.compression_mode == COMPRESSION_RAW_OR_ZSTD
+            && !accepted_features.contains(&FEATURE_RASTER_ZSTD_V1))
+        || (update.mode == RASTER_FULL_FRAME_AND_DELTA
+            && !accepted_features.contains(&FEATURE_RASTER_DELTA_V1))
+    {
+        return Err(invalid(
+            "raster configuration requires a feature that was not accepted",
+        ));
+    }
+    crate::media::rgba8_raw_frame_body_len(config.width, config.height)
+        .map_err(|_| invalid("raster source is not admissible as a full frame"))?;
+    Ok(())
+}
+
+fn validate_need_full_frame(need: NeedFullFrame) -> io::Result<()> {
+    if need.source_id == 0
+        || !(NEED_FULL_FRAME_BASE_UNAVAILABLE..=NEED_FULL_FRAME_POLICY_CHANGE)
+            .contains(&need.reason)
+    {
+        return Err(invalid(
+            "NEED_FULL_FRAME contains an invalid source or reason",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_source_status(status: &SourceStatus) -> io::Result<()> {
     if status.source_id == 0
         || !(SOURCE_KIND_VIDEO..=SOURCE_KIND_AUDIO).contains(&status.kind)
@@ -5852,6 +6033,87 @@ mod tests {
     }
 
     #[test]
+    fn raster_delta_creation_schema_is_strict_and_full_frame_admissible() {
+        let config = RasterSourceConfig {
+            source_id: 10,
+            width: 640,
+            height: 480,
+            alpha_mode: ALPHA_STRAIGHT,
+            compression_mode: COMPRESSION_RAW_OR_ZSTD,
+        };
+        let body = create_raster_delta_config(7, &config, 12).unwrap();
+        let (envelope, parsed, update) = parse_create_raster_with_update(&body).unwrap();
+        assert_eq!(envelope.request_id, 7);
+        assert_eq!((parsed.width, parsed.height), (640, 480));
+        assert_eq!(
+            update,
+            RasterUpdateConfig {
+                mode: RASTER_FULL_FRAME_AND_DELTA,
+                operation_limit: 12,
+            }
+        );
+        assert!(
+            parse_create_raster(&body).is_err(),
+            "a legacy presenter must not silently accept delta mode"
+        );
+        assert!(create_raster_delta_config(7, &config, 0).is_err());
+        assert!(create_raster_delta_config(7, &config, 17).is_err());
+
+        let features = [
+            FEATURE_RASTER_RGBA8,
+            FEATURE_RASTER_ZSTD_V1,
+            FEATURE_RASTER_DELTA_V1,
+        ];
+        assert!(validate_raster_source_features(&config, update, &features).is_ok());
+        assert!(
+            validate_raster_source_features(&config, update, &features[..2]).is_err(),
+            "delta mode requires feature 23"
+        );
+
+        let inadmissible = RasterSourceConfig {
+            width: 4096,
+            height: 4096,
+            ..config
+        };
+        assert!(
+            validate_raster_source_features(&inadmissible, update, &features).is_err(),
+            "delta admissibility must never replace full-frame admissibility"
+        );
+    }
+
+    #[test]
+    fn raster_update_mode_and_limit_pairs_are_rejected_atomically() {
+        fn raster_creation(mode: u64, limit: u64) -> Vec<u8> {
+            envelope(1, None, None, |encoder| {
+                encoder.map(9);
+                key_u64(encoder, 0, 1);
+                key_u64(encoder, 1, 1);
+                key_u64(encoder, 2, 1);
+                key_u64(encoder, 3, PIXEL_FORMAT_RGBA8);
+                key_u64(encoder, 4, ALPHA_STRAIGHT);
+                key_u64(encoder, 5, mode);
+                key_u64(encoder, 6, limit);
+                key_u64(encoder, 7, COMPRESSION_NONE);
+                key_u64(encoder, 8, RETENTION_NONE);
+            })
+        }
+
+        for (mode, limit) in [
+            (RASTER_FULL_FRAME, 0),
+            (RASTER_FULL_FRAME, 2),
+            (RASTER_FULL_FRAME_AND_DELTA, 0),
+            (RASTER_FULL_FRAME_AND_DELTA, 17),
+            (2, 1),
+        ] {
+            assert!(parse_create_raster_with_update(&raster_creation(mode, limit)).is_err());
+        }
+        assert!(
+            parse_create_raster_with_update(&raster_creation(RASTER_FULL_FRAME_AND_DELTA, 16))
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn anchor_events_round_trip() {
         assert_eq!(
             parse_anchor_event(&anchor_event(0x1020_3040)).unwrap(),
@@ -6183,6 +6445,25 @@ mod tests {
         assert_eq!((parsed.source_id, parsed.minimum_epoch), (4, 7));
         assert_eq!(parsed.last_packet_id, Some(18));
 
+        for reason in NEED_FULL_FRAME_BASE_UNAVAILABLE..=NEED_FULL_FRAME_POLICY_CHANGE {
+            assert_eq!(
+                parse_need_full_frame(&need_full_frame(4, reason).unwrap()).unwrap(),
+                NeedFullFrame {
+                    source_id: 4,
+                    reason,
+                }
+            );
+        }
+        assert!(need_full_frame(0, NEED_FULL_FRAME_BASE_UNAVAILABLE).is_err());
+        assert!(need_full_frame(4, 0).is_err());
+        assert!(need_full_frame(4, NEED_FULL_FRAME_POLICY_CHANGE + 1).is_err());
+        let correlated = envelope(1, None, None, |encoder| {
+            encoder.map(2);
+            key_u64(encoder, 0, 4);
+            key_u64(encoder, 1, NEED_FULL_FRAME_BASE_UNAVAILABLE);
+        });
+        assert!(parse_need_full_frame(&correlated).is_err());
+
         let parsed = parse_source_lost(&source_lost(4, ERROR_HASH_MISMATCH, "bad hash")).unwrap();
         assert_eq!(parsed.source_id, 4);
         assert_eq!(parsed.code, ERROR_HASH_MISMATCH);
@@ -6482,6 +6763,39 @@ mod tests {
         );
         assert_eq!(negotiate_features(&[1, 99], &[], supported), Err(99));
         assert_eq!(negotiate_features(&[], &[99], supported), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn negotiate_features_enforces_declared_prerequisites() {
+        let supported = |_| true;
+        assert_eq!(
+            negotiate_features(&[FEATURE_RASTER_DELTA_V1], &[], supported),
+            Err(FEATURE_RASTER_DELTA_V1)
+        );
+        assert_eq!(
+            negotiate_features(
+                &[FEATURE_RASTER_RGBA8, FEATURE_RASTER_DELTA_V1],
+                &[],
+                supported
+            ),
+            Ok(vec![FEATURE_RASTER_RGBA8, FEATURE_RASTER_DELTA_V1])
+        );
+        assert_eq!(
+            negotiate_features(&[], &[FEATURE_RASTER_DELTA_V1], supported),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            negotiate_features(
+                &[],
+                &[FEATURE_RASTER_RGBA8, FEATURE_RASTER_DELTA_V1],
+                supported
+            ),
+            Ok(vec![FEATURE_RASTER_RGBA8, FEATURE_RASTER_DELTA_V1])
+        );
+        assert_eq!(
+            negotiate_features(&[FEATURE_IMAGE_CACHE_V1], &[], supported),
+            Err(FEATURE_IMAGE_CACHE_V1)
+        );
     }
 
     #[test]
@@ -6924,7 +7238,7 @@ mod tests {
             rolling_packet_window: 8,
             initial_source_revision: SourceRevision::new(1),
             media_connection_required: true,
-            delta_operation_limit: None,
+            delta_operation_limit: Some(16),
         };
         let parsed =
             parse_source_ready(&source_ready_with_observability(8, &regular).unwrap()).unwrap();
@@ -6932,6 +7246,7 @@ mod tests {
         assert_eq!(parsed.rolling_packet_window, 8);
         assert_eq!(parsed.initial_source_revision, SourceRevision::new(1));
         assert!(parsed.media_connection_required);
+        assert_eq!(parsed.delta_operation_limit, Some(16));
 
         let cache_hit = SourceReady {
             source_id: 5,
