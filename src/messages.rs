@@ -441,6 +441,20 @@ pub struct PlayRequest {
     pub start_policy: u64,
 }
 
+/// Optional media-connection ordering point carried by `EOS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaOrderBarrier {
+    pub attachment_generation: u64,
+    pub final_record_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EosRequest {
+    pub source_id: u64,
+    pub epoch: u32,
+    pub barrier: Option<MediaOrderBarrier>,
+}
+
 impl PlayRequest {
     pub fn baseline(source_id: u64, minimum_buffer_us: u64) -> Self {
         Self {
@@ -1968,10 +1982,45 @@ pub fn play(request_id: u64, source_id: u64, minimum_buffer_us: u64) -> Vec<u8> 
 }
 
 pub fn eos(request_id: u64, source_id: u64, epoch: u32) -> Vec<u8> {
+    eos_request(
+        request_id,
+        &EosRequest {
+            source_id,
+            epoch,
+            barrier: None,
+        },
+    )
+}
+
+pub fn eos_with_barrier(
+    request_id: u64,
+    source_id: u64,
+    epoch: u32,
+    attachment_generation: u64,
+    final_record_sequence: u64,
+) -> Vec<u8> {
+    eos_request(
+        request_id,
+        &EosRequest {
+            source_id,
+            epoch,
+            barrier: Some(MediaOrderBarrier {
+                attachment_generation,
+                final_record_sequence,
+            }),
+        },
+    )
+}
+
+pub fn eos_request(request_id: u64, request: &EosRequest) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(2);
-        key_u64(encoder, 0, source_id);
-        key_u64(encoder, 1, u64::from(epoch));
+        encoder.map(if request.barrier.is_some() { 4 } else { 2 });
+        key_u64(encoder, 0, request.source_id);
+        key_u64(encoder, 1, u64::from(request.epoch));
+        if let Some(barrier) = request.barrier {
+            key_u64(encoder, 2, barrier.attachment_generation);
+            key_u64(encoder, 3, barrier.final_record_sequence);
+        }
     })
 }
 
@@ -3910,8 +3959,29 @@ pub fn parse_play(body: &[u8]) -> io::Result<(ControlEnvelope, PlayRequest)> {
     Ok((envelope, request))
 }
 
-pub fn parse_eos(body: &[u8]) -> io::Result<(ControlEnvelope, u64, u32)> {
-    parse_source_epoch(body)
+pub fn parse_eos(body: &[u8]) -> io::Result<(ControlEnvelope, EosRequest)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0, 1, 2, 3])?;
+    let attachment_generation = optional_u64(&envelope.payload, 2, "attachment generation")?;
+    let final_record_sequence = optional_u64(&envelope.payload, 3, "final media record sequence")?;
+    let barrier = match (attachment_generation, final_record_sequence) {
+        (Some(attachment_generation), Some(final_record_sequence)) => Some(MediaOrderBarrier {
+            attachment_generation,
+            final_record_sequence,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(invalid(
+                "EOS attachment generation and final media record sequence must appear together",
+            ));
+        }
+    };
+    let request = EosRequest {
+        source_id: required_u64(&envelope.payload, 0, "source ID")?,
+        epoch: required_u32(&envelope.payload, 1, "source epoch")?,
+        barrier,
+    };
+    Ok((envelope, request))
 }
 
 /// `FLUSH` shares the source-ID/epoch body layout with `EOS` but has distinct semantics; parse it
@@ -6599,8 +6669,50 @@ mod tests {
         let (envelope, source_id, epoch) = parse_flush(&body).unwrap();
         assert_eq!((envelope.request_id, source_id, epoch), (9, 4, 7));
         let body = eos(10, 4, 8);
-        let (envelope, source_id, epoch) = parse_eos(&body).unwrap();
-        assert_eq!((envelope.request_id, source_id, epoch), (10, 4, 8));
+        let (decoded_envelope, request) = parse_eos(&body).unwrap();
+        assert_eq!(decoded_envelope.request_id, 10);
+        assert_eq!(
+            request,
+            EosRequest {
+                source_id: 4,
+                epoch: 8,
+                barrier: None,
+            }
+        );
+    }
+
+    #[test]
+    fn eos_media_order_barrier_is_both_or_neither() {
+        let body = eos_with_barrier(10, 4, 8, 3, 99);
+        let (decoded_envelope, request) = parse_eos(&body).unwrap();
+        assert_eq!(decoded_envelope.request_id, 10);
+        assert_eq!(
+            request,
+            EosRequest {
+                source_id: 4,
+                epoch: 8,
+                barrier: Some(MediaOrderBarrier {
+                    attachment_generation: 3,
+                    final_record_sequence: 99,
+                }),
+            }
+        );
+
+        let only_generation = envelope(10, None, None, |encoder| {
+            encoder.map(3);
+            key_u64(encoder, 0, 4);
+            key_u64(encoder, 1, 8);
+            key_u64(encoder, 2, 3);
+        });
+        assert!(parse_eos(&only_generation).is_err());
+
+        let only_sequence = envelope(10, None, None, |encoder| {
+            encoder.map(3);
+            key_u64(encoder, 0, 4);
+            key_u64(encoder, 1, 8);
+            key_u64(encoder, 3, 99);
+        });
+        assert!(parse_eos(&only_sequence).is_err());
     }
 
     #[test]
