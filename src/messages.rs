@@ -344,6 +344,13 @@ pub const CONTEXT_CHANGED_QUOTA_REDUCTION: u64 = 1 << 3;
 pub const CONTEXT_CHANGED_PRESENTER_POLICY: u64 = 1 << 4;
 pub const CONTEXT_CHANGED_REASON_MASK: u64 = (1 << 5) - 1;
 
+pub const CAPTURE_POLICY_DENY_CAPTURE: u64 = 1 << 0;
+pub const CAPTURE_POLICY_DENY_SEMANTIC_EXPORT: u64 = 1 << 1;
+pub const CAPTURE_POLICY_DENY_POSTER_RETENTION: u64 = 1 << 2;
+pub const CAPTURE_POLICY_DENY_CACHE: u64 = 1 << 3;
+pub const CAPTURE_POLICY_REDUCE_DIAGNOSTICS: u64 = 1 << 4;
+pub const CAPTURE_POLICY_MASK: u64 = (1 << 5) - 1;
+
 pub const LIMIT_CONCURRENT_SESSIONS: u64 = 1;
 pub const LIMIT_CONCURRENT_CONNECTIONS: u64 = 2;
 pub const LIMIT_SOURCES: u64 = 3;
@@ -1493,8 +1500,16 @@ pub fn create_raster(request_id: u64, source_id: u64, width: u32, height: u32) -
 }
 
 pub fn create_raster_config(request_id: u64, config: &RasterSourceConfig) -> Vec<u8> {
+    create_raster_with_policy(request_id, config, 0)
+}
+
+pub fn create_raster_with_policy(
+    request_id: u64,
+    config: &RasterSourceConfig,
+    capture_policy: u64,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(9);
+        encoder.map(9 + usize::from(capture_policy != 0));
         key_u64(encoder, 0, config.source_id);
         key_u64(encoder, 1, u64::from(config.width));
         key_u64(encoder, 2, u64::from(config.height));
@@ -1504,12 +1519,23 @@ pub fn create_raster_config(request_id: u64, config: &RasterSourceConfig) -> Vec
         key_u64(encoder, 6, 1);
         key_u64(encoder, 7, config.compression_mode);
         key_u64(encoder, 8, RETENTION_NONE);
+        if capture_policy != 0 {
+            key_u64(encoder, 9, capture_policy);
+        }
     })
 }
 
 pub fn create_image(request_id: u64, config: &ImageSourceConfig) -> Vec<u8> {
+    create_image_with_policy(request_id, config, 0)
+}
+
+pub fn create_image_with_policy(
+    request_id: u64,
+    config: &ImageSourceConfig,
+    capture_policy: u64,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(if config.sha256.is_some() { 8 } else { 7 });
+        encoder.map(if config.sha256.is_some() { 8 } else { 7 } + usize::from(capture_policy != 0));
         key_u64(encoder, 0, config.source_id);
         key_u64(encoder, 1, config.encoding);
         key_u64(encoder, 2, u64::from(config.width));
@@ -1521,13 +1547,25 @@ pub fn create_image(request_id: u64, config: &ImageSourceConfig) -> Vec<u8> {
         }
         key_u64(encoder, 6, COLOR_SPACE_SRGB);
         key_u64(encoder, 7, RETENTION_DECODED_SOURCE);
+        if capture_policy != 0 {
+            key_u64(encoder, 9, capture_policy);
+        }
     })
 }
 
 pub fn create_video(request_id: u64, config: &VideoSourceConfig<'_>) -> Vec<u8> {
+    create_video_with_policy(request_id, config, 0)
+}
+
+pub fn create_video_with_policy(
+    request_id: u64,
+    config: &VideoSourceConfig<'_>,
+    capture_policy: u64,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
         let optional = usize::from(config.codec_string.is_some())
-            + usize::from(config.decoder_config.is_some());
+            + usize::from(config.decoder_config.is_some())
+            + usize::from(capture_policy != 0);
         encoder.map(21 + optional);
         key_u64(encoder, 0, config.source_id);
         encoder.u64(1);
@@ -1562,6 +1600,9 @@ pub fn create_video(request_id: u64, config: &VideoSourceConfig<'_>) -> Vec<u8> 
             encoder.u64(22);
             encoder.bytes(decoder_config);
         }
+        if capture_policy != 0 {
+            key_u64(encoder, 23, capture_policy);
+        }
     })
 }
 
@@ -1570,8 +1611,18 @@ pub fn probe_video_config(request_id: u64, config: &VideoSourceConfig<'_>) -> Ve
 }
 
 pub fn create_audio(request_id: u64, config: &AudioSourceConfig<'_>) -> Vec<u8> {
+    create_audio_with_policy(request_id, config, 0)
+}
+
+pub fn create_audio_with_policy(
+    request_id: u64,
+    config: &AudioSourceConfig<'_>,
+    capture_policy: u64,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(11 + usize::from(config.codec_string.is_some()));
+        encoder.map(
+            11 + usize::from(config.codec_string.is_some()) + usize::from(capture_policy != 0),
+        );
         key_u64(encoder, 0, config.source_id);
         key_u64(encoder, 1, config.linked_video_source_id.unwrap_or(0));
         encoder.u64(2);
@@ -1591,6 +1642,17 @@ pub fn create_audio(request_id: u64, config: &AudioSourceConfig<'_>) -> Vec<u8> 
             encoder.u64(11);
             encoder.text(codec_string);
         }
+        if capture_policy != 0 {
+            key_u64(encoder, 12, capture_policy);
+        }
+    })
+}
+
+pub fn set_source_policy(request_id: u64, source_id: u64, capture_policy: u64) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(2);
+        key_u64(encoder, 0, source_id);
+        key_u64(encoder, 1, capture_policy);
     })
 }
 
@@ -2878,9 +2940,15 @@ pub fn parse_context_changed(body: &[u8]) -> io::Result<ContextChanged> {
 }
 
 pub fn parse_create_raster(body: &[u8]) -> io::Result<(ControlEnvelope, RasterSourceConfig)> {
+    parse_create_raster_with_policy(body).map(|(envelope, config, _)| (envelope, config))
+}
+
+pub fn parse_create_raster_with_policy(
+    body: &[u8],
+) -> io::Result<(ControlEnvelope, RasterSourceConfig, u64)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
-    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8])?;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])?;
     let config = RasterSourceConfig {
         source_id: required_u64(payload, 0, "source ID")?,
         width: required_u32(payload, 1, "raster width")?,
@@ -2906,13 +2974,21 @@ pub fn parse_create_raster(body: &[u8]) -> io::Result<(ControlEnvelope, RasterSo
     if config.width == 0 || config.height == 0 || config.width > 8192 || config.height > 8192 {
         return Err(invalid("raster dimensions are outside Vivid v1 limits"));
     }
-    Ok((envelope, config))
+    let capture_policy = optional_u64(payload, 9, "capture policy")?.unwrap_or(0);
+    validate_capture_policy(capture_policy)?;
+    Ok((envelope, config, capture_policy))
 }
 
 pub fn parse_create_image(body: &[u8]) -> io::Result<(ControlEnvelope, ImageSourceConfig)> {
+    parse_create_image_with_policy(body).map(|(envelope, config, _)| (envelope, config))
+}
+
+pub fn parse_create_image_with_policy(
+    body: &[u8],
+) -> io::Result<(ControlEnvelope, ImageSourceConfig, u64)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
-    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7])?;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 9])?;
     let hash = payload
         .map_value(5)
         .map(|value| {
@@ -2944,16 +3020,24 @@ pub fn parse_create_image(body: &[u8]) -> io::Result<(ControlEnvelope, ImageSour
     {
         return Err(invalid("unsupported encoded-image configuration"));
     }
-    Ok((envelope, config))
+    let capture_policy = optional_u64(payload, 9, "capture policy")?.unwrap_or(0);
+    validate_capture_policy(capture_policy)?;
+    Ok((envelope, config, capture_policy))
 }
 
 pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVideoSourceConfig)> {
+    parse_create_video_with_policy(body).map(|(envelope, config, _)| (envelope, config))
+}
+
+pub fn parse_create_video_with_policy(
+    body: &[u8],
+) -> io::Result<(ControlEnvelope, ParsedVideoSourceConfig, u64)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
     reject_unknown_fields(
         payload,
         &[
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
         ],
     )?;
     let profile = required_i64(payload, 6, "video profile")?;
@@ -3020,13 +3104,21 @@ pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVid
     {
         return Err(invalid("unsupported video configuration"));
     }
-    Ok((envelope, config))
+    let capture_policy = optional_u64(payload, 23, "capture policy")?.unwrap_or(0);
+    validate_capture_policy(capture_policy)?;
+    Ok((envelope, config, capture_policy))
 }
 
 pub fn parse_create_audio(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedAudioSourceConfig)> {
+    parse_create_audio_with_policy(body).map(|(envelope, config, _)| (envelope, config))
+}
+
+pub fn parse_create_audio_with_policy(
+    body: &[u8],
+) -> io::Result<(ControlEnvelope, ParsedAudioSourceConfig, u64)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
-    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])?;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])?;
     let channels = required_u32(payload, 6, "audio channel count")?;
     let linked = required_u64(payload, 1, "linked video source ID")?;
     let codec_string = match payload.map_value(11) {
@@ -3061,7 +3153,45 @@ pub fn parse_create_audio(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedAud
     if let Some(codec_string) = &config.codec_string {
         validate_audio_codec_string(&config.codec, codec_string)?;
     }
+    let capture_policy = optional_u64(payload, 12, "capture policy")?.unwrap_or(0);
+    validate_capture_policy(capture_policy)?;
+    Ok((envelope, config, capture_policy))
+}
+
+pub fn parse_probe_video_config(
+    body: &[u8],
+) -> io::Result<(ControlEnvelope, ParsedVideoSourceConfig)> {
+    let (envelope, config, capture_policy) = parse_create_video_with_policy(body)?;
+    if config.source_id != 0 || capture_policy != 0 {
+        return Err(invalid(
+            "video probe must use source ID zero and cannot carry capture policy",
+        ));
+    }
     Ok((envelope, config))
+}
+
+pub fn parse_probe_audio_config(
+    body: &[u8],
+) -> io::Result<(ControlEnvelope, ParsedAudioSourceConfig)> {
+    let (envelope, config, capture_policy) = parse_create_audio_with_policy(body)?;
+    if config.source_id != 0 || capture_policy != 0 {
+        return Err(invalid(
+            "audio probe must use source ID zero and cannot carry capture policy",
+        ));
+    }
+    Ok((envelope, config))
+}
+
+pub fn parse_set_source_policy(body: &[u8]) -> io::Result<(ControlEnvelope, u64, u64)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0, 1])?;
+    let source_id = required_u64(&envelope.payload, 0, "source ID")?;
+    let capture_policy = required_u64(&envelope.payload, 1, "capture policy")?;
+    if source_id == 0 {
+        return Err(invalid("source ID is zero"));
+    }
+    validate_capture_policy(capture_policy)?;
+    Ok((envelope, source_id, capture_policy))
 }
 
 pub fn audio_config_supported(config: &ParsedAudioSourceConfig) -> bool {
@@ -4794,6 +4924,13 @@ fn optional_u64(value: &Value, key: u64, description: &str) -> io::Result<Option
         .transpose()
 }
 
+pub fn validate_capture_policy(capture_policy: u64) -> io::Result<()> {
+    if capture_policy & !CAPTURE_POLICY_MASK != 0 {
+        return Err(invalid("capture policy contains reserved bits"));
+    }
+    Ok(())
+}
+
 fn reject_unknown_fields(value: &Value, allowed: &[u64]) -> io::Result<()> {
     let Value::Map(entries) = value else {
         return Err(invalid("schema value is not a map"));
@@ -5693,6 +5830,143 @@ mod tests {
         assert_eq!(parsed.extradata, [0x11, 0x90]);
         assert_eq!(parsed.codec_string.as_deref(), Some("mp4a.40.2"));
         assert!(audio_config_supported(&parsed));
+    }
+
+    #[test]
+    fn capture_policy_round_trips_on_creation_and_tightening() {
+        let raster = RasterSourceConfig {
+            source_id: 7,
+            width: 320,
+            height: 200,
+            alpha_mode: ALPHA_STRAIGHT,
+            compression_mode: COMPRESSION_RAW_OR_ZSTD,
+        };
+        let policy = CAPTURE_POLICY_DENY_CAPTURE
+            | CAPTURE_POLICY_DENY_POSTER_RETENTION
+            | CAPTURE_POLICY_REDUCE_DIAGNOSTICS;
+        let (envelope, parsed, parsed_policy) =
+            parse_create_raster_with_policy(&create_raster_with_policy(5, &raster, policy))
+                .unwrap();
+        assert_eq!(envelope.request_id, 5);
+        assert_eq!(parsed.source_id, 7);
+        assert_eq!(parsed_policy, policy);
+
+        let image = ImageSourceConfig {
+            source_id: 8,
+            encoding: IMAGE_PNG,
+            width: 1,
+            height: 1,
+            encoded_length: 68,
+            sha256: Some([7; 32]),
+        };
+        assert_eq!(
+            parse_create_image_with_policy(&create_image_with_policy(9, &image, policy))
+                .unwrap()
+                .2,
+            policy
+        );
+        let video = VideoSourceConfig {
+            source_id: 9,
+            codec: "h264",
+            packetization: "h264-annexb-au-v1",
+            extradata: &[0, 0, 0, 1, 0x67],
+            width: 16,
+            height: 16,
+            profile: 100,
+            level: 40,
+            bitrate: 1_000_000,
+            color_primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            range: 1,
+            sar_num: 1,
+            sar_den: 1,
+            max_access_unit_bytes: 4096,
+            codec_string: None,
+            decoder_config: None,
+        };
+        assert_eq!(
+            parse_create_video_with_policy(&create_video_with_policy(10, &video, policy))
+                .unwrap()
+                .2,
+            policy
+        );
+        let audio = AudioSourceConfig {
+            source_id: 10,
+            linked_video_source_id: Some(9),
+            codec: "aac",
+            packetization: "aac-raw-au-v1",
+            extradata: &[0x11, 0x90],
+            sample_rate: 48_000,
+            channels: 2,
+            channel_mask: 3,
+            bitrate: 128_000,
+            max_access_unit_bytes: 4096,
+            codec_string: None,
+        };
+        assert_eq!(
+            parse_create_audio_with_policy(&create_audio_with_policy(11, &audio, policy))
+                .unwrap()
+                .2,
+            policy
+        );
+
+        let (envelope, source_id, parsed_policy) =
+            parse_set_source_policy(&set_source_policy(6, 7, CAPTURE_POLICY_MASK)).unwrap();
+        assert_eq!(envelope.request_id, 6);
+        assert_eq!(source_id, 7);
+        assert_eq!(parsed_policy, CAPTURE_POLICY_MASK);
+
+        assert!(
+            parse_create_raster_with_policy(&create_raster_with_policy(
+                7,
+                &raster,
+                CAPTURE_POLICY_MASK + 1,
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_set_source_policy(&set_source_policy(8, 7, CAPTURE_POLICY_MASK + 1)).is_err()
+        );
+    }
+
+    #[test]
+    fn probes_reject_source_policy_and_nonzero_source_ids() {
+        let base = VideoSourceConfig {
+            source_id: 0,
+            codec: "h264",
+            packetization: "h264-annexb-au-v1",
+            extradata: &[0, 0, 0, 1, 0x67],
+            width: 640,
+            height: 360,
+            profile: 100,
+            level: 40,
+            bitrate: 2_000_000,
+            color_primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            range: 1,
+            sar_num: 1,
+            sar_den: 1,
+            max_access_unit_bytes: 1_000_000,
+            codec_string: None,
+            decoder_config: None,
+        };
+        assert!(parse_probe_video_config(&probe_video_config(1, &base)).is_ok());
+        assert!(
+            parse_probe_video_config(&create_video_with_policy(
+                2,
+                &base,
+                CAPTURE_POLICY_DENY_CAPTURE,
+            ))
+            .is_err()
+        );
+
+        let non_probe = VideoSourceConfig {
+            source_id: 9,
+            ..base
+        };
+        assert!(parse_probe_video_config(&probe_video_config(3, &non_probe)).is_err());
     }
 
     #[test]
