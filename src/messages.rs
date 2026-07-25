@@ -351,6 +351,23 @@ pub const CAPTURE_POLICY_DENY_CACHE: u64 = 1 << 3;
 pub const CAPTURE_POLICY_REDUCE_DIAGNOSTICS: u64 = 1 << 4;
 pub const CAPTURE_POLICY_MASK: u64 = (1 << 5) - 1;
 
+pub const SOURCE_ROLE_UNSPECIFIED: u64 = 0;
+pub const SOURCE_ROLE_DOCUMENT: u64 = 1;
+pub const SOURCE_ROLE_DESKTOP: u64 = 2;
+pub const SOURCE_ROLE_TIMED_MEDIA: u64 = 3;
+pub const SOURCE_ROLE_FIGURE: u64 = 4;
+pub const SOURCE_ROLE_TERMINAL: u64 = 5;
+pub const SOURCE_ROLE_MAX: u64 = SOURCE_ROLE_TERMINAL;
+
+pub const SEMANTIC_AVAILABLE_TEXT: u64 = 1 << 0;
+pub const SEMANTIC_AVAILABLE_STRUCTURE: u64 = 1 << 1;
+pub const SEMANTIC_AVAILABLE_LINKS: u64 = 1 << 2;
+pub const SEMANTIC_AVAILABLE_OUTLINE: u64 = 1 << 3;
+pub const SEMANTIC_AVAILABLE_ACTIONS: u64 = 1 << 4;
+pub const SEMANTIC_AVAILABILITY_MASK: u64 = (1 << 5) - 1;
+pub const MAX_SOURCE_DESCRIPTOR_TITLE_BYTES: usize = 256;
+pub const MAX_SOURCE_DESCRIPTOR_LOCATOR_BYTES: usize = 512;
+
 pub const LIMIT_CONCURRENT_SESSIONS: u64 = 1;
 pub const LIMIT_CONCURRENT_CONNECTIONS: u64 = 2;
 pub const LIMIT_SOURCES: u64 = 3;
@@ -518,6 +535,21 @@ pub struct SourceChanged {
     pub first_lost_sequence: Option<ObservationSequence>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDescriptor {
+    pub role: u64,
+    pub title: String,
+    pub content_revision: u64,
+    pub semantic_availability: u64,
+    pub locator: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportedSourceDescriptor {
+    Full(SourceDescriptor),
+    RoleOnly { role: u64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneChanged {
     pub scene_revision: SceneRevision,
@@ -566,7 +598,7 @@ pub struct SourceStatus {
     pub outstanding_byte_credit: u64,
     pub outstanding_packet_credit: u64,
     pub ingress_queue_depth: u64,
-    pub descriptor: Option<Value>,
+    pub descriptor: Option<ReportedSourceDescriptor>,
     pub playback: Option<PlaybackSnapshot>,
     pub terminal_loss_code: Option<u64>,
 }
@@ -1508,8 +1540,17 @@ pub fn create_raster_with_policy(
     config: &RasterSourceConfig,
     capture_policy: u64,
 ) -> Vec<u8> {
+    create_raster_with_extensions(request_id, config, capture_policy, None)
+}
+
+pub fn create_raster_with_extensions(
+    request_id: u64,
+    config: &RasterSourceConfig,
+    capture_policy: u64,
+    descriptor: Option<&SourceDescriptor>,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(9 + usize::from(capture_policy != 0));
+        encoder.map(9 + usize::from(capture_policy != 0) + usize::from(descriptor.is_some()));
         key_u64(encoder, 0, config.source_id);
         key_u64(encoder, 1, u64::from(config.width));
         key_u64(encoder, 2, u64::from(config.height));
@@ -1521,6 +1562,10 @@ pub fn create_raster_with_policy(
         key_u64(encoder, 8, RETENTION_NONE);
         if capture_policy != 0 {
             key_u64(encoder, 9, capture_policy);
+        }
+        if let Some(descriptor) = descriptor {
+            encoder.u64(10);
+            encode_source_descriptor(encoder, descriptor);
         }
     })
 }
@@ -1534,8 +1579,21 @@ pub fn create_image_with_policy(
     config: &ImageSourceConfig,
     capture_policy: u64,
 ) -> Vec<u8> {
+    create_image_with_extensions(request_id, config, capture_policy, None)
+}
+
+pub fn create_image_with_extensions(
+    request_id: u64,
+    config: &ImageSourceConfig,
+    capture_policy: u64,
+    descriptor: Option<&SourceDescriptor>,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
-        encoder.map(if config.sha256.is_some() { 8 } else { 7 } + usize::from(capture_policy != 0));
+        encoder.map(
+            if config.sha256.is_some() { 8 } else { 7 }
+                + usize::from(capture_policy != 0)
+                + usize::from(descriptor.is_some()),
+        );
         key_u64(encoder, 0, config.source_id);
         key_u64(encoder, 1, config.encoding);
         key_u64(encoder, 2, u64::from(config.width));
@@ -1550,6 +1608,10 @@ pub fn create_image_with_policy(
         if capture_policy != 0 {
             key_u64(encoder, 9, capture_policy);
         }
+        if let Some(descriptor) = descriptor {
+            encoder.u64(10);
+            encode_source_descriptor(encoder, descriptor);
+        }
     })
 }
 
@@ -1562,10 +1624,20 @@ pub fn create_video_with_policy(
     config: &VideoSourceConfig<'_>,
     capture_policy: u64,
 ) -> Vec<u8> {
+    create_video_with_extensions(request_id, config, capture_policy, None)
+}
+
+pub fn create_video_with_extensions(
+    request_id: u64,
+    config: &VideoSourceConfig<'_>,
+    capture_policy: u64,
+    descriptor: Option<&SourceDescriptor>,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
         let optional = usize::from(config.codec_string.is_some())
             + usize::from(config.decoder_config.is_some())
-            + usize::from(capture_policy != 0);
+            + usize::from(capture_policy != 0)
+            + usize::from(descriptor.is_some());
         encoder.map(21 + optional);
         key_u64(encoder, 0, config.source_id);
         encoder.u64(1);
@@ -1603,6 +1675,10 @@ pub fn create_video_with_policy(
         if capture_policy != 0 {
             key_u64(encoder, 23, capture_policy);
         }
+        if let Some(descriptor) = descriptor {
+            encoder.u64(24);
+            encode_source_descriptor(encoder, descriptor);
+        }
     })
 }
 
@@ -1619,9 +1695,20 @@ pub fn create_audio_with_policy(
     config: &AudioSourceConfig<'_>,
     capture_policy: u64,
 ) -> Vec<u8> {
+    create_audio_with_extensions(request_id, config, capture_policy, None)
+}
+
+pub fn create_audio_with_extensions(
+    request_id: u64,
+    config: &AudioSourceConfig<'_>,
+    capture_policy: u64,
+    descriptor: Option<&SourceDescriptor>,
+) -> Vec<u8> {
     envelope(request_id, None, None, |encoder| {
         encoder.map(
-            11 + usize::from(config.codec_string.is_some()) + usize::from(capture_policy != 0),
+            11 + usize::from(config.codec_string.is_some())
+                + usize::from(capture_policy != 0)
+                + usize::from(descriptor.is_some()),
         );
         key_u64(encoder, 0, config.source_id);
         key_u64(encoder, 1, config.linked_video_source_id.unwrap_or(0));
@@ -1645,6 +1732,10 @@ pub fn create_audio_with_policy(
         if capture_policy != 0 {
             key_u64(encoder, 12, capture_policy);
         }
+        if let Some(descriptor) = descriptor {
+            encoder.u64(13);
+            encode_source_descriptor(encoder, descriptor);
+        }
     })
 }
 
@@ -1653,6 +1744,19 @@ pub fn set_source_policy(request_id: u64, source_id: u64, capture_policy: u64) -
         encoder.map(2);
         key_u64(encoder, 0, source_id);
         key_u64(encoder, 1, capture_policy);
+    })
+}
+
+pub fn update_source_descriptor(
+    request_id: u64,
+    source_id: u64,
+    descriptor: &SourceDescriptor,
+) -> Vec<u8> {
+    envelope(request_id, None, None, |encoder| {
+        encoder.map(2);
+        key_u64(encoder, 0, source_id);
+        encoder.u64(1);
+        encode_source_descriptor(encoder, descriptor);
     })
 }
 
@@ -2336,7 +2440,7 @@ pub fn source_status(request_id: u64, status: &SourceStatus) -> io::Result<Vec<u
         (18, Value::Unsigned(status.ingress_queue_depth)),
     ];
     if let Some(descriptor) = &status.descriptor {
-        entries.push((19, descriptor.clone()));
+        entries.push((19, reported_source_descriptor_value(descriptor)));
     }
     if let Some(playback) = status.playback {
         entries.push((20, playback_snapshot_value(playback)));
@@ -2946,9 +3050,21 @@ pub fn parse_create_raster(body: &[u8]) -> io::Result<(ControlEnvelope, RasterSo
 pub fn parse_create_raster_with_policy(
     body: &[u8],
 ) -> io::Result<(ControlEnvelope, RasterSourceConfig, u64)> {
+    parse_create_raster_with_extensions(body)
+        .map(|(envelope, config, policy, _)| (envelope, config, policy))
+}
+
+pub fn parse_create_raster_with_extensions(
+    body: &[u8],
+) -> io::Result<(
+    ControlEnvelope,
+    RasterSourceConfig,
+    u64,
+    Option<SourceDescriptor>,
+)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
-    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])?;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
     let config = RasterSourceConfig {
         source_id: required_u64(payload, 0, "source ID")?,
         width: required_u32(payload, 1, "raster width")?,
@@ -2976,7 +3092,11 @@ pub fn parse_create_raster_with_policy(
     }
     let capture_policy = optional_u64(payload, 9, "capture policy")?.unwrap_or(0);
     validate_capture_policy(capture_policy)?;
-    Ok((envelope, config, capture_policy))
+    let descriptor = payload
+        .map_value(10)
+        .map(parse_source_descriptor)
+        .transpose()?;
+    Ok((envelope, config, capture_policy, descriptor))
 }
 
 pub fn parse_create_image(body: &[u8]) -> io::Result<(ControlEnvelope, ImageSourceConfig)> {
@@ -2986,9 +3106,21 @@ pub fn parse_create_image(body: &[u8]) -> io::Result<(ControlEnvelope, ImageSour
 pub fn parse_create_image_with_policy(
     body: &[u8],
 ) -> io::Result<(ControlEnvelope, ImageSourceConfig, u64)> {
+    parse_create_image_with_extensions(body)
+        .map(|(envelope, config, policy, _)| (envelope, config, policy))
+}
+
+pub fn parse_create_image_with_extensions(
+    body: &[u8],
+) -> io::Result<(
+    ControlEnvelope,
+    ImageSourceConfig,
+    u64,
+    Option<SourceDescriptor>,
+)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
-    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 9])?;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 9, 10])?;
     let hash = payload
         .map_value(5)
         .map(|value| {
@@ -3022,7 +3154,11 @@ pub fn parse_create_image_with_policy(
     }
     let capture_policy = optional_u64(payload, 9, "capture policy")?.unwrap_or(0);
     validate_capture_policy(capture_policy)?;
-    Ok((envelope, config, capture_policy))
+    let descriptor = payload
+        .map_value(10)
+        .map(parse_source_descriptor)
+        .transpose()?;
+    Ok((envelope, config, capture_policy, descriptor))
 }
 
 pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVideoSourceConfig)> {
@@ -3032,12 +3168,25 @@ pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVid
 pub fn parse_create_video_with_policy(
     body: &[u8],
 ) -> io::Result<(ControlEnvelope, ParsedVideoSourceConfig, u64)> {
+    parse_create_video_with_extensions(body)
+        .map(|(envelope, config, policy, _)| (envelope, config, policy))
+}
+
+pub fn parse_create_video_with_extensions(
+    body: &[u8],
+) -> io::Result<(
+    ControlEnvelope,
+    ParsedVideoSourceConfig,
+    u64,
+    Option<SourceDescriptor>,
+)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
     reject_unknown_fields(
         payload,
         &[
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24,
         ],
     )?;
     let profile = required_i64(payload, 6, "video profile")?;
@@ -3106,7 +3255,11 @@ pub fn parse_create_video_with_policy(
     }
     let capture_policy = optional_u64(payload, 23, "capture policy")?.unwrap_or(0);
     validate_capture_policy(capture_policy)?;
-    Ok((envelope, config, capture_policy))
+    let descriptor = payload
+        .map_value(24)
+        .map(parse_source_descriptor)
+        .transpose()?;
+    Ok((envelope, config, capture_policy, descriptor))
 }
 
 pub fn parse_create_audio(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedAudioSourceConfig)> {
@@ -3116,9 +3269,21 @@ pub fn parse_create_audio(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedAud
 pub fn parse_create_audio_with_policy(
     body: &[u8],
 ) -> io::Result<(ControlEnvelope, ParsedAudioSourceConfig, u64)> {
+    parse_create_audio_with_extensions(body)
+        .map(|(envelope, config, policy, _)| (envelope, config, policy))
+}
+
+pub fn parse_create_audio_with_extensions(
+    body: &[u8],
+) -> io::Result<(
+    ControlEnvelope,
+    ParsedAudioSourceConfig,
+    u64,
+    Option<SourceDescriptor>,
+)> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
-    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])?;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])?;
     let channels = required_u32(payload, 6, "audio channel count")?;
     let linked = required_u64(payload, 1, "linked video source ID")?;
     let codec_string = match payload.map_value(11) {
@@ -3155,16 +3320,20 @@ pub fn parse_create_audio_with_policy(
     }
     let capture_policy = optional_u64(payload, 12, "capture policy")?.unwrap_or(0);
     validate_capture_policy(capture_policy)?;
-    Ok((envelope, config, capture_policy))
+    let descriptor = payload
+        .map_value(13)
+        .map(parse_source_descriptor)
+        .transpose()?;
+    Ok((envelope, config, capture_policy, descriptor))
 }
 
 pub fn parse_probe_video_config(
     body: &[u8],
 ) -> io::Result<(ControlEnvelope, ParsedVideoSourceConfig)> {
-    let (envelope, config, capture_policy) = parse_create_video_with_policy(body)?;
-    if config.source_id != 0 || capture_policy != 0 {
+    let (envelope, config, capture_policy, descriptor) = parse_create_video_with_extensions(body)?;
+    if config.source_id != 0 || capture_policy != 0 || descriptor.is_some() {
         return Err(invalid(
-            "video probe must use source ID zero and cannot carry capture policy",
+            "video probe must use source ID zero and cannot carry policy or descriptor",
         ));
     }
     Ok((envelope, config))
@@ -3173,10 +3342,10 @@ pub fn parse_probe_video_config(
 pub fn parse_probe_audio_config(
     body: &[u8],
 ) -> io::Result<(ControlEnvelope, ParsedAudioSourceConfig)> {
-    let (envelope, config, capture_policy) = parse_create_audio_with_policy(body)?;
-    if config.source_id != 0 || capture_policy != 0 {
+    let (envelope, config, capture_policy, descriptor) = parse_create_audio_with_extensions(body)?;
+    if config.source_id != 0 || capture_policy != 0 || descriptor.is_some() {
         return Err(invalid(
-            "audio probe must use source ID zero and cannot carry capture policy",
+            "audio probe must use source ID zero and cannot carry policy or descriptor",
         ));
     }
     Ok((envelope, config))
@@ -3192,6 +3361,23 @@ pub fn parse_set_source_policy(body: &[u8]) -> io::Result<(ControlEnvelope, u64,
     }
     validate_capture_policy(capture_policy)?;
     Ok((envelope, source_id, capture_policy))
+}
+
+pub fn parse_update_source_descriptor(
+    body: &[u8],
+) -> io::Result<(ControlEnvelope, u64, SourceDescriptor)> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0, 1])?;
+    let source_id = required_u64(&envelope.payload, 0, "source ID")?;
+    if source_id == 0 {
+        return Err(invalid("source ID is zero"));
+    }
+    let descriptor = envelope
+        .payload
+        .map_value(1)
+        .ok_or_else(|| invalid("missing source descriptor"))
+        .and_then(parse_source_descriptor)?;
+    Ok((envelope, source_id, descriptor))
 }
 
 pub fn audio_config_supported(config: &ParsedAudioSourceConfig) -> bool {
@@ -4027,13 +4213,10 @@ pub fn parse_source_status(body: &[u8]) -> io::Result<(u64, SourceStatus)> {
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
         ],
     )?;
-    let descriptor = payload.map_value(19).cloned();
-    if descriptor
-        .as_ref()
-        .is_some_and(|value| !matches!(value, Value::Map(_)))
-    {
-        return Err(invalid("SOURCE_STATUS descriptor is not a map"));
-    }
+    let descriptor = payload
+        .map_value(19)
+        .map(parse_reported_source_descriptor)
+        .transpose()?;
     let status = SourceStatus {
         source_id: required_u64(&payload, 0, "source ID")?,
         source_revision: SourceRevision::new(required_u64(&payload, 1, "source revision")?),
@@ -4797,12 +4980,14 @@ fn validate_source_status(status: &SourceStatus) -> io::Result<()> {
     {
         return Err(invalid("SOURCE_STATUS contains an invalid state field"));
     }
-    if status
-        .descriptor
-        .as_ref()
-        .is_some_and(|value| !matches!(value, Value::Map(_)))
-    {
-        return Err(invalid("SOURCE_STATUS descriptor is not a map"));
+    if let Some(descriptor) = &status.descriptor {
+        match descriptor {
+            ReportedSourceDescriptor::Full(descriptor) => validate_source_descriptor(descriptor)?,
+            ReportedSourceDescriptor::RoleOnly { role } if *role <= SOURCE_ROLE_MAX => {}
+            ReportedSourceDescriptor::RoleOnly { .. } => {
+                return Err(invalid("source descriptor role is reserved"));
+            }
+        }
     }
     if let Some(playback) = status.playback {
         validate_playback_snapshot(playback)?;
@@ -4931,6 +5116,85 @@ pub fn validate_capture_policy(capture_policy: u64) -> io::Result<()> {
     Ok(())
 }
 
+pub fn validate_source_descriptor(descriptor: &SourceDescriptor) -> io::Result<()> {
+    if descriptor.role > SOURCE_ROLE_MAX {
+        return Err(invalid("source descriptor role is reserved"));
+    }
+    if descriptor.title.len() > MAX_SOURCE_DESCRIPTOR_TITLE_BYTES {
+        return Err(invalid("source descriptor title exceeds 256 UTF-8 bytes"));
+    }
+    if descriptor.semantic_availability & !SEMANTIC_AVAILABILITY_MASK != 0 {
+        return Err(invalid(
+            "source descriptor semantic availability contains reserved bits",
+        ));
+    }
+    if descriptor.locator.len() > MAX_SOURCE_DESCRIPTOR_LOCATOR_BYTES {
+        return Err(invalid("source descriptor locator exceeds 512 UTF-8 bytes"));
+    }
+    Ok(())
+}
+
+pub fn source_descriptor_value(descriptor: &SourceDescriptor) -> Value {
+    Value::Map(vec![
+        (0, Value::Unsigned(descriptor.role)),
+        (1, Value::Text(descriptor.title.clone())),
+        (2, Value::Unsigned(descriptor.content_revision)),
+        (3, Value::Unsigned(descriptor.semantic_availability)),
+        (4, Value::Text(descriptor.locator.clone())),
+    ])
+}
+
+pub fn reported_source_descriptor_value(descriptor: &ReportedSourceDescriptor) -> Value {
+    match descriptor {
+        ReportedSourceDescriptor::Full(descriptor) => source_descriptor_value(descriptor),
+        ReportedSourceDescriptor::RoleOnly { role } => {
+            Value::Map(vec![(0, Value::Unsigned(*role))])
+        }
+    }
+}
+
+pub fn parse_source_descriptor(value: &Value) -> io::Result<SourceDescriptor> {
+    reject_unknown_fields(value, &[0, 1, 2, 3, 4])?;
+    let descriptor = SourceDescriptor {
+        role: required_u64(value, 0, "source descriptor role")?,
+        title: bounded_text(
+            value,
+            1,
+            "source descriptor title",
+            MAX_SOURCE_DESCRIPTOR_TITLE_BYTES,
+        )?
+        .to_owned(),
+        content_revision: required_u64(value, 2, "source descriptor content revision")?,
+        semantic_availability: required_u64(value, 3, "source descriptor semantic availability")?,
+        locator: bounded_text(
+            value,
+            4,
+            "source descriptor locator",
+            MAX_SOURCE_DESCRIPTOR_LOCATOR_BYTES,
+        )?
+        .to_owned(),
+    };
+    validate_source_descriptor(&descriptor)?;
+    Ok(descriptor)
+}
+
+pub fn parse_reported_source_descriptor(value: &Value) -> io::Result<ReportedSourceDescriptor> {
+    let Value::Map(entries) = value else {
+        return Err(invalid("SOURCE_STATUS descriptor is not a map"));
+    };
+    if entries.len() == 1 && entries[0].0 == 0 {
+        let role = entries[0]
+            .1
+            .as_u64()
+            .ok_or_else(|| invalid("source descriptor role is not unsigned"))?;
+        if role > SOURCE_ROLE_MAX {
+            return Err(invalid("source descriptor role is reserved"));
+        }
+        return Ok(ReportedSourceDescriptor::RoleOnly { role });
+    }
+    parse_source_descriptor(value).map(ReportedSourceDescriptor::Full)
+}
+
 fn reject_unknown_fields(value: &Value, allowed: &[u64]) -> io::Result<()> {
     let Value::Map(entries) = value else {
         return Err(invalid("schema value is not a map"));
@@ -5054,6 +5318,17 @@ fn key_u64(encoder: &mut Encoder, key: u64, value: u64) {
 fn key_i64(encoder: &mut Encoder, key: u64, value: i64) {
     encoder.u64(key);
     encoder.i64(value);
+}
+
+fn encode_source_descriptor(encoder: &mut Encoder, descriptor: &SourceDescriptor) {
+    encoder.map(5);
+    key_u64(encoder, 0, descriptor.role);
+    encoder.u64(1);
+    encoder.text(&descriptor.title);
+    key_u64(encoder, 2, descriptor.content_revision);
+    key_u64(encoder, 3, descriptor.semantic_availability);
+    encoder.u64(4);
+    encoder.text(&descriptor.locator);
 }
 
 #[cfg(test)]
@@ -5833,7 +6108,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_policy_round_trips_on_creation_and_tightening() {
+    fn capture_policy_and_descriptors_round_trip_on_all_source_kinds() {
         let raster = RasterSourceConfig {
             source_id: 7,
             width: 320,
@@ -5844,12 +6119,27 @@ mod tests {
         let policy = CAPTURE_POLICY_DENY_CAPTURE
             | CAPTURE_POLICY_DENY_POSTER_RETENTION
             | CAPTURE_POLICY_REDUCE_DIAGNOSTICS;
-        let (envelope, parsed, parsed_policy) =
-            parse_create_raster_with_policy(&create_raster_with_policy(5, &raster, policy))
-                .unwrap();
+        let descriptor = SourceDescriptor {
+            role: SOURCE_ROLE_DOCUMENT,
+            title: "Quarterly report".into(),
+            content_revision: 17,
+            semantic_availability: SEMANTIC_AVAILABLE_TEXT
+                | SEMANTIC_AVAILABLE_LINKS
+                | SEMANTIC_AVAILABLE_OUTLINE,
+            locator: "vvrd-control:source-7".into(),
+        };
+        let (envelope, parsed, parsed_policy, parsed_descriptor) =
+            parse_create_raster_with_extensions(&create_raster_with_extensions(
+                5,
+                &raster,
+                policy,
+                Some(&descriptor),
+            ))
+            .unwrap();
         assert_eq!(envelope.request_id, 5);
         assert_eq!(parsed.source_id, 7);
         assert_eq!(parsed_policy, policy);
+        assert_eq!(parsed_descriptor, Some(descriptor.clone()));
 
         let image = ImageSourceConfig {
             source_id: 8,
@@ -5860,10 +6150,15 @@ mod tests {
             sha256: Some([7; 32]),
         };
         assert_eq!(
-            parse_create_image_with_policy(&create_image_with_policy(9, &image, policy))
-                .unwrap()
-                .2,
-            policy
+            parse_create_image_with_extensions(&create_image_with_extensions(
+                9,
+                &image,
+                policy,
+                Some(&descriptor),
+            ))
+            .unwrap()
+            .3,
+            Some(descriptor.clone())
         );
         let video = VideoSourceConfig {
             source_id: 9,
@@ -5886,10 +6181,15 @@ mod tests {
             decoder_config: None,
         };
         assert_eq!(
-            parse_create_video_with_policy(&create_video_with_policy(10, &video, policy))
-                .unwrap()
-                .2,
-            policy
+            parse_create_video_with_extensions(&create_video_with_extensions(
+                10,
+                &video,
+                policy,
+                Some(&descriptor),
+            ))
+            .unwrap()
+            .3,
+            Some(descriptor.clone())
         );
         let audio = AudioSourceConfig {
             source_id: 10,
@@ -5905,10 +6205,15 @@ mod tests {
             codec_string: None,
         };
         assert_eq!(
-            parse_create_audio_with_policy(&create_audio_with_policy(11, &audio, policy))
-                .unwrap()
-                .2,
-            policy
+            parse_create_audio_with_extensions(&create_audio_with_extensions(
+                11,
+                &audio,
+                policy,
+                Some(&descriptor),
+            ))
+            .unwrap()
+            .3,
+            Some(descriptor.clone())
         );
 
         let (envelope, source_id, parsed_policy) =
@@ -5916,6 +6221,10 @@ mod tests {
         assert_eq!(envelope.request_id, 6);
         assert_eq!(source_id, 7);
         assert_eq!(parsed_policy, CAPTURE_POLICY_MASK);
+        let (envelope, source_id, updated_descriptor) =
+            parse_update_source_descriptor(&update_source_descriptor(12, 7, &descriptor)).unwrap();
+        assert_eq!((envelope.request_id, source_id), (12, 7));
+        assert_eq!(updated_descriptor, descriptor);
 
         assert!(
             parse_create_raster_with_policy(&create_raster_with_policy(
@@ -5928,10 +6237,20 @@ mod tests {
         assert!(
             parse_set_source_policy(&set_source_policy(8, 7, CAPTURE_POLICY_MASK + 1)).is_err()
         );
+
+        let mut oversized = descriptor.clone();
+        oversized.title = "界".repeat(86);
+        assert!(validate_source_descriptor(&oversized).is_err());
+        oversized = descriptor.clone();
+        oversized.locator = "x".repeat(MAX_SOURCE_DESCRIPTOR_LOCATOR_BYTES + 1);
+        assert!(validate_source_descriptor(&oversized).is_err());
+        oversized = descriptor;
+        oversized.semantic_availability = SEMANTIC_AVAILABILITY_MASK + 1;
+        assert!(validate_source_descriptor(&oversized).is_err());
     }
 
     #[test]
-    fn probes_reject_source_policy_and_nonzero_source_ids() {
+    fn probes_reject_source_policy_descriptors_and_nonzero_source_ids() {
         let base = VideoSourceConfig {
             source_id: 0,
             codec: "h264",
@@ -5958,6 +6277,22 @@ mod tests {
                 2,
                 &base,
                 CAPTURE_POLICY_DENY_CAPTURE,
+            ))
+            .is_err()
+        );
+        let descriptor = SourceDescriptor {
+            role: SOURCE_ROLE_TIMED_MEDIA,
+            title: String::new(),
+            content_revision: 1,
+            semantic_availability: 0,
+            locator: String::new(),
+        };
+        assert!(
+            parse_probe_video_config(&create_video_with_extensions(
+                2,
+                &base,
+                0,
+                Some(&descriptor),
             ))
             .is_err()
         );
@@ -6566,7 +6901,9 @@ mod tests {
             outstanding_byte_credit: 4096,
             outstanding_packet_credit: 4,
             ingress_queue_depth: QUEUE_DEPTH_LOW,
-            descriptor: Some(Value::Map(vec![(0, Value::Unsigned(1))])),
+            descriptor: Some(ReportedSourceDescriptor::RoleOnly {
+                role: SOURCE_ROLE_DOCUMENT,
+            }),
             playback: Some(PlaybackSnapshot {
                 state: PLAYBACK_PLAYING,
                 clock_pts_us: 53,
@@ -6643,10 +6980,13 @@ mod tests {
         assert_eq!(parse_scene_status(&encoded).unwrap(), (2, status));
 
         let mut oversized = sample_source_status();
-        oversized.descriptor = Some(Value::Map(vec![(
-            0,
-            Value::Text("x".repeat(MAX_STATUS_REPLY_BODY)),
-        )]));
+        oversized.descriptor = Some(ReportedSourceDescriptor::Full(SourceDescriptor {
+            role: SOURCE_ROLE_DOCUMENT,
+            title: "x".repeat(MAX_STATUS_REPLY_BODY),
+            content_revision: 1,
+            semantic_availability: 0,
+            locator: String::new(),
+        }));
         assert!(source_status(3, &oversized).is_err());
     }
 
