@@ -38,6 +38,8 @@ DISPLAY_CHANGED = 0x0008
 CREATE_IMAGE = 0x0102
 SOURCE_READY = 0x0105
 SOURCE_LOST = 0x0108
+WAIT_SOURCE = 0x010F
+WAIT_SATISFIED = 0x0110
 BEGIN_TXN = 0x0200
 CREATE_NODE = 0x0201
 COMMIT_TXN = 0x0204
@@ -54,6 +56,9 @@ FEATURE_GRID_CELL_NODES = 4
 FEATURE_CREDIT_FLOW_CONTROL = 5
 FEATURE_ENCODED_IMAGE = 7
 FEATURE_TEXT_ANCHORS = 13
+FEATURE_OBSERVABILITY_CORE = 18
+
+WAIT_FIRST_VISIBLE_PRESENTATION = 2
 
 # Image and scene constants.
 IMAGE_PNG = 1
@@ -473,12 +478,12 @@ class VividImageClient:
             FEATURE_CREDIT_FLOW_CONTROL,
             FEATURE_TEXT_ANCHORS,
         ]
-        optional = [FEATURE_ENCODED_IMAGE]
+        optional = [FEATURE_ENCODED_IMAGE, FEATURE_OBSERVABILITY_CORE]
         payload = {
             0: 1,
-            1: 0,
+            1: 1,
             2: 1,
-            3: 0,
+            3: 1,
             4: token,
             5: "vivid-python-image-demo",
             6: "demo",
@@ -491,7 +496,7 @@ class VividImageClient:
         self.display = welcome
         _positive_int(welcome, 0, "session ID")
         self.root_context_id = _positive_int(welcome, 2, "root context ID")
-        if welcome.get(13) != 1 or welcome.get(14) != 0:
+        if welcome.get(13) != 1 or welcome.get(14) != 1:
             raise VividError("presenter selected an unsupported Vivid version")
         session_tag = welcome.get(1)
         features = welcome.get(15)
@@ -691,6 +696,32 @@ class VividImageClient:
         finally:
             media.close()
 
+    def wait_until_visible(self, source_id: int, timeout_seconds: float = 10.0) -> None:
+        if FEATURE_OBSERVABILITY_CORE not in self.accepted_features:
+            return
+        request_id = self._request_id()
+        timeout_us = int(timeout_seconds * 1_000_000)
+        self.control.send_record(
+            WAIT_SOURCE,
+            source_id,
+            envelope(
+                request_id,
+                {
+                    0: source_id,
+                    1: WAIT_FIRST_VISIBLE_PRESENTATION,
+                    3: timeout_us,
+                },
+            ),
+        )
+        _, satisfied = self._wait_for(
+            {WAIT_SATISFIED}, request_id=request_id, object_id=source_id
+        )
+        if (
+            satisfied.get(0) != source_id
+            or satisfied.get(2) != WAIT_FIRST_VISIBLE_PRESENTATION
+        ):
+            raise VividError("presenter satisfied the wrong image milestone")
+
     def goodbye(self) -> None:
         request_id = self._request_id()
         self.control.send_record(GOODBYE, 0, envelope(request_id, {}))
@@ -725,6 +756,7 @@ def display_image(path: Path, scale: float) -> None:
         client.place_image(source.source_id, anchor_id, columns, rows)
         _write_terminal(b"\r\n" * rows)
         client.send_image(source, image)
+        client.wait_until_visible(source.source_id)
         client.goodbye()
     finally:
         client.close()
