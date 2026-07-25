@@ -164,45 +164,138 @@ pub struct AudioPacket<'a> {
     pub data: &'a [u8],
 }
 
-pub fn audio_packet_body(packet: AudioPacket<'_>) -> io::Result<Vec<u8>> {
-    let capacity = AUDIO_PACKET_PREFIX_SIZE
-        .checked_add(packet.data.len())
+pub fn audio_packet_prefix(packet: &AudioPacket<'_>) -> io::Result<[u8; AUDIO_PACKET_PREFIX_SIZE]> {
+    packet
+        .data
+        .len()
+        .checked_add(AUDIO_PACKET_PREFIX_SIZE)
+        .and_then(|length| u32::try_from(length).ok())
+        .filter(|length| *length <= HARD_MAX_RECORD_BODY)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "audio packet too large"))?;
+    let mut prefix = [0_u8; AUDIO_PACKET_PREFIX_SIZE];
+    put_u32(&mut prefix, 0, packet.epoch);
+    put_u32(&mut prefix, 4, 0);
+    put_u64(&mut prefix, 8, packet.packet_id);
+    put_i64(&mut prefix, 16, packet.pts_us);
+    put_i64(&mut prefix, 24, packet.dts_us);
+    put_u64(&mut prefix, 32, packet.duration_us);
+    put_u32(&mut prefix, 40, packet.trim_start_samples);
+    put_u32(&mut prefix, 44, packet.trim_end_samples);
+    Ok(prefix)
+}
+
+pub fn audio_packet_body(packet: AudioPacket<'_>) -> io::Result<Vec<u8>> {
+    let prefix = audio_packet_prefix(&packet)?;
+    let capacity = prefix.len() + packet.data.len();
     let mut body = Vec::with_capacity(capacity);
-    push_u32(&mut body, packet.epoch);
-    push_u32(&mut body, 0);
-    push_u64(&mut body, packet.packet_id);
-    push_i64(&mut body, packet.pts_us);
-    push_i64(&mut body, packet.dts_us);
-    push_u64(&mut body, packet.duration_us);
-    push_u32(&mut body, packet.trim_start_samples);
-    push_u32(&mut body, packet.trim_end_samples);
+    body.extend_from_slice(&prefix);
     body.extend_from_slice(packet.data);
     Ok(body)
 }
 
-pub fn video_packet_body(packet: VideoPacket<'_>) -> io::Result<Vec<u8>> {
-    let capacity = VIDEO_PACKET_PREFIX_SIZE
-        .checked_add(packet.data.len())
+pub fn video_packet_prefix(packet: &VideoPacket<'_>) -> io::Result<[u8; VIDEO_PACKET_PREFIX_SIZE]> {
+    packet
+        .data
+        .len()
+        .checked_add(VIDEO_PACKET_PREFIX_SIZE)
+        .and_then(|length| u32::try_from(length).ok())
+        .filter(|length| *length <= HARD_MAX_RECORD_BODY)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "video packet too large"))?;
-    let mut body = Vec::with_capacity(capacity);
-    push_u32(&mut body, packet.epoch);
-    push_u32(
-        &mut body,
+    let mut prefix = [0_u8; VIDEO_PACKET_PREFIX_SIZE];
+    put_u32(&mut prefix, 0, packet.epoch);
+    put_u32(
+        &mut prefix,
+        4,
         if packet.key {
             VIDEO_PACKET_KEY
         } else {
             VIDEO_PACKET_DELTA
         },
     );
-    push_u64(&mut body, packet.packet_id);
-    push_i64(&mut body, packet.pts_us);
-    push_i64(&mut body, packet.dts_us);
-    push_u64(&mut body, packet.duration_us);
-    push_u32(&mut body, 0); // side data length
-    push_u32(&mut body, 0); // reserved
+    put_u64(&mut prefix, 8, packet.packet_id);
+    put_i64(&mut prefix, 16, packet.pts_us);
+    put_i64(&mut prefix, 24, packet.dts_us);
+    put_u64(&mut prefix, 32, packet.duration_us);
+    put_u32(&mut prefix, 40, 0);
+    put_u32(&mut prefix, 44, 0);
+    Ok(prefix)
+}
+
+pub fn video_packet_body(packet: VideoPacket<'_>) -> io::Result<Vec<u8>> {
+    let prefix = video_packet_prefix(&packet)?;
+    let capacity = prefix.len() + packet.data.len();
+    let mut body = Vec::with_capacity(capacity);
+    body.extend_from_slice(&prefix);
     body.extend_from_slice(packet.data);
     Ok(body)
+}
+
+pub fn raster_full_frame_prefix(
+    epoch: u32,
+    frame_id: u64,
+    width: u32,
+    height: u32,
+    data_len: usize,
+) -> io::Result<[u8; RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE]> {
+    let expected_length = rgba8_pixel_len(width, height)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        as usize;
+    if data_len != expected_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("RGBA data has {data_len} bytes, expected {expected_length}"),
+        ));
+    }
+    rgba8_raw_frame_body_len(width, height)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    raster_full_frame_prefix_inner(epoch, frame_id, width, height, data_len, false)
+}
+
+fn raster_full_frame_prefix_inner(
+    epoch: u32,
+    frame_id: u64,
+    width: u32,
+    height: u32,
+    data_len: usize,
+    compressed: bool,
+) -> io::Result<[u8; RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE]> {
+    if width == 0 || height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raster dimensions are empty",
+        ));
+    }
+    let data_len = u32::try_from(data_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raster frame exceeds u32 length",
+        )
+    })?;
+    data_len
+        .checked_add((RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE) as u32)
+        .filter(|length| *length <= HARD_MAX_RECORD_BODY)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raster frame too large"))?;
+
+    let mut prefix = [0_u8; RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE];
+    put_u32(&mut prefix, 0, epoch);
+    put_u32(
+        &mut prefix,
+        4,
+        RASTER_FRAME_FULL | if compressed { RASTER_FRAME_ZSTD } else { 0 },
+    );
+    put_u64(&mut prefix, 8, frame_id);
+    put_u64(&mut prefix, 16, 0);
+    put_i64(&mut prefix, 24, 0);
+    put_u64(&mut prefix, 32, 0);
+    put_u32(&mut prefix, 40, 1);
+    put_u32(&mut prefix, 44, 0);
+    put_u32(&mut prefix, 48, 0);
+    put_u32(&mut prefix, 52, 0);
+    put_u32(&mut prefix, 56, width);
+    put_u32(&mut prefix, 60, height);
+    put_u32(&mut prefix, 64, 0);
+    put_u32(&mut prefix, 68, data_len);
+    Ok(prefix)
 }
 
 pub fn raster_frame_body(
@@ -254,32 +347,10 @@ pub fn raster_frame_body_with_compression(
     } else {
         rgba
     };
-    let data_length = u32::try_from(pixels.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "raster frame exceeds u32 length",
-        )
-    })?;
-
-    let mut body = Vec::with_capacity(RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE + pixels.len());
-    push_u32(&mut body, epoch);
-    push_u32(
-        &mut body,
-        RASTER_FRAME_FULL | if compress { RASTER_FRAME_ZSTD } else { 0 },
-    );
-    push_u64(&mut body, frame_id);
-    push_u64(&mut body, 0); // no base frame
-    push_i64(&mut body, 0); // PTS
-    push_u64(&mut body, 0); // unknown duration
-    push_u32(&mut body, 1); // one rectangle
-    push_u32(&mut body, 0); // reserved
-
-    push_u32(&mut body, 0); // x
-    push_u32(&mut body, 0); // y
-    push_u32(&mut body, width);
-    push_u32(&mut body, height);
-    push_u32(&mut body, 0); // data offset from rectangle-data area
-    push_u32(&mut body, data_length);
+    let prefix =
+        raster_full_frame_prefix_inner(epoch, frame_id, width, height, pixels.len(), compress)?;
+    let mut body = Vec::with_capacity(prefix.len() + pixels.len());
+    body.extend_from_slice(&prefix);
     body.extend_from_slice(pixels);
     Ok(body)
 }
@@ -628,16 +699,16 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_be_bytes());
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
 }
 
-fn push_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_be_bytes());
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
 }
 
-fn push_i64(bytes: &mut Vec<u8>, value: i64) {
-    bytes.extend_from_slice(&value.to_be_bytes());
+fn put_i64(bytes: &mut [u8], offset: usize, value: i64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
 }
 
 #[cfg(test)]
@@ -663,6 +734,64 @@ mod tests {
             VIDEO_PACKET_KEY
         );
         assert_eq!(&body[48..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn borrowed_prefixes_match_owned_media_bodies() {
+        let video = VideoPacket {
+            epoch: 3,
+            packet_id: 11,
+            pts_us: 20,
+            dts_us: 18,
+            duration_us: 16_667,
+            key: false,
+            data: &[1, 2, 3, 4],
+        };
+        let video_prefix = video_packet_prefix(&video).unwrap();
+        let video_body = video_packet_body(VideoPacket {
+            epoch: video.epoch,
+            packet_id: video.packet_id,
+            pts_us: video.pts_us,
+            dts_us: video.dts_us,
+            duration_us: video.duration_us,
+            key: video.key,
+            data: video.data,
+        })
+        .unwrap();
+        assert_eq!([video_prefix.as_slice(), video.data].concat(), video_body);
+
+        let audio = AudioPacket {
+            epoch: 4,
+            packet_id: 12,
+            pts_us: 30,
+            dts_us: 28,
+            duration_us: 20_000,
+            trim_start_samples: 32,
+            trim_end_samples: 16,
+            data: &[5, 6, 7],
+        };
+        let audio_prefix = audio_packet_prefix(&audio).unwrap();
+        let audio_body = audio_packet_body(AudioPacket {
+            epoch: audio.epoch,
+            packet_id: audio.packet_id,
+            pts_us: audio.pts_us,
+            dts_us: audio.dts_us,
+            duration_us: audio.duration_us,
+            trim_start_samples: audio.trim_start_samples,
+            trim_end_samples: audio.trim_end_samples,
+            data: audio.data,
+        })
+        .unwrap();
+        assert_eq!([audio_prefix.as_slice(), audio.data].concat(), audio_body);
+
+        let pixels = [8; 24];
+        let raster_prefix = raster_full_frame_prefix(5, 13, 3, 2, pixels.len()).unwrap();
+        let raster_body = raster_frame_body(5, 13, 3, 2, &pixels).unwrap();
+        assert_eq!(
+            [raster_prefix.as_slice(), pixels.as_slice()].concat(),
+            raster_body
+        );
+        assert!(raster_full_frame_prefix(5, 13, 3, 2, pixels.len() - 1).is_err());
     }
 
     #[test]

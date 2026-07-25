@@ -85,6 +85,14 @@ impl Encoder {
         self.bytes
     }
 
+    pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.bytes.clear();
+    }
+
     pub fn map(&mut self, length: usize) {
         self.major_length(5, length as u64);
     }
@@ -156,9 +164,18 @@ impl std::error::Error for EncodeError {}
 
 /// Encode a value using the canonical Vivid CBOR subset.
 pub fn encode(value: &Value) -> Result<Vec<u8>, EncodeError> {
-    let mut encoder = Encoder::new();
-    encode_value(&mut encoder, value, 0)?;
-    Ok(encoder.into_vec())
+    let mut output = Vec::new();
+    encode_into(&mut output, value)?;
+    Ok(output)
+}
+
+/// Encode a value into a reusable caller-owned buffer.
+pub fn encode_into(output: &mut Vec<u8>, value: &Value) -> Result<(), EncodeError> {
+    let mut encoder = Encoder::from_vec(std::mem::take(output));
+    encoder.clear();
+    let result = encode_value(&mut encoder, value, 0);
+    *output = encoder.into_vec();
+    result
 }
 
 fn encode_value(encoder: &mut Encoder, value: &Value, depth: usize) -> Result<(), EncodeError> {
@@ -455,6 +472,20 @@ mod tests {
     fn generic_encoder_rejects_unsorted_maps() {
         let value = Value::Map(vec![(1, Value::Unsigned(0)), (0, Value::Unsigned(0))]);
         assert!(encode(&value).is_err());
+    }
+
+    #[test]
+    fn generic_encoder_reuses_caller_buffer() {
+        let value = Value::Map(vec![(0, Value::Unsigned(42))]);
+        let mut output = Vec::with_capacity(32);
+        let allocation = output.as_ptr();
+        encode_into(&mut output, &value).unwrap();
+        assert_eq!(output, [0xa1, 0, 0x18, 42]);
+        assert_eq!(output.as_ptr(), allocation);
+
+        encode_into(&mut output, &Value::Bool(true)).unwrap();
+        assert_eq!(output, [0xf5]);
+        assert_eq!(output.as_ptr(), allocation);
     }
 
     #[test]

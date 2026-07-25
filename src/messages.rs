@@ -1257,8 +1257,20 @@ pub fn flush(request_id: u64, source_id: u64, epoch: u32) -> Vec<u8> {
 }
 
 pub fn visibility(source_id: u64, visible: bool, reasons: u64, generation: u64) -> Vec<u8> {
+    let mut output = Vec::new();
+    visibility_into(&mut output, source_id, visible, reasons, generation);
+    output
+}
+
+pub fn visibility_into(
+    output: &mut Vec<u8>,
+    source_id: u64,
+    visible: bool,
+    reasons: u64,
+    generation: u64,
+) {
     let _ = source_id;
-    envelope(0, None, None, |encoder| {
+    envelope_into(output, 0, None, None, |encoder| {
         encoder.map(3);
         encoder.u64(0);
         encoder.bool(visible);
@@ -1295,7 +1307,13 @@ pub fn source_lost(source_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
 }
 
 pub fn ok(request_id: u64) -> Vec<u8> {
-    envelope(request_id, None, None, |encoder| encoder.map(0))
+    let mut output = Vec::new();
+    ok_into(&mut output, request_id);
+    output
+}
+
+pub fn ok_into(output: &mut Vec<u8>, request_id: u64) {
+    envelope_into(output, request_id, None, None, |encoder| encoder.map(0));
 }
 
 pub fn error(request_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
@@ -1311,12 +1329,38 @@ pub fn error(request_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
 }
 
 pub fn credit(bytes: u64, packets: u64, fragments: u64) -> Vec<u8> {
-    envelope(0, None, None, |encoder| {
+    let mut output = Vec::new();
+    credit_into(&mut output, bytes, packets, fragments);
+    output
+}
+
+pub fn credit_into(output: &mut Vec<u8>, bytes: u64, packets: u64, fragments: u64) {
+    envelope_into(output, 0, None, None, |encoder| {
         encoder.map(3);
         key_u64(encoder, 0, bytes);
         key_u64(encoder, 1, packets);
         key_u64(encoder, 2, fragments);
-    })
+    });
+}
+
+pub fn ping(request_id: u64) -> Vec<u8> {
+    let mut output = Vec::new();
+    ping_into(&mut output, request_id);
+    output
+}
+
+pub fn ping_into(output: &mut Vec<u8>, request_id: u64) {
+    envelope_into(output, request_id, None, None, |encoder| encoder.map(0));
+}
+
+pub fn pong(request_id: u64) -> Vec<u8> {
+    let mut output = Vec::new();
+    pong_into(&mut output, request_id);
+    output
+}
+
+pub fn pong_into(output: &mut Vec<u8>, request_id: u64) {
+    envelope_into(output, request_id, None, None, |encoder| encoder.map(0));
 }
 
 pub fn key_input(usage: u16, pressed: bool) -> Vec<u8> {
@@ -2469,7 +2513,26 @@ fn envelope(
     expected_generation: Option<u64>,
     payload: impl FnOnce(&mut Encoder),
 ) -> Vec<u8> {
-    let mut encoder = Encoder::new();
+    let mut output = Vec::new();
+    envelope_into(
+        &mut output,
+        request_id,
+        transaction_id,
+        expected_generation,
+        payload,
+    );
+    output
+}
+
+fn envelope_into(
+    output: &mut Vec<u8>,
+    request_id: u64,
+    transaction_id: Option<u64>,
+    expected_generation: Option<u64>,
+    payload: impl FnOnce(&mut Encoder),
+) {
+    let mut encoder = Encoder::from_vec(std::mem::take(output));
+    encoder.clear();
     let field_count =
         2 + usize::from(transaction_id.is_some()) + usize::from(expected_generation.is_some());
     encoder.map(field_count);
@@ -2482,7 +2545,7 @@ fn envelope(
     }
     encoder.u64(3);
     payload(&mut encoder);
-    encoder.into_vec()
+    *output = encoder.into_vec();
 }
 
 fn decode_envelope(body: &[u8]) -> io::Result<(u64, Value)> {
@@ -3113,6 +3176,35 @@ mod tests {
         );
         assert_eq!(negotiate_features(&[1, 99], &[], supported), Err(99));
         assert_eq!(negotiate_features(&[], &[99], supported), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn hot_control_encoders_reuse_buffers_and_preserve_golden_bytes() {
+        let mut output = Vec::with_capacity(128);
+        let allocation = output.as_ptr();
+
+        credit_into(&mut output, 1, 2, 3);
+        assert_eq!(output, [0xa2, 0, 0, 3, 0xa3, 0, 1, 1, 2, 2, 3]);
+        assert_eq!(output, credit(1, 2, 3));
+        assert_eq!(output.as_ptr(), allocation);
+
+        visibility_into(&mut output, 7, true, 2, 3);
+        assert_eq!(output, [0xa2, 0, 0, 3, 0xa3, 0, 0xf5, 1, 2, 2, 3]);
+        assert_eq!(output, visibility(7, true, 2, 3));
+        assert_eq!(output.as_ptr(), allocation);
+
+        ok_into(&mut output, 9);
+        assert_eq!(output, [0xa2, 0, 9, 3, 0xa0]);
+        assert_eq!(output, ok(9));
+        assert_eq!(output.as_ptr(), allocation);
+
+        ping_into(&mut output, 10);
+        assert_eq!(output, [0xa2, 0, 10, 3, 0xa0]);
+        assert_eq!(output, ping(10));
+        pong_into(&mut output, 10);
+        assert_eq!(output, [0xa2, 0, 10, 3, 0xa0]);
+        assert_eq!(output, pong(10));
+        assert_eq!(output.as_ptr(), allocation);
     }
 
     #[test]
