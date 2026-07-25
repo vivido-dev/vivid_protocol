@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
 use super::cbor::{self, Encoder, PreservedField, PreservingMap, Value};
@@ -177,6 +177,47 @@ pub const ERROR_CONTEXT_REVOKED: u64 = 17;
 pub const ERROR_DECODER: u64 = 18;
 pub const ERROR_DEVICE_LOST: u64 = 19;
 pub const ERROR_TIMEOUT: u64 = 20;
+pub const ERROR_PRECONDITION_FAILED: u64 = 21;
+pub const ERROR_ALREADY_APPLIED: u64 = 22;
+pub const ERROR_NOT_VISIBLE: u64 = 23;
+pub const ERROR_CANCELLED: u64 = 24;
+
+pub const MAX_ERROR_DETAIL_BYTES: usize = 4096;
+
+pub const ERROR_DETAIL_LIMIT_ID: u64 = 0;
+pub const ERROR_DETAIL_CURRENT: u64 = 1;
+pub const ERROR_DETAIL_MAXIMUM: u64 = 2;
+pub const ERROR_DETAIL_SCENE_REVISION: u64 = 3;
+pub const ERROR_DETAIL_SOURCE_REVISION: u64 = 4;
+pub const ERROR_DETAIL_SOURCE_EPOCH: u64 = 5;
+pub const ERROR_DETAIL_PRECONDITION_KIND: u64 = 6;
+pub const ERROR_DETAIL_RETRYABLE: u64 = 7;
+pub const ERROR_DETAIL_RETRY_DELAY_US: u64 = 8;
+pub const ERROR_DETAIL_IDEMPOTENT_OUTCOME: u64 = 9;
+pub const ERROR_DETAIL_OFFENDING_PAYLOAD_KEY: u64 = 10;
+pub const ERROR_DETAIL_SUPPORTED_MAJOR: u64 = 11;
+pub const ERROR_DETAIL_SUPPORTED_MINOR: u64 = 12;
+
+pub const LIMIT_CONCURRENT_SESSIONS: u64 = 1;
+pub const LIMIT_CONCURRENT_CONNECTIONS: u64 = 2;
+pub const LIMIT_SOURCES: u64 = 3;
+pub const LIMIT_NODES: u64 = 4;
+pub const LIMIT_OPEN_TRANSACTIONS: u64 = 5;
+pub const LIMIT_ACTIVE_ANCHORS: u64 = 6;
+pub const LIMIT_SEEN_ANCHOR_IDS: u64 = 7;
+pub const LIMIT_CONTROL_RECORD_BODY: u64 = 8;
+pub const LIMIT_MEDIA_RECORD_BODY: u64 = 9;
+pub const LIMIT_SOURCE_DIMENSION: u64 = 10;
+pub const LIMIT_DECODED_OR_POSTER_PIXELS: u64 = 11;
+pub const LIMIT_MEDIA_BYTE_CREDIT_WINDOW: u64 = 12;
+pub const LIMIT_MEDIA_PACKET_CREDIT_WINDOW: u64 = 13;
+pub const LIMIT_PENDING_CORRELATED_REQUESTS: u64 = 14;
+pub const LIMIT_REGISTERED_WAITS: u64 = 15;
+pub const LIMIT_IDEMPOTENCY_MAP_ENTRIES: u64 = 16;
+pub const LIMIT_CONTEXTS: u64 = 17;
+pub const LIMIT_DELTA_OPERATIONS_PER_FRAME: u64 = 18;
+pub const LIMIT_RASTER_DAMAGE_BUDGET: u64 = 19;
+pub const LIMIT_ENCODED_IMAGE_CACHE_BUDGET: u64 = 20;
 
 pub const PIXEL_FORMAT_RGBA8: u64 = 1;
 pub const ALPHA_STRAIGHT: u64 = 1;
@@ -301,8 +342,130 @@ pub struct ErrorReply {
     pub code: u64,
     pub request_id: u64,
     pub fatal: bool,
+    pub detail: ErrorDetail,
     pub supported_version: Option<(u64, u64)>,
     pub diagnostic: String,
+}
+
+/// Numeric-only structured `ERROR` detail (specification section 14.2).
+///
+/// Keeping the value vocabulary closed prevents diagnostics, paths, tokens, tickets, hashes,
+/// media, and other secret-bearing byte or text values from entering the machine-readable map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorDetailValue {
+    Unsigned(u64),
+    Bool(bool),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ErrorDetail {
+    fields: BTreeMap<u64, ErrorDetailValue>,
+}
+
+impl ErrorDetail {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn limit(identifier: u64, current: u64, maximum: u64) -> Self {
+        let mut detail = Self::new();
+        detail.insert_u64(ERROR_DETAIL_LIMIT_ID, identifier);
+        detail.insert_u64(ERROR_DETAIL_CURRENT, current);
+        detail.insert_u64(ERROR_DETAIL_MAXIMUM, maximum);
+        detail
+    }
+
+    pub fn supported_version(major: u64, minor: u64) -> Self {
+        let mut detail = Self::new();
+        detail.insert_u64(ERROR_DETAIL_SUPPORTED_MAJOR, major);
+        detail.insert_u64(ERROR_DETAIL_SUPPORTED_MINOR, minor);
+        detail
+    }
+
+    pub fn insert_u64(&mut self, key: u64, value: u64) -> Option<ErrorDetailValue> {
+        self.fields.insert(key, ErrorDetailValue::Unsigned(value))
+    }
+
+    pub fn insert_bool(&mut self, key: u64, value: bool) -> Option<ErrorDetailValue> {
+        self.fields.insert(key, ErrorDetailValue::Bool(value))
+    }
+
+    pub fn get_u64(&self, key: u64) -> Option<u64> {
+        match self.fields.get(&key) {
+            Some(ErrorDetailValue::Unsigned(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn get_bool(&self, key: u64) -> Option<bool> {
+        match self.fields.get(&key) {
+            Some(ErrorDetailValue::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u64, ErrorDetailValue)> + '_ {
+        self.fields.iter().map(|(key, value)| (*key, *value))
+    }
+
+    fn encoded(&self) -> io::Result<Vec<u8>> {
+        let entries = self
+            .iter()
+            .map(|(key, value)| {
+                validate_error_detail_field(key, value)?;
+                let value = match value {
+                    ErrorDetailValue::Unsigned(value) => Value::Unsigned(value),
+                    ErrorDetailValue::Bool(value) => Value::Bool(value),
+                };
+                Ok((key, value))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let encoded = cbor::encode(&Value::Map(entries)).map_err(invalid_data)?;
+        if encoded.len() > MAX_ERROR_DETAIL_BYTES {
+            return Err(invalid("ERROR detail map exceeds 4,096 encoded bytes"));
+        }
+        Ok(encoded)
+    }
+
+    fn parse(value: &Value) -> io::Result<Self> {
+        let Value::Map(entries) = value else {
+            return Err(invalid("ERROR detail is not a map"));
+        };
+        let encoded = cbor::encode(value).map_err(invalid_data)?;
+        if encoded.len() > MAX_ERROR_DETAIL_BYTES {
+            return Err(invalid("ERROR detail map exceeds 4,096 encoded bytes"));
+        }
+        let mut detail = Self::new();
+        for (key, value) in entries {
+            let value = match value {
+                Value::Unsigned(value) => ErrorDetailValue::Unsigned(*value),
+                Value::Bool(value) => ErrorDetailValue::Bool(*value),
+                _ => return Err(invalid("ERROR detail value is not numeric or boolean")),
+            };
+            validate_error_detail_field(*key, value)?;
+            detail.fields.insert(*key, value);
+        }
+        Ok(detail)
+    }
+}
+
+fn validate_error_detail_field(key: u64, value: ErrorDetailValue) -> io::Result<()> {
+    let valid = if key == ERROR_DETAIL_RETRYABLE {
+        matches!(value, ErrorDetailValue::Bool(_))
+    } else if key <= ERROR_DETAIL_SUPPORTED_MINOR {
+        matches!(value, ErrorDetailValue::Unsigned(_))
+    } else {
+        true
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid("ERROR detail value has the wrong registered type"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1237,6 +1400,26 @@ pub fn welcome(
     display: DisplayChanged,
     accepted_features: &[u64],
 ) -> Vec<u8> {
+    welcome_preserving(
+        request_id,
+        session_id,
+        session_tag,
+        root_context_id,
+        display,
+        accepted_features,
+        &[],
+    )
+}
+
+pub fn welcome_preserving(
+    request_id: u64,
+    session_id: u64,
+    session_tag: &[u8; 16],
+    root_context_id: u64,
+    display: DisplayChanged,
+    accepted_features: &[u64],
+    preserved_fields: &[PreservedField],
+) -> Vec<u8> {
     const BASE_PROFILES: &[&str] = &[
         PROFILE_AUDIO_ACCESS_UNIT,
         PROFILE_IMAGE_PNG_JPEG,
@@ -1270,7 +1453,7 @@ pub fn welcome(
             selected_minor: u64::from(VIVID_MINOR),
             accepted_features,
             initial_scene_revision: 0,
-            preserved_fields: &[],
+            preserved_fields,
         },
     )
 }
@@ -1465,32 +1648,43 @@ pub fn ok_into(output: &mut Vec<u8>, request_id: u64) {
 }
 
 pub fn error(request_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
-    envelope(request_id, None, None, |encoder| {
-        encoder.map(4);
+    error_with_detail(request_id, code, false, &ErrorDetail::new(), diagnostic)
+        .expect("an empty ERROR detail map is always encodable")
+}
+
+pub fn error_with_detail(
+    request_id: u64,
+    code: u64,
+    fatal: bool,
+    detail: &ErrorDetail,
+    diagnostic: &str,
+) -> io::Result<Vec<u8>> {
+    let encoded_detail = (!detail.is_empty()).then(|| detail.encoded()).transpose()?;
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(4 + usize::from(encoded_detail.is_some()));
         key_u64(encoder, 0, code);
         key_u64(encoder, 1, request_id);
+        if let Some(detail) = &encoded_detail {
+            encoder.u64(2);
+            encoder.canonical_value(detail);
+        }
         encoder.u64(4);
-        encoder.bool(false);
+        encoder.bool(fatal);
         encoder.u64(5);
         encoder.text(truncate_utf8(diagnostic, 4096));
-    })
+    }))
 }
 
 /// Encode the one fatal session-level error permitted before `HELLO`.
 pub fn unsupported_version_error() -> Vec<u8> {
-    envelope(0, None, None, |encoder| {
-        encoder.map(5);
-        key_u64(encoder, 0, ERROR_UNSUPPORTED_VERSION);
-        key_u64(encoder, 1, 0);
-        encoder.u64(2);
-        encoder.map(2);
-        key_u64(encoder, 11, u64::from(VIVID_MAJOR));
-        key_u64(encoder, 12, u64::from(VIVID_MINOR));
-        encoder.u64(4);
-        encoder.bool(true);
-        encoder.u64(5);
-        encoder.text("unsupported Vivid version");
-    })
+    error_with_detail(
+        0,
+        ERROR_UNSUPPORTED_VERSION,
+        true,
+        &ErrorDetail::supported_version(u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR)),
+        "unsupported Vivid version",
+    )
+    .expect("the supported-version ERROR detail is bounded")
 }
 
 pub fn credit(bytes: u64, packets: u64, fragments: u64) -> Vec<u8> {
@@ -2610,20 +2804,27 @@ pub fn parse_error_reply(body: &[u8]) -> io::Result<ErrorReply> {
         .map_value(4)
         .and_then(Value::as_bool)
         .ok_or_else(|| invalid("missing error fatal flag"))?;
-    let supported_version = match payload.map_value(2) {
-        Some(detail) => {
-            reject_unknown_fields(detail, &[11, 12])?;
-            Some((
-                required_u64(detail, 11, "supported Vivid major version")?,
-                required_u64(detail, 12, "supported Vivid minor version")?,
-            ))
+    let detail = match payload.map_value(2) {
+        Some(detail) => ErrorDetail::parse(detail)?,
+        None => ErrorDetail::new(),
+    };
+    let supported_version = match (
+        detail.get_u64(ERROR_DETAIL_SUPPORTED_MAJOR),
+        detail.get_u64(ERROR_DETAIL_SUPPORTED_MINOR),
+    ) {
+        (Some(major), Some(minor)) => Some((major, minor)),
+        (None, None) => None,
+        _ => {
+            return Err(invalid(
+                "ERROR supported version detail is missing its major or minor",
+            ));
         }
-        None => None,
     };
     Ok(ErrorReply {
         code,
         request_id,
         fatal,
+        detail,
         supported_version,
         diagnostic: diagnostic.to_owned(),
     })
@@ -3455,9 +3656,65 @@ mod tests {
         assert_eq!(parsed.request_id, 0);
         assert!(parsed.fatal);
         assert_eq!(
+            parsed.detail.get_u64(ERROR_DETAIL_SUPPORTED_MAJOR),
+            Some(u64::from(VIVID_MAJOR))
+        );
+        assert_eq!(
             parsed.supported_version,
             Some((u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR)))
         );
+    }
+
+    #[test]
+    fn error_detail_round_trips_and_is_capped_before_encode() {
+        let detail = ErrorDetail::limit(LIMIT_SOURCES, 64, 64);
+        let encoded = error_with_detail(
+            9,
+            ERROR_LIMIT_EXCEEDED,
+            false,
+            &detail,
+            "source quota exceeded",
+        )
+        .unwrap();
+        let parsed = parse_error_reply(&encoded).unwrap();
+        assert_eq!(parsed.detail, detail);
+        assert_eq!(
+            parsed.detail.get_u64(ERROR_DETAIL_LIMIT_ID),
+            Some(LIMIT_SOURCES)
+        );
+
+        let mut oversized = ErrorDetail::new();
+        for key in 100..700 {
+            oversized.insert_u64(key, u64::MAX);
+        }
+        let error =
+            error_with_detail(9, ERROR_LIMIT_EXCEEDED, false, &oversized, "bounded").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("4,096"));
+    }
+
+    #[test]
+    fn error_detail_rejects_secret_bearing_value_types() {
+        for forbidden in [
+            Value::Text("/secret/path".into()),
+            Value::Bytes(vec![0x42; 32]),
+        ] {
+            let body = cbor::encode(&Value::Map(vec![
+                (0, Value::Unsigned(5)),
+                (
+                    3,
+                    Value::Map(vec![
+                        (0, Value::Unsigned(ERROR_BAD_MESSAGE)),
+                        (1, Value::Unsigned(5)),
+                        (2, Value::Map(vec![(13, forbidden)])),
+                        (4, Value::Bool(false)),
+                        (5, Value::Text("invalid detail".into())),
+                    ]),
+                ),
+            ]))
+            .unwrap();
+            assert!(parse_error_reply(&body).is_err());
+        }
     }
 
     #[test]
