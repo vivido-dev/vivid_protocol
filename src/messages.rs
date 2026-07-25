@@ -284,6 +284,10 @@ pub const QUEUE_DEPTH_MODERATE: u64 = 2;
 pub const QUEUE_DEPTH_HIGH: u64 = 3;
 pub const QUEUE_DEPTH_CAPACITY: u64 = 4;
 
+pub const ANCHOR_STATE_UNKNOWN: u64 = 0;
+pub const ANCHOR_STATE_READY: u64 = 1;
+pub const ANCHOR_STATE_GONE: u64 = 2;
+
 pub const WAIT_SOURCE_REVISION: u64 = 1;
 pub const WAIT_FIRST_VISIBLE_PRESENTATION: u64 = 2;
 pub const WAIT_RASTER_FRAME: u64 = 3;
@@ -1261,6 +1265,7 @@ pub fn hello(request_id: u64, token: &str) -> Vec<u8> {
         FEATURE_VIDEO_CONTROL_V1,
         FEATURE_AUDIO_ACCESS_UNIT_V1,
         FEATURE_DECODER_DESCRIPTION_V1,
+        FEATURE_OBSERVABILITY_CORE_V1,
     ];
     encode_hello(
         request_id,
