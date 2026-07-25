@@ -129,6 +129,15 @@ pub const FEATURE_IMAGE_CACHE_V1: u64 = 24;
 pub const FEATURE_MEDIA_ORDER_BARRIER_V1: u64 = 25;
 pub const FEATURE_CLOCK_SAMPLING_V1: u64 = 26;
 
+pub const CAPS_CHANGE_DECODER_AVAILABILITY: u64 = 1 << 0;
+pub const CAPS_CHANGE_DEVICE_AVAILABILITY: u64 = 1 << 1;
+pub const CAPS_CHANGE_PRESENTER_POLICY: u64 = 1 << 2;
+pub const CAPS_CHANGE_RESOURCE_PRESSURE: u64 = 1 << 3;
+pub const CAPS_CHANGE_REASON_MASK: u64 = CAPS_CHANGE_DECODER_AVAILABILITY
+    | CAPS_CHANGE_DEVICE_AVAILABILITY
+    | CAPS_CHANGE_PRESENTER_POLICY
+    | CAPS_CHANGE_RESOURCE_PRESSURE;
+
 pub const AUTHENTICATION_WINDOW_ROOT: u64 = 0;
 pub const AUTHENTICATION_DELEGATED_CONTEXT: u64 = 1;
 
@@ -2038,6 +2047,31 @@ pub fn welcome_preserving_at_scene_revision(
     initial_scene_revision: SceneRevision,
     preserved_fields: &[PreservedField],
 ) -> Vec<u8> {
+    welcome_preserving_at_generations(
+        request_id,
+        session_id,
+        session_tag,
+        root_context_id,
+        display,
+        accepted_features,
+        1,
+        initial_scene_revision,
+        preserved_fields,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn welcome_preserving_at_generations(
+    request_id: u64,
+    session_id: u64,
+    session_tag: &[u8; 16],
+    root_context_id: u64,
+    display: DisplayChanged,
+    accepted_features: &[u64],
+    capability_generation: u64,
+    initial_scene_revision: SceneRevision,
+    preserved_fields: &[PreservedField],
+) -> Vec<u8> {
     const BASE_PROFILES: &[&str] = &[
         PROFILE_AUDIO_ACCESS_UNIT,
         PROFILE_IMAGE_PNG_JPEG,
@@ -2063,7 +2097,7 @@ pub fn welcome_preserving_at_scene_revision(
             session_id,
             session_tag,
             root_context_id,
-            capability_generation: 1,
+            capability_generation,
             display,
             maximum_control_body: super::CONTROL_MAX_RECORD_BODY,
             accepted_profiles: &profiles,
@@ -2327,7 +2361,8 @@ pub fn source_lost_with_observability(
 }
 
 pub fn caps_changed(capability_generation: u64, reason_mask: u64) -> io::Result<Vec<u8>> {
-    if capability_generation == 0 || reason_mask & !0x0f != 0 {
+    if capability_generation == 0 || reason_mask == 0 || reason_mask & !CAPS_CHANGE_REASON_MASK != 0
+    {
         return Err(invalid(
             "CAPS_CHANGED contains an invalid generation or reason mask",
         ));
@@ -4098,7 +4133,10 @@ pub fn parse_caps_changed(body: &[u8]) -> io::Result<CapsChanged> {
         capability_generation: required_u64(&envelope.payload, 0, "capability generation")?,
         reason_mask: required_u64(&envelope.payload, 1, "capability change reason")?,
     };
-    if changed.capability_generation == 0 || changed.reason_mask & !0x0f != 0 {
+    if changed.capability_generation == 0
+        || changed.reason_mask == 0
+        || changed.reason_mask & !CAPS_CHANGE_REASON_MASK != 0
+    {
         return Err(invalid(
             "CAPS_CHANGED contains an invalid generation or reason mask",
         ));
