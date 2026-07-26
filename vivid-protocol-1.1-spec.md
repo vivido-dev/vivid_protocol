@@ -1165,8 +1165,17 @@ Reason values are:
 | 2 | Decoder error or lost decoder state |
 | 3 | Invalid discontinuity/epoch transition |
 | 4 | Device or renderer reset |
+| 5 | Packet loss before decoding at a transport or relay; decoder state is otherwise intact |
 
 The presenter discards unusable delta packets and waits for a key packet at the stated epoch or a greater epoch. This recovery is source-scoped.
+
+For reason 5, the presenter MUST set the minimum acceptable epoch to the source's current epoch.
+The producer resumes at the next key packet in the current epoch or a greater epoch and is not
+required to send `FLUSH`. This does not make a key packet available sooner; it avoids discarding
+otherwise valid playback and decoder state while the producer advances to the next natural random
+access point.
+
+A producer that does not recognize a reason value MUST treat it as reason 2.
 
 `NEED_FULL_FRAME` requires `RASTER_DELTA_V1`, is unsolicited, uses request ID zero, and identifies the source in both the record object ID and payload key 0:
 
@@ -2469,7 +2478,7 @@ Transport and discovery, the record header, record flags, the CBOR profile, scen
 | §7.4 | Raster update mode 1 and operation limit |
 | §7.5 | `CREATE_IMAGE` cache-lookup flag |
 | §7.6 | `SOURCE_READY` window advertisement, initial revision, cache-hit form; source replacement sequence |
-| §7.8 | `PLAY` admission semantics; EOS media-order barrier; `NEED_FULL_FRAME` |
+| §7.8 | `PLAY` admission semantics; EOS media-order barrier; `NEED_FULL_FRAME`; transport-loss keyframe recovery |
 | §7.13, §7.14 | Source descriptor; capture and export policy |
 | §7.15–§7.17 | Observation configuration, change events, status queries, source waits |
 | §7.18 | Contexts and opaque delegated capabilities |
@@ -2497,7 +2506,6 @@ Vivid 1.0 §11.4 "Timing and coalescing" is Vivid 1.1 §11.5. Vivid 1.0 §12 gai
 | `CAPS_CHANGED` | Defined schema; may no longer remove an accepted feature |
 | `ERROR` | Payload key 2 is now the structured detail map |
 | `CREDIT` | Unchanged, with an explicit prohibition on delaying a credit to batch it |
-
 
 
 

@@ -229,6 +229,7 @@ pub const KEYFRAME_REASON_INITIAL: u64 = 1;
 pub const KEYFRAME_REASON_DECODER_ERROR: u64 = 2;
 pub const KEYFRAME_REASON_EPOCH_DISCONTINUITY: u64 = 3;
 pub const KEYFRAME_REASON_DEVICE_RESET: u64 = 4;
+pub const KEYFRAME_REASON_TRANSPORT_LOSS: u64 = 5;
 pub const ERROR_STALE_DISPLAY_GENERATION: u64 = 15;
 pub const ERROR_ANCHOR_GONE: u64 = 16;
 pub const ERROR_CONTEXT_REVOKED: u64 = 17;
@@ -6612,9 +6613,22 @@ mod tests {
         assert!(!parsed.visible);
         assert_eq!((parsed.reasons, parsed.display_generation), (3, 8));
 
-        let parsed =
-            parse_need_keyframe(&need_keyframe(4, 7, ERROR_DEVICE_LOST, Some(18))).unwrap();
+        let reason_five = need_keyframe(4, 7, KEYFRAME_REASON_TRANSPORT_LOSS, None);
+        assert_eq!(
+            reason_five,
+            [0xa2, 0, 0, 3, 0xa3, 0, 4, 1, 7, 2, 5],
+            "reason 5 has a stable deterministic encoding"
+        );
+        let parsed = parse_need_keyframe(&reason_five).unwrap();
         assert_eq!((parsed.source_id, parsed.minimum_epoch), (4, 7));
+        assert_eq!(parsed.reason, KEYFRAME_REASON_TRANSPORT_LOSS);
+        assert_eq!(parsed.last_packet_id, None);
+
+        let parsed = parse_need_keyframe(&need_keyframe(4, 7, 99, Some(18))).unwrap();
+        assert_eq!(
+            parsed.reason, 99,
+            "unknown reasons remain visible to consumers"
+        );
         assert_eq!(parsed.last_packet_id, Some(18));
 
         for reason in NEED_FULL_FRAME_BASE_UNAVAILABLE..=NEED_FULL_FRAME_POLICY_CHANGE {
