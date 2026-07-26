@@ -128,6 +128,7 @@ pub const FEATURE_RASTER_DELTA_V1: u64 = 23;
 pub const FEATURE_IMAGE_CACHE_V1: u64 = 24;
 pub const FEATURE_MEDIA_ORDER_BARRIER_V1: u64 = 25;
 pub const FEATURE_CLOCK_SAMPLING_V1: u64 = 26;
+pub const MAX_CLOCK_SAMPLE_PROCESSING_US: u64 = 100_000;
 
 pub const CAPS_CHANGE_DECODER_AVAILABILITY: u64 = 1 << 0;
 pub const CAPS_CHANGE_DEVICE_AVAILABILITY: u64 = 1 << 1;
@@ -541,6 +542,32 @@ pub struct DisplayChanged {
     pub cell_width: u32,
     pub cell_height: u32,
     pub settled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockPing {
+    pub request_id: u64,
+    pub sender_transmit_us: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockPongTimestamps {
+    pub echoed_sender_transmit_us: u64,
+    pub responder_receive_us: u64,
+    pub responder_transmit_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockPong {
+    pub request_id: u64,
+    pub timestamps: Option<ClockPongTimestamps>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockSample {
+    pub offset_us: i64,
+    pub delay_us: u64,
+    pub responder_processing_us: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1689,9 +1716,24 @@ pub fn create_image_with_extensions(
     capture_policy: u64,
     descriptor: Option<&SourceDescriptor>,
 ) -> Vec<u8> {
-    envelope(request_id, None, None, |encoder| {
+    create_image_with_cache_extensions(request_id, config, false, capture_policy, descriptor)
+        .expect("an image creation without cache lookup is valid")
+}
+
+pub fn create_image_with_cache_extensions(
+    request_id: u64,
+    config: &ImageSourceConfig,
+    cache_lookup: bool,
+    capture_policy: u64,
+    descriptor: Option<&SourceDescriptor>,
+) -> io::Result<Vec<u8>> {
+    if cache_lookup && config.sha256.is_none() {
+        return Err(invalid("image cache lookup requires an exact SHA-256 hash"));
+    }
+    Ok(envelope(request_id, None, None, |encoder| {
         encoder.map(
             if config.sha256.is_some() { 8 } else { 7 }
+                + usize::from(cache_lookup)
                 + usize::from(capture_policy != 0)
                 + usize::from(descriptor.is_some()),
         );
@@ -1706,6 +1748,10 @@ pub fn create_image_with_extensions(
         }
         key_u64(encoder, 6, COLOR_SPACE_SRGB);
         key_u64(encoder, 7, RETENTION_DECODED_SOURCE);
+        if cache_lookup {
+            encoder.u64(8);
+            encoder.bool(true);
+        }
         if capture_policy != 0 {
             key_u64(encoder, 9, capture_policy);
         }
@@ -1713,7 +1759,7 @@ pub fn create_image_with_extensions(
             encoder.u64(10);
             encode_source_descriptor(encoder, descriptor);
         }
-    })
+    }))
 }
 
 pub fn create_video(request_id: u64, config: &VideoSourceConfig<'_>) -> Vec<u8> {
@@ -2782,6 +2828,60 @@ pub fn ok_into(output: &mut Vec<u8>, request_id: u64) {
     envelope_into(output, request_id, None, None, |encoder| encoder.map(0));
 }
 
+pub fn clock_ping(request_id: u64, sender_transmit_us: Option<u64>) -> io::Result<Vec<u8>> {
+    if request_id == 0 {
+        return Err(invalid("PING request ID is zero"));
+    }
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(usize::from(sender_transmit_us.is_some()));
+        if let Some(timestamp) = sender_transmit_us {
+            key_u64(encoder, 0, timestamp);
+        }
+    }))
+}
+
+pub fn clock_pong(request_id: u64, timestamps: Option<ClockPongTimestamps>) -> io::Result<Vec<u8>> {
+    if request_id == 0 {
+        return Err(invalid("PONG request ID is zero"));
+    }
+    if timestamps.is_some_and(|timestamps| {
+        timestamps.responder_transmit_us < timestamps.responder_receive_us
+    }) {
+        return Err(invalid("PONG responder clock moved backward"));
+    }
+    Ok(envelope(request_id, None, None, |encoder| {
+        encoder.map(3 * usize::from(timestamps.is_some()));
+        if let Some(timestamps) = timestamps {
+            key_u64(encoder, 0, timestamps.echoed_sender_transmit_us);
+            key_u64(encoder, 1, timestamps.responder_receive_us);
+            key_u64(encoder, 2, timestamps.responder_transmit_us);
+        }
+    }))
+}
+
+pub fn calculate_clock_sample(
+    sender_transmit_us: u64,
+    responder_receive_us: u64,
+    responder_transmit_us: u64,
+    sender_receive_us: u64,
+    maximum_processing_us: u64,
+) -> Option<ClockSample> {
+    let local_round_trip = sender_receive_us.checked_sub(sender_transmit_us)?;
+    let responder_processing = responder_transmit_us.checked_sub(responder_receive_us)?;
+    if responder_processing > maximum_processing_us || responder_processing > local_round_trip {
+        return None;
+    }
+    let delay_us = local_round_trip - responder_processing;
+    let offset_twice = (i128::from(responder_receive_us) - i128::from(sender_transmit_us))
+        + (i128::from(responder_transmit_us) - i128::from(sender_receive_us));
+    let offset_us = i64::try_from(offset_twice / 2).ok()?;
+    Some(ClockSample {
+        offset_us,
+        delay_us,
+        responder_processing_us: responder_processing,
+    })
+}
+
 pub fn error(request_id: u64, code: u64, diagnostic: &str) -> Vec<u8> {
     error_with_detail(request_id, code, false, &ErrorDetail::new(), diagnostic)
         .expect("an empty ERROR detail map is always encodable")
@@ -3007,6 +3107,53 @@ pub fn decode_control(body: &[u8]) -> io::Result<ControlEnvelope> {
         preconditions,
         idempotency_key,
         causation_id,
+    })
+}
+
+pub fn parse_clock_ping(body: &[u8]) -> io::Result<ClockPing> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0])?;
+    if envelope.request_id == 0 {
+        return Err(invalid("PING request ID is zero"));
+    }
+    Ok(ClockPing {
+        request_id: envelope.request_id,
+        sender_transmit_us: optional_u64(&envelope.payload, 0, "PING sender transmit time")?,
+    })
+}
+
+pub fn parse_clock_pong(body: &[u8]) -> io::Result<ClockPong> {
+    let envelope = decode_control(body)?;
+    reject_unknown_fields(&envelope.payload, &[0, 1, 2])?;
+    if envelope.request_id == 0 {
+        return Err(invalid("PONG request ID is zero"));
+    }
+    let values = [
+        optional_u64(&envelope.payload, 0, "PONG echoed sender time")?,
+        optional_u64(&envelope.payload, 1, "PONG responder receive time")?,
+        optional_u64(&envelope.payload, 2, "PONG responder transmit time")?,
+    ];
+    let timestamps = match values {
+        [None, None, None] => None,
+        [Some(echoed), Some(receive), Some(transmit)] if transmit >= receive => {
+            Some(ClockPongTimestamps {
+                echoed_sender_transmit_us: echoed,
+                responder_receive_us: receive,
+                responder_transmit_us: transmit,
+            })
+        }
+        [Some(_), Some(_), Some(_)] => {
+            return Err(invalid("PONG responder clock moved backward"));
+        }
+        _ => {
+            return Err(invalid(
+                "PONG timestamp fields must be all present or all absent",
+            ));
+        }
+    };
+    Ok(ClockPong {
+        request_id: envelope.request_id,
+        timestamps,
     })
 }
 
@@ -3306,14 +3453,14 @@ pub fn parse_create_raster_with_update_extensions(
 }
 
 pub fn parse_create_image(body: &[u8]) -> io::Result<(ControlEnvelope, ImageSourceConfig)> {
-    parse_create_image_with_policy(body).map(|(envelope, config, _)| (envelope, config))
+    parse_create_image_with_extensions(body).map(|(envelope, config, _, _, _)| (envelope, config))
 }
 
 pub fn parse_create_image_with_policy(
     body: &[u8],
 ) -> io::Result<(ControlEnvelope, ImageSourceConfig, u64)> {
     parse_create_image_with_extensions(body)
-        .map(|(envelope, config, policy, _)| (envelope, config, policy))
+        .map(|(envelope, config, _, policy, _)| (envelope, config, policy))
 }
 
 pub fn parse_create_image_with_extensions(
@@ -3321,12 +3468,13 @@ pub fn parse_create_image_with_extensions(
 ) -> io::Result<(
     ControlEnvelope,
     ImageSourceConfig,
+    bool,
     u64,
     Option<SourceDescriptor>,
 )> {
     let envelope = decode_control(body)?;
     let payload = &envelope.payload;
-    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 9, 10])?;
+    reject_unknown_fields(payload, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
     let hash = payload
         .map_value(5)
         .map(|value| {
@@ -3358,13 +3506,23 @@ pub fn parse_create_image_with_extensions(
     {
         return Err(invalid("unsupported encoded-image configuration"));
     }
+    let cache_lookup = match payload.map_value(8) {
+        None => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => {
+            return Err(invalid("image cache lookup must be absent or true"));
+        }
+    };
+    if cache_lookup && config.sha256.is_none() {
+        return Err(invalid("image cache lookup requires an exact SHA-256 hash"));
+    }
     let capture_policy = optional_u64(payload, 9, "capture policy")?.unwrap_or(0);
     validate_capture_policy(capture_policy)?;
     let descriptor = payload
         .map_value(10)
         .map(parse_source_descriptor)
         .transpose()?;
-    Ok((envelope, config, capture_policy, descriptor))
+    Ok((envelope, config, cache_lookup, capture_policy, descriptor))
 }
 
 pub fn parse_create_video(body: &[u8]) -> io::Result<(ControlEnvelope, ParsedVideoSourceConfig)> {
@@ -6436,6 +6594,20 @@ mod tests {
         assert_eq!(parsed.source_id, image.source_id);
         assert_eq!(parsed.sha256, image.sha256);
 
+        let cached = create_image_with_cache_extensions(2, &image, true, 0, None).unwrap();
+        let (_, parsed, cache_lookup, policy, descriptor) =
+            parse_create_image_with_extensions(&cached).unwrap();
+        assert_eq!(parsed, image);
+        assert!(cache_lookup);
+        assert_eq!(policy, 0);
+        assert_eq!(descriptor, None);
+
+        let unhashed = ImageSourceConfig {
+            sha256: None,
+            ..image.clone()
+        };
+        assert!(create_image_with_cache_extensions(2, &unhashed, true, 0, None).is_err());
+
         let parsed = parse_visibility(&visibility(4, false, 3, 8)).unwrap();
         assert!(!parsed.visible);
         assert_eq!((parsed.reasons, parsed.display_generation), (3, 8));
@@ -6546,7 +6718,7 @@ mod tests {
                 Some(&descriptor),
             ))
             .unwrap()
-            .3,
+            .4,
             Some(descriptor.clone())
         );
         let video = VideoSourceConfig {
@@ -7125,6 +7297,65 @@ mod tests {
         assert_eq!(minimum_buffer_for_rtt(90_000, Some(10_000)), 90_000);
         assert_eq!(minimum_buffer_for_rtt(10_000, Some(50_000)), 125_000);
         assert_eq!(minimum_buffer_for_rtt(10_000, Some(u64::MAX)), 500_000);
+    }
+
+    #[test]
+    fn timestamped_ping_pong_and_four_timestamp_sample_are_strict() {
+        let ping = parse_clock_ping(&clock_ping(7, Some(1_000)).unwrap()).unwrap();
+        assert_eq!(
+            ping,
+            ClockPing {
+                request_id: 7,
+                sender_transmit_us: Some(1_000)
+            }
+        );
+        let pong = parse_clock_pong(
+            &clock_pong(
+                7,
+                Some(ClockPongTimestamps {
+                    echoed_sender_transmit_us: 1_000,
+                    responder_receive_us: 1_500,
+                    responder_transmit_us: 1_600,
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pong.timestamps.unwrap(),
+            ClockPongTimestamps {
+                echoed_sender_transmit_us: 1_000,
+                responder_receive_us: 1_500,
+                responder_transmit_us: 1_600,
+            }
+        );
+        assert_eq!(
+            calculate_clock_sample(1_000, 1_500, 1_600, 1_300, 100_000),
+            Some(ClockSample {
+                offset_us: 400,
+                delay_us: 200,
+                responder_processing_us: 100,
+            })
+        );
+        assert!(calculate_clock_sample(1_000, 1_500, 1_600, 999, 100_000).is_none());
+        assert!(calculate_clock_sample(1_000, 1_500, 1_600, 1_300, 99).is_none());
+
+        let partial = envelope(7, None, None, |encoder| {
+            encoder.map(1);
+            key_u64(encoder, 0, 1_000);
+        });
+        assert!(parse_clock_pong(&partial).is_err());
+        assert!(
+            clock_pong(
+                7,
+                Some(ClockPongTimestamps {
+                    echoed_sender_transmit_us: 1_000,
+                    responder_receive_us: 2,
+                    responder_transmit_us: 1,
+                })
+            )
+            .is_err()
+        );
     }
 
     #[test]
