@@ -25,7 +25,12 @@ The crate provides:
 - deterministic, bounded CBOR with byte-exact negotiation-extension preservation, typed
   control-message schemas, complete `PlayRequest` parsing, and conservative RTT-based
   initial-buffer calculation;
+- checked revision types, structured numeric error detail, observation/query/wait schemas,
+  preconditions and idempotency metadata, delegated contexts, source descriptors, and capture
+  policy;
 - raw/zstd RGBA raster, straight or premultiplied alpha, and PNG/JPEG image bodies;
+- retained raster-delta validation (overwrites and overlap-safe copies), image-cache negotiation,
+  ordered EOS barriers, and rolling credit-window advertisements;
 - portable H.264/HEVC/VP9/AV1 video and MP3/AAC/ALAC/PCM/Opus/Vorbis/FLAC audio access units,
   including media sequence and trim metadata validation;
 - canonical OpusHead, Xiph-laced Vorbis-header, and raw FLAC STREAMINFO validators;
@@ -54,6 +59,11 @@ Public modules:
 - `media` — raster, image, portable-video, and portable-audio binary contracts;
 - `anchor` — token decoding, session-key derivation, and text-anchor authentication.
 
+The complete public registry and feature prerequisites are normative in
+[`vivid-protocol-1.1-spec.md`](vivid-protocol-1.1-spec.md). Numeric assignments are append-only:
+new behavior must not reuse an old feature, record type, connection kind, envelope/payload key,
+error code, or limit ID.
+
 ## Python image demo
 
 [`examples/vivid_image.py`](examples/vivid_image.py) is a self-contained producer that displays a
@@ -80,8 +90,11 @@ entries byte-for-byte so relays do not erase future negotiation extensions. The 
 Rust 1.85 compatibility.
 
 `PLAY` carries start PTS, minimum buffer, maximum latency, 32.32 rate, late policy, loop count, and
-start policy. `PING`/`PONG` are bidirectional correlated session records. Playback telemetry,
-derived media tickets, audio batching, and alternate packet framing are not part of Vivid 1.1.
+start policy. Admission is distinct from the authoritative `PLAYBACK_STATE` transition.
+`PING`/`PONG` are bidirectional correlated records and may carry diagnostic four-timestamp clock
+samples. Source/scene/anchor/limit queries, bounded observations with explicit gaps, milestones,
+and cancellation-safe source waits are part of 1.1 when `OBSERVABILITY_CORE_V1` is negotiated.
+Derived media tickets, generic audio batching, and alternate packet framing are not part of 1.1.
 
 ## License
 

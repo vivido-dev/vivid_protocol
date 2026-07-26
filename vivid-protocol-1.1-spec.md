@@ -1,7 +1,6 @@
 # Vivid Protocol 1.1 Specification
 
-**Status:** draft normative Vivi/Vivido interoperable profile. This document is expected to change
-during implementation; it is not frozen.
+**Status:** normative Vivi/Vivido interoperable profile.
 **Vivid version:** 1.1
 **Compatibility:** Vivid 1.1 only. Vivid 1.1 is a coordinated ecosystem cutover, not a negotiated
 upgrade from Vivid 1.0.
@@ -2506,6 +2505,5 @@ Vivid 1.0 §11.4 "Timing and coalescing" is Vivid 1.1 §11.5. Vivid 1.0 §12 gai
 | `CAPS_CHANGED` | Defined schema; may no longer remove an accepted feature |
 | `ERROR` | Payload key 2 is now the structured detail map |
 | `CREDIT` | Unchanged, with an explicit prohibition on delaying a credit to batch it |
-
 
 
