@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use super::super::{BenchmarkReport, Distribution, PathMetrics};
+use super::super::{BenchmarkReport, Distribution, PathMetrics, Stage4Evidence};
 
 pub fn write(path: &Path, report: &BenchmarkReport) -> io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -66,6 +66,7 @@ pub fn write(path: &Path, report: &BenchmarkReport) -> io::Result<()> {
         "    \"memory\": \"bounded receive-buffer retention and scenario queue high-water model\""
     )?;
     writeln!(output, "  }},")?;
+    write_stage4(&mut output, &report.stage4)?;
     writeln!(output, "  \"scenarios\": [")?;
     for (index, result) in report.results.iter().enumerate() {
         writeln!(output, "    {{")?;
@@ -219,6 +220,56 @@ pub fn write(path: &Path, report: &BenchmarkReport) -> io::Result<()> {
     writeln!(output, "  }}")?;
     writeln!(output, "}}")?;
     output.flush()
+}
+
+fn write_stage4(output: &mut impl Write, evidence: &Stage4Evidence) -> io::Result<()> {
+    writeln!(output, "  \"stage4\": {{")?;
+    writeln!(
+        output,
+        "    \"mode\": {},",
+        json_string(evidence.mode.label())
+    )?;
+    writeln!(output, "    \"gate_passed\": {},", evidence.gate_passed)?;
+    writeln!(
+        output,
+        "    \"disabled_overhead\": {{\"additional_media_records\": {}, \
+         \"additional_media_fields\": {}, \"additional_hot_path_allocations\": {}, \
+         \"additional_syscalls\": {}}},",
+        evidence.additional_media_records,
+        evidence.additional_media_fields,
+        evidence.additional_hot_path_allocations,
+        evidence.additional_syscalls,
+    )?;
+    writeln!(
+        output,
+        "    \"full_frame_paths_unchanged\": {},",
+        evidence.full_frame_paths_unchanged
+    )?;
+    writeln!(
+        output,
+        "    \"vvrd_scroll\": {{\"full_wire_bytes\": {}, \"optimized_wire_bytes\": {}, \
+         \"full_upload_pixels\": {}, \"optimized_upload_pixels\": {}}},",
+        evidence.scroll_full_bytes,
+        evidence.scroll_optimized_bytes,
+        evidence.scroll_full_upload_pixels,
+        evidence.scroll_optimized_upload_pixels,
+    )?;
+    writeln!(
+        output,
+        "    \"vvrd_search_highlight\": {{\"full_wire_bytes\": {}, \
+         \"optimized_wire_bytes\": {}, \"full_upload_pixels\": {}, \
+         \"optimized_upload_pixels\": {}}},",
+        evidence.search_full_bytes,
+        evidence.search_optimized_bytes,
+        evidence.search_full_upload_pixels,
+        evidence.search_optimized_upload_pixels,
+    )?;
+    writeln!(
+        output,
+        "    \"repeated_image\": {{\"logical_presentations\": {}, \"encoded_uploads\": {}}}",
+        evidence.repeated_image_count, evidence.repeated_image_uploads,
+    )?;
+    writeln!(output, "  }},")
 }
 
 fn write_metrics(

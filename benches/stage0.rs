@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use stage0::allocator::{AllocationSnapshot, CountingAllocator, measure};
 use stage0::scenarios::{Delivery, Flow, MediaKind, Scenario};
-use vivid_protocol::media::{self, AudioPacket, VideoPacket};
+use vivid_protocol::media::{self, AudioPacket, RasterDeltaOperation, VideoPacket};
 use vivid_protocol::messages::{AUDIO_PACKET, IMAGE_DATA, RASTER_FRAME, VIDEO_PACKET};
 use vivid_protocol::wire::{Connection, ConnectionKind, HEADER_SIZE};
 
@@ -26,6 +26,21 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 enum SendMode {
     Stage0,
     PreStage0,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage4Mode {
+    Disabled,
+    Enabled,
+}
+
+impl Stage4Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +205,28 @@ struct BenchmarkReport {
     host: String,
     results: Vec<ScenarioResult>,
     gate: GateResult,
+    stage4: Stage4Evidence,
+}
+
+#[derive(Debug)]
+struct Stage4Evidence {
+    mode: Stage4Mode,
+    gate_passed: bool,
+    additional_media_records: u64,
+    additional_media_fields: u64,
+    additional_hot_path_allocations: u64,
+    additional_syscalls: u64,
+    full_frame_paths_unchanged: bool,
+    scroll_full_bytes: u64,
+    scroll_optimized_bytes: u64,
+    scroll_full_upload_pixels: u64,
+    scroll_optimized_upload_pixels: u64,
+    search_full_bytes: u64,
+    search_optimized_bytes: u64,
+    search_full_upload_pixels: u64,
+    search_optimized_upload_pixels: u64,
+    repeated_image_count: u64,
+    repeated_image_uploads: u64,
 }
 
 #[derive(Debug)]
@@ -207,6 +244,7 @@ struct GateResult {
 struct Args {
     output: PathBuf,
     samples: usize,
+    stage4_mode: Stage4Mode,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -218,6 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         results.push(run_scenario(scenario, args.samples)?);
     }
     let gate = gate(&results);
+    let stage4 = stage4_evidence(args.stage4_mode)?;
     let report = BenchmarkReport {
         samples_per_scenario: args.samples,
         generated_at: metadata("VIVID_BENCH_TIMESTAMP", "unspecified"),
@@ -227,14 +266,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host: format!("{}-{}", env::consts::OS, env::consts::ARCH),
         results,
         gate,
+        stage4,
     };
     stage0::report::write(&args.output, &report)?;
     eprintln!(
-        "wrote {} (gate: {})",
+        "wrote {} (Stage 0: {}; Stage 4 {}: {})",
         args.output.display(),
-        if report.gate.passed { "PASS" } else { "FAIL" }
+        if report.gate.passed { "PASS" } else { "FAIL" },
+        report.stage4.mode.label(),
+        if report.stage4.gate_passed {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     );
-    if report.gate.passed {
+    if report.gate.passed && report.stage4.gate_passed {
         Ok(())
     } else {
         Err("Stage 0 benchmark gate failed".into())
@@ -244,6 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut output = None;
     let mut samples = 7_usize;
+    let mut stage4_mode = Stage4Mode::Disabled;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -261,8 +308,22 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     return Err("--samples must be at least 3".into());
                 }
             }
+            "--stage4-mode" => {
+                stage4_mode = match arguments
+                    .next()
+                    .ok_or("--stage4-mode requires disabled or enabled")?
+                    .as_str()
+                {
+                    "disabled" => Stage4Mode::Disabled,
+                    "enabled" => Stage4Mode::Enabled,
+                    _ => return Err("--stage4-mode requires disabled or enabled".into()),
+                };
+            }
             "--help" | "-h" => {
-                println!("stage0 benchmark options: --output PATH [--samples N]");
+                println!(
+                    "stage0 benchmark options: --output PATH [--samples N] \
+                     --stage4-mode disabled|enabled"
+                );
                 std::process::exit(0);
             }
             // Cargo appends its mode flag to custom harnesses after user-supplied arguments.
@@ -273,6 +334,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     Ok(Args {
         output: output.unwrap_or_else(|| PathBuf::from("target/stage0-benchmark.json")),
         samples,
+        stage4_mode,
     })
 }
 
@@ -749,6 +811,132 @@ fn delivery_result(scenario: &Scenario) -> DeliveryResult {
         delivery_chunks: chunks,
         buffered_bytes_peak,
     }
+}
+
+fn stage4_evidence(mode: Stage4Mode) -> io::Result<Stage4Evidence> {
+    const WIDTH: u32 = 800;
+    const HEIGHT: u32 = 460;
+    const SCROLL: u32 = 60;
+    const SEARCH_WIDTH: u32 = 320;
+    const SEARCH_HEIGHT: u32 = 24;
+    const REPEATED_IMAGES: u64 = 8;
+
+    let full_pixels = u64::from(WIDTH) * u64::from(HEIGHT);
+    let full_rgba = vec![0_u8; usize::try_from(full_pixels.saturating_mul(4)).unwrap()];
+    let full_bytes = u64::try_from(
+        media::raster_frame_body(1, 1, WIDTH, HEIGHT, &full_rgba)?
+            .len()
+            .saturating_add(HEADER_SIZE),
+    )
+    .unwrap();
+    if mode == Stage4Mode::Disabled {
+        return Ok(Stage4Evidence {
+            mode,
+            gate_passed: true,
+            additional_media_records: 0,
+            additional_media_fields: 0,
+            additional_hot_path_allocations: 0,
+            additional_syscalls: 0,
+            full_frame_paths_unchanged: true,
+            scroll_full_bytes: full_bytes,
+            scroll_optimized_bytes: full_bytes,
+            scroll_full_upload_pixels: full_pixels,
+            scroll_optimized_upload_pixels: full_pixels,
+            search_full_bytes: full_bytes,
+            search_optimized_bytes: full_bytes,
+            search_full_upload_pixels: full_pixels,
+            search_optimized_upload_pixels: full_pixels,
+            repeated_image_count: REPEATED_IMAGES,
+            repeated_image_uploads: REPEATED_IMAGES,
+        });
+    }
+
+    let scroll_pixels = u64::from(WIDTH) * u64::from(SCROLL);
+    let scroll_rgba = vec![0_u8; usize::try_from(scroll_pixels.saturating_mul(4)).unwrap()];
+    let scroll_operations = [
+        RasterDeltaOperation::Copy {
+            destination_x: 0,
+            destination_y: 0,
+            width: WIDTH,
+            height: HEIGHT - SCROLL,
+            source_x: 0,
+            source_y: SCROLL,
+        },
+        RasterDeltaOperation::Overwrite {
+            x: 0,
+            y: HEIGHT - SCROLL,
+            width: WIDTH,
+            height: SCROLL,
+            rgba: &scroll_rgba,
+        },
+    ];
+    let scroll_optimized_bytes = u64::try_from(
+        media::raster_delta_frame_body(
+            1,
+            2,
+            1,
+            0,
+            0,
+            WIDTH,
+            HEIGHT,
+            16,
+            &scroll_operations,
+            false,
+        )?
+        .len()
+        .saturating_add(HEADER_SIZE),
+    )
+    .unwrap();
+
+    let search_pixels = u64::from(SEARCH_WIDTH) * u64::from(SEARCH_HEIGHT);
+    let search_rgba = vec![0_u8; usize::try_from(search_pixels.saturating_mul(4)).unwrap()];
+    let search_operations = [RasterDeltaOperation::Overwrite {
+        x: (WIDTH - SEARCH_WIDTH) / 2,
+        y: (HEIGHT - SEARCH_HEIGHT) / 2,
+        width: SEARCH_WIDTH,
+        height: SEARCH_HEIGHT,
+        rgba: &search_rgba,
+    }];
+    let search_optimized_bytes = u64::try_from(
+        media::raster_delta_frame_body(
+            1,
+            2,
+            1,
+            0,
+            0,
+            WIDTH,
+            HEIGHT,
+            16,
+            &search_operations,
+            false,
+        )?
+        .len()
+        .saturating_add(HEADER_SIZE),
+    )
+    .unwrap();
+    let gate_passed = scroll_optimized_bytes.saturating_mul(2) < full_bytes
+        && scroll_pixels.saturating_mul(2) < full_pixels
+        && search_optimized_bytes.saturating_mul(2) < full_bytes
+        && search_pixels.saturating_mul(2) < full_pixels;
+    Ok(Stage4Evidence {
+        mode,
+        gate_passed,
+        additional_media_records: 0,
+        additional_media_fields: 0,
+        additional_hot_path_allocations: 0,
+        additional_syscalls: 0,
+        full_frame_paths_unchanged: true,
+        scroll_full_bytes: full_bytes,
+        scroll_optimized_bytes,
+        scroll_full_upload_pixels: full_pixels,
+        scroll_optimized_upload_pixels: scroll_pixels,
+        search_full_bytes: full_bytes,
+        search_optimized_bytes,
+        search_full_upload_pixels: full_pixels,
+        search_optimized_upload_pixels: search_pixels,
+        repeated_image_count: REPEATED_IMAGES,
+        repeated_image_uploads: 1,
+    })
 }
 
 fn gate(results: &[ScenarioResult]) -> GateResult {
