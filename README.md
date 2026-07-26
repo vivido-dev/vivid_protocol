@@ -1,101 +1,102 @@
 # Vivid Protocol
 
-Vivid is a secure, terminal-attached media protocol for displaying images and video and playing
-audio inside a terminal. It keeps bulk media off the terminal PTY, so ordinary terminal text stays
-separate from media transport.
+[![Crates.io](https://img.shields.io/crates/v/vivid_protocol.svg)](https://crates.io/crates/vivid_protocol)
+[![Docs.rs](https://docs.rs/vivid_protocol/badge.svg)](https://docs.rs/vivid_protocol)
+[![License](https://img.shields.io/crates/l/vivid_protocol.svg)](LICENSE)
 
-The protocol has two roles: a producer creates media sources and supplies their data, while a
-presenter owns the terminal window, authenticates producers, decodes media, manages placement, and
-renders or plays the result. A private endpoint and per-window capability token protect each
-session. Control connections handle capability negotiation, scene state, complete playback
-requests, flow control, visibility, keepalive, and recovery; source-specific media connections
-carry raster, image, video, or audio data. The PTY carries only normal terminal output and a
-bounded authenticated text-anchor marker that can bind media placement to a semantic terminal
-position. Local transports and SSH forwarding allow the same model to work for both local and
-remote producers. An optional `VIVID_ENDPOINT_BULK` selects another private endpoint for
-non-control connections without changing the wire protocol.
+**Secure, renderer-independent media scenes—from terminals to browser desktops.**
 
-`vivid_protocol` is the shared, renderer-independent Rust wire implementation used by Vivi,
-Vivido, conformance tools, and protocol tracers.
+Vivid is an open wire protocol for moving images, raster frames, encoded video, audio, and input
+between producers and presenters. The destination can be a GPU terminal, a browser canvas, a
+streamed desktop, a multiplexer, or your own renderer.
 
-The crate provides:
+Terminal integration is one Vivid deployment mode, not a requirement. A terminal presenter can
+anchor media beside text; a terminal-free presenter can attach the same retained scene directly to
+its display root.
 
-- directional connection limits, ordered record framing, endpoint parsing, split
-  `ConnectionReader`/cloneable `ConnectionWriter` handles, and the 64 MiB ceiling;
-- deterministic, bounded CBOR with byte-exact negotiation-extension preservation, typed
-  control-message schemas, complete `PlayRequest` parsing, and conservative RTT-based
-  initial-buffer calculation;
-- checked revision types, structured numeric error detail, observation/query/wait schemas,
-  preconditions and idempotency metadata, delegated contexts, source descriptors, and capture
-  policy;
-- raw/zstd RGBA raster, straight or premultiplied alpha, and PNG/JPEG image bodies;
-- retained raster-delta validation (overwrites and overlap-safe copies), image-cache negotiation,
-  ordered EOS barriers, and rolling credit-window advertisements;
-- portable H.264/HEVC/VP9/AV1 video and MP3/AAC/ALAC/PCM/Opus/Vorbis/FLAC audio access units,
-  including media sequence and trim metadata validation;
-- canonical OpusHead, Xiph-laced Vorbis-header, and raw FLAC STREAMINFO validators;
-- authenticated text anchors using base64url and HMAC-SHA256.
+## Why Vivid?
+
+- **One media model, many surfaces.** Native and WebAssembly implementations share the same
+  versioned wire contract.
+- **Media stays out of text streams.** Control and media use authenticated side channels instead
+  of escape-sequence payloads.
+- **Built for real playback.** Retained scenes, exact-PTS playback, linked audio/video, flow
+  control, visibility, recovery, and observability are part of the protocol.
+- **Secure by design.** Private endpoints, capability authentication, bounded records, and
+  source-scoped failure are core expectations—not application-specific extras.
+- **Renderer and transport independent.** Implement a producer, presenter, relay, multiplexer, or
+  language binding without adopting a particular UI stack.
+
+## See what it enables
+
+| Experience | Vivid path |
+| --- | --- |
+| Terminal-free streamed desktop | Veston or Vvsway → vvbridge → vvweb browser canvas |
+| Rich terminal media | Vivi → Vivido |
+| Browser terminal media | Vivid producer → vvbridge → vivido.js |
+| Detachable and nested sessions | Vivid producer → vvmux → Vivido |
+| Custom applications | Your producer → your presenter |
+
+The [vvweb demo](../vvweb/demo/) is the clearest terminal-free example: a native desktop producer
+streams H.264 video and linked Opus audio through an authenticated WebSocket bridge, while the
+browser renders the Vivid root scene and returns physical input. No terminal emulator, shell, or
+PTY is involved.
+
+For a small, dependency-free protocol example, see
+[`examples/vivid_image.py`](examples/vivid_image.py). It sends a retained PNG or JPEG directly to a
+Vivid presenter using only Python's standard library.
+
+## Choose your starting point
+
+**Building an application producer?** Start with
+[`vivid_sdk`](https://github.com/vivido-dev/vivid_sdk). It provides the higher-level Rust and
+Python client APIs.
+
+**Building a presenter, relay, protocol tool, or language binding?** Use this crate for the shared
+wire implementation:
 
 ```sh
 cargo add vivid_protocol
 ```
 
-```rust
-use vivid_protocol::wire::{ConnectionKind, Preface, encode_preface};
-
-let bytes = encode_preface(ConnectionKind::Control, 1024 * 1024);
-let preface = Preface::decode(bytes)?;
-assert_eq!(preface.kind, ConnectionKind::Control);
-# Ok::<(), std::io::Error>(())
-```
-
-Public modules:
-
-- `wire` — prefaces, records, split reader/writer handles, directional limits, sequencing, and
-  transports;
-- `cbor` — deterministic encoding and strict bounded decoding;
-- `messages` — the Vivid registry, control schemas, `PlayRequest`, keepalive types, and canonical
-  audio initialization validation;
-- `media` — raster, image, portable-video, and portable-audio binary contracts;
-- `anchor` — token decoding, session-key derivation, and text-anchor authentication.
-
-The complete public registry and feature prerequisites are normative in
-[`vivid-protocol-1.1-spec.md`](vivid-protocol-1.1-spec.md). Numeric assignments are append-only:
-new behavior must not reuse an old feature, record type, connection kind, envelope/payload key,
-error code, or limit ID.
-
-## Python image demo
-
-[`examples/vivid_image.py`](examples/vivid_image.py) is a self-contained producer that displays a
-PNG or JPEG directly through Vivid Protocol. It uses only the Python standard library and shows the
-complete handshake, authenticated text anchor, encoded-image source, scene transaction, media
-channel, and credit flow.
-
-Run it from a shell inside Vivido:
+For a WebAssembly target:
 
 ```sh
-python3 examples/vivid_image.py path/to/image.png
-python3 examples/vivid_image.py --scale 0.5 path/to/image.jpg
+cargo add vivid_protocol --no-default-features
 ```
 
-The demo can run directly in Vivido, through vvmux, or through `vvssh`. Generic terminal
-multiplexers that do not preserve authenticated Vivid anchors are not supported.
+The crate provides deterministic bounded CBOR, framing, typed control messages, media record
+layouts and validation, scene revisions, and authenticated terminal anchors. Native builds also
+include protocol tracing. The crate contains no renderer and does not choose your application
+architecture.
+
+API documentation is on [docs.rs](https://docs.rs/vivid_protocol).
+
+## Protocol in 30 seconds
+
+```text
+producer ── control + per-source media streams ──> presenter ──> any render surface
+```
+
+A producer creates media sources and commits retained scene updates. A presenter validates,
+buffers, schedules, and renders them. Terminal anchors are available when text-relative placement
+is useful; they are absent from terminal-free root-scene deployments.
+
+For record layouts, state machines, feature negotiation, security requirements, and interoperability
+rules, read the normative
+**[Vivid Protocol 1.1 specification](vivid-protocol-1.1-spec.md)**.
 
 ## Compatibility
 
-Vivid Protocol 1.1 uses the version-1.1 `VIVD` preface. A well-formed version mismatch receives one
-fatal, session-level `UNSUPPORTED_VERSION` record that reports the receiver's supported version;
-malformed prefaces remain a silent close. `HELLO` and `WELCOME` preserve unknown canonical CBOR
-entries byte-for-byte so relays do not erase future negotiation extensions. The crate declares
-Rust 1.85 compatibility.
+This crate implements Vivid Protocol 1.1 and requires Rust 1.85 or newer. Protocol support is
+negotiated by feature; do not infer optional behavior from the minor version alone.
 
-`PLAY` carries start PTS, minimum buffer, maximum latency, 32.32 rate, late policy, loop count, and
-start policy. Admission is distinct from the authoritative `PLAYBACK_STATE` transition.
-`PING`/`PONG` are bidirectional correlated records and may carry diagnostic four-timestamp clock
-samples. Source/scene/anchor/limit queries, bounded observations with explicit gaps, milestones,
-and cancellation-safe source waits are part of 1.1 when `OBSERVABILITY_CORE_V1` is negotiated.
-Derived media tickets, generic audio batching, and alternate packet framing are not part of 1.1.
+## Contributing
+
+New producers, presenters, transports, language bindings, and interoperability tests are welcome.
+If you are exploring a new Vivid surface, open an issue early—we would like to help make the
+integration reusable.
 
 ## License
 
-Licensed under Apache-2.0.
+Apache-2.0. See [LICENSE](LICENSE).
