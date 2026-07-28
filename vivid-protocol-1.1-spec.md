@@ -1141,7 +1141,8 @@ Barrier rules:
 - if the named record never arrives, the request completes with `TIMEOUT` after a bounded presenter-chosen interval and applies no EOS;
 - a barrier is never forwarded verbatim across a hop; a bridge computes its own generation and sequence for its own outgoing connection.
 
-EOS closes ingress. It is not an implicit `PAUSE`, and already-buffered media continues to play.
+EOS closes ingress for the addressed source only. It does not cascade from a video source to linked
+audio. It is not an implicit `PAUSE`, and already-buffered media continues to play.
 
 `DRAIN` requires `AUDIO_ACCESS_UNIT_V1` and has payload key 0 audio source ID. It returns `OK`
 only after EOS has been observed, the decoder and resampler have flushed, and all queued device
@@ -2505,5 +2506,4 @@ Vivid 1.0 §11.4 "Timing and coalescing" is Vivid 1.1 §11.5. Vivid 1.0 §12 gai
 | `CAPS_CHANGED` | Defined schema; may no longer remove an accepted feature |
 | `ERROR` | Payload key 2 is now the structured detail map |
 | `CREDIT` | Unchanged, with an explicit prohibition on delaying a credit to batch it |
-
 
