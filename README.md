@@ -86,6 +86,11 @@ For record layouts, state machines, feature negotiation, security requirements, 
 rules, read the normative
 **[Vivid Protocol 1.1 specification](vivid-protocol-1.1-spec.md)**.
 
+The intentionally breaking next-version design is the multipart
+**[Vivid Protocol 1.5 specification](vivid-protocol-1.5-spec.md)**. The crate does not implement
+1.5 yet. Implementers planning a dual-stack cutover should also read the
+**[1.1 to 1.5 migration guide](vivid-protocol-1.1-to-1.5-migration.md)**.
+
 ## Compatibility
 
 This crate implements Vivid Protocol 1.1 and requires Rust 1.85 or newer. Protocol support is
