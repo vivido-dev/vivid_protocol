@@ -34,3 +34,5 @@ pub const VIVID_MINOR: u8 = 5;
 pub const CONTROL_MAX_RECORD_BODY: u32 = 1024 * 1024;
 pub const DEFAULT_MAX_RECORD_BODY: u32 = 64 * 1024 * 1024;
 pub const HARD_MAX_RECORD_BODY: u32 = 64 * 1024 * 1024;
+/// Maximum timeout carried by one correlated `WAIT_TRACK` request.
+pub const MAX_TRACK_WAIT_TIMEOUT_US: u64 = 30_000_000;

@@ -504,6 +504,9 @@ mask. It never carries flow authority or recovery requirements.
 | 5 | uint | Timeout in microseconds |
 | 6 | uint | Required channel generation |
 
+The timeout is nonzero and at most 30 seconds. Longer application waits use successive correlated
+requests and treat each `TIMEOUT` result as an opportunity to re-evaluate current track state.
+
 Conditions are track revision greater than value (`1`), current-generation milestone set (`2`),
 presented raster frame at least value (`3`), presented video PTS at least value (`4`), playback
 started (`5`), playback ended (`6`), channel accepted (`7`), channel closed (`8`), and track lost

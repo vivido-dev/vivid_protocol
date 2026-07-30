@@ -6,6 +6,8 @@ use std::fs::{self, File};
 use std::io::{IoSlice, Read, Write};
 #[cfg(feature = "native")]
 use std::net::TcpStream;
+#[cfg(all(feature = "native", unix))]
+use std::os::unix::net::UnixStream;
 #[cfg(feature = "native")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "native")]
@@ -196,6 +198,31 @@ pub enum Endpoint {
 }
 
 #[cfg(feature = "native")]
+struct ConnectedIo {
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    establishment_read_deadline: EstablishmentReadDeadline,
+}
+
+#[cfg(feature = "native")]
+enum EstablishmentReadDeadline {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+#[cfg(feature = "native")]
+impl EstablishmentReadDeadline {
+    fn clear(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_read_timeout(None),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_read_timeout(None),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
 impl Endpoint {
     pub fn parse(value: &str) -> io::Result<Self> {
         if let Some(path) = value.strip_prefix("unix:") {
@@ -238,7 +265,7 @@ impl Endpoint {
         Ok(Self::Unix(path))
     }
 
-    fn connect(&self) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    fn connect(&self) -> io::Result<ConnectedIo> {
         match self {
             Self::Unix(path) => connect_unix(path),
             Self::Tcp(address) => {
@@ -247,25 +274,34 @@ impl Endpoint {
                 stream.set_write_timeout(Some(Duration::from_secs(30)))?;
                 stream.set_nodelay(true)?;
                 let writer = stream.try_clone()?;
-                Ok((Box::new(stream), Box::new(writer)))
+                let establishment_read_deadline =
+                    EstablishmentReadDeadline::Tcp(stream.try_clone()?);
+                Ok(ConnectedIo {
+                    reader: Box::new(stream),
+                    writer: Box::new(writer),
+                    establishment_read_deadline,
+                })
             }
         }
     }
 }
 
 #[cfg(all(feature = "native", unix))]
-fn connect_unix(path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
-    use std::os::unix::net::UnixStream;
-
+fn connect_unix(path: &Path) -> io::Result<ConnectedIo> {
     let stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let writer = stream.try_clone()?;
-    Ok((Box::new(stream), Box::new(writer)))
+    let establishment_read_deadline = EstablishmentReadDeadline::Unix(stream.try_clone()?);
+    Ok(ConnectedIo {
+        reader: Box::new(stream),
+        writer: Box::new(writer),
+        establishment_read_deadline,
+    })
 }
 
 #[cfg(all(feature = "native", not(unix)))]
-fn connect_unix(_path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+fn connect_unix(_path: &Path) -> io::Result<ConnectedIo> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Unix Vivid endpoints are not supported on this platform; named-pipe support is pending",
@@ -446,6 +482,7 @@ pub struct ConnectionReader {
     io: Box<dyn Read + Send>,
     receive_sequence: u64,
     receive_body_limit: u32,
+    establishment_read_deadline: Option<EstablishmentReadDeadline>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,6 +496,13 @@ pub struct BorrowedRecord<'a> {
 
 #[cfg(feature = "native")]
 impl ConnectionReader {
+    fn clear_establishment_read_deadline(&mut self) -> io::Result<()> {
+        if let Some(deadline) = self.establishment_read_deadline.take() {
+            deadline.clear()?;
+        }
+        Ok(())
+    }
+
     pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
         validate_body_limit(maximum)?;
         self.receive_body_limit = maximum;
@@ -547,8 +591,19 @@ impl Connection {
         major: u8,
         minor: u8,
     ) -> io::Result<Self> {
-        let (reader, writer) = endpoint.connect()?;
-        Self::new_version(Some(reader), WriterIo::Live(writer), kind, major, minor)
+        let ConnectedIo {
+            reader,
+            writer,
+            establishment_read_deadline,
+        } = endpoint.connect()?;
+        Self::new_version(
+            Some(reader),
+            Some(establishment_read_deadline),
+            WriterIo::Live(writer),
+            kind,
+            major,
+            minor,
+        )
     }
 
     /// Start an initiator-side Vivid connection over an already authenticated transport.
@@ -580,11 +635,12 @@ impl Connection {
         io: WriterIo,
         kind: ConnectionKind,
     ) -> io::Result<Self> {
-        Self::new_version(reader, io, kind, VIVID_MAJOR, VIVID_MINOR)
+        Self::new_version(reader, None, io, kind, VIVID_MAJOR, VIVID_MINOR)
     }
 
     fn new_version(
         reader: Option<Box<dyn Read + Send>>,
+        establishment_read_deadline: Option<EstablishmentReadDeadline>,
         io: WriterIo,
         kind: ConnectionKind,
         major: u8,
@@ -610,18 +666,25 @@ impl Connection {
                 io,
                 receive_sequence: 0,
                 receive_body_limit: body_limit,
+                establishment_read_deadline,
             }),
             writer,
         })
     }
 
+    /// Commit a positively established connection to its long-lived reader.
+    ///
+    /// Native endpoints use a bounded read deadline while waiting for the first positive
+    /// handshake response. Once the caller has validated that response, `split` removes that
+    /// transport deadline: ordinary protocol idleness is not a framing error or loss signal.
     pub fn split(self) -> io::Result<(ConnectionReader, ConnectionWriter)> {
-        let reader = self.reader.ok_or_else(|| {
+        let mut reader = self.reader.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "trace connections do not have presenter replies",
             )
         })?;
+        reader.clear_establishment_read_deadline()?;
         Ok((reader, self.writer))
     }
 
@@ -1155,6 +1218,64 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "native", unix))]
+    fn split_clears_the_unix_establishment_read_deadline() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let observer = stream.try_clone().unwrap();
+        let deadline = EstablishmentReadDeadline::Unix(stream.try_clone().unwrap());
+        let connection = Connection::new_version(
+            Some(Box::new(stream)),
+            Some(deadline),
+            WriterIo::Sink(io::sink()),
+            ConnectionKind::Control,
+            VIVID_MAJOR,
+            VIVID_MINOR,
+        )
+        .unwrap();
+
+        assert_eq!(
+            observer.read_timeout().unwrap(),
+            Some(Duration::from_secs(30))
+        );
+        let (reader, _writer) = connection.split().unwrap();
+        assert!(reader.establishment_read_deadline.is_none());
+        assert_eq!(observer.read_timeout().unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(all(feature = "native", not(unix)))]
+    fn split_clears_the_tcp_establishment_read_deadline() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let observer = stream.try_clone().unwrap();
+        let deadline = EstablishmentReadDeadline::Tcp(stream.try_clone().unwrap());
+        let connection = Connection::new_version(
+            Some(Box::new(stream)),
+            Some(deadline),
+            WriterIo::Sink(io::sink()),
+            ConnectionKind::Control,
+            VIVID_MAJOR,
+            VIVID_MINOR,
+        )
+        .unwrap();
+
+        assert_eq!(
+            observer.read_timeout().unwrap(),
+            Some(Duration::from_secs(30))
+        );
+        let (reader, _writer) = connection.split().unwrap();
+        assert!(reader.establishment_read_deadline.is_none());
+        assert_eq!(observer.read_timeout().unwrap(), None);
+    }
+
+    #[test]
     #[cfg(feature = "native")]
     fn cloned_writers_serialize_complete_records_and_sequences() {
         let bytes = Arc::new(Mutex::new(Vec::new()));
@@ -1316,6 +1437,7 @@ mod tests {
             io: Box::new(io::Cursor::new(input)),
             receive_sequence: 0,
             receive_body_limit: 32,
+            establishment_read_deadline: None,
         };
         let mut body = Vec::new();
         assert_eq!(reader.read_record_into(&mut body).unwrap().body, &[1; 32]);
@@ -1335,6 +1457,7 @@ mod tests {
             io: Box::new(io::Cursor::new(oversized.encode())),
             receive_sequence: 0,
             receive_body_limit: 32,
+            establishment_read_deadline: None,
         };
         let mut untouched = vec![9; 8];
         let capacity = untouched.capacity();

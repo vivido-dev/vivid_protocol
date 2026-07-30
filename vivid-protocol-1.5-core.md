@@ -451,6 +451,13 @@ modify media PTS, flow allowance, input epochs, or authority deadlines.
 Any valid inbound control record proves control liveness. Input has an independent, shorter
 watchdog in the desktop surface specification. Track flow remains channel-local.
 
+An establishment transport deadline may bound the wait for the first positive `WELCOME`,
+`LANE_ACCEPTED`, or `CHANNEL_ACCEPTED`. After that response is authenticated and validated, an
+implementation MUST remove the establishment deadline or replace it with a framing-safe
+keepalive. Protocol idleness by itself is not control, lane, or channel loss. An implementation
+MUST NOT resume ordinary record parsing after a transport timeout if the transport API does not
+preserve how much of the current header or body was consumed.
+
 `CAPS_CHANGED` reports a new capability generation and a reason mask for future track probes. It
 does not change accepted profile syntax or mutate live tracks.
 
