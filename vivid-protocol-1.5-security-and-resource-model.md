@@ -300,6 +300,15 @@ A presenter MAY enforce a stricter producer-declared per-track rate returned by 
 Exceeding a rate returns or emits `RATE_LIMITED`; repeated or material violation loses only the
 track or input grant unless policy requires session revocation.
 
+Receiver arrival timing is not proof that the producer violated its pacing contract. SSH,
+WebTransport, WebSocket, relay, and native stream scheduling can coalesce correctly paced writes
+into a later burst. A receiver MAY shape admission with the same finite token bucket and transport
+backpressure. It MUST charge byte and record buckets atomically and MUST NOT lose a track solely
+because a bounded arrival burst temporarily lacks tokens. Absolute channel flow remains the
+in-flight bound; a receiver does not return capacity for a delayed record until its storage is
+reusable. A receiver emits `RATE_LIMITED` only for a material or repeated contractual overrun that
+it can distinguish from bounded transport scheduling.
+
 The token-bucket capacity permits a bounded burst but no continuous overuse. Saturating arithmetic
 is forbidden. Counter overflow is fatal `LIMIT_EXCEEDED`.
 

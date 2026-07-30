@@ -246,7 +246,7 @@ tracks under the lease and context policy.
 and removes the active slot only if it named this track. It does not destroy the surface or its
 nodes.
 
-`TRACK_LOST` is actionable:
+`TRACK_LOST` is an actionable, uncorrelated control-connection event:
 
 | Key | Type | Meaning |
 |---:|---|---|
@@ -475,6 +475,19 @@ not change. Old tracks remain valid but inactive until destroyed.
 | 20 | uint | Ingress depth bucket |
 | 21 | map, optional | Playback state |
 | 22 | uint, optional | Terminal loss code |
+
+Keys 10 through 17 are presenter-accepted progress, not producer-submission acknowledgments.
+Control and track connections are independently ordered, including when they are carried through
+SSH forwarding, WebTransport streams, WebSocket substreams, or distinct native connections.
+Consequently, a `TRACK_STATUS` response can legitimately lag media records that the producer has
+already written. A producer MUST preserve its own track-wide increasing media ID and epoch state,
+MUST NOT move that submitted state backward to the status snapshot, and MUST NOT infer loss merely
+because accepted progress lags submitted progress. It may merge accepted IDs or epochs that are
+ahead, such as after authenticated resume and reconciliation.
+
+Key 12 is the exact wire record sequence of the last accepted media record on the current track
+connection. It is not a media-record count. `CHANNEL_EOS` remains the ordered acceptance barrier
+because it travels on that same connection.
 
 `TRACK_CHANGED` is a coalescible observation and names the current track revision and changed-field
 mask. It never carries flow authority or recovery requirements.
