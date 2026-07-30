@@ -194,7 +194,7 @@ or surfaces.
 gone (`2`), current cell, viewport intersection, and target generation. No query exposes another
 context's anchor.
 
-## 6. Suspension and poster behavior
+## 6. Suspension and post-disconnect poster behavior
 
 Terminal text and anchors belong to the presenter target, not to a child decoder. During an
 eligible lease suspension:
@@ -207,6 +207,24 @@ eligible lease suspension:
 
 If a retained anchor disappears during suspension, its nodes are removed normally. Resume status
 reports the resulting scene revision; it never recreates an anchor.
+
+After a clean `GOODBYE`, a terminal presenter MAY preserve the last rendered visual for an
+authenticated anchored node as a bounded target-native poster. Before doing so it MUST:
+
+- reject retention when the effective surface policy denies post-disconnect posters;
+- copy only the selected visual output, placement, clip, composition, capture policy, and anchor
+  relationship needed to reproduce the last presentation;
+- release the logical session, authority, contexts, surface and track state, channels, decoder
+  state, media queues, waits, and all other protocol resources; and
+- enforce a finite target-wide retained-pixel limit.
+
+The retained poster is not protocol state: it is absent from session, surface, track, scene, and
+anchor queries and receives no protocol events or presentation acknowledgements. It follows its
+complete authenticated anchor through scroll and reflow and is erased when that anchor is cleared,
+evicted, or leaves its terminal screen. Grid-positioned nodes are never retained after disconnect.
+
+An unclean root-session control loss retains no poster. Lease suspension uses the resumable rules
+above rather than this clean-closure materialization.
 
 ## 7. Multiplexers and nested terminals
 

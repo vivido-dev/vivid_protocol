@@ -429,6 +429,12 @@ input by itself.
 invalidates its lanes and channels, and applies owner-scoped cleanup. A resumable lease does not
 suspend after clean `GOODBYE`.
 
+Owner-scoped cleanup removes all addressable protocol objects, authority, waits, decoder state,
+media queues, and resource reservations. For a terminal target, this does not require erasing a
+bounded target-native poster already attached to authenticated terminal text. Such a poster is no
+longer a surface, track, scene node, or queryable session object and follows the terminal profile's
+post-disconnect rules. This exception never applies after unclean root-session loss.
+
 Either endpoint may send `PING`; the peer promptly returns `PONG` with the same request ID.
 Optional timestamp keys follow the Vivid 1.1 four-timestamp pattern:
 

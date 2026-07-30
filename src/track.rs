@@ -163,8 +163,9 @@ pub struct VideoConfiguration {
 
 impl VideoConfiguration {
     fn validate(&self) -> Result<(), MessageError> {
-        media::validate_portable_packetization(&self.codec, &self.packetization, &self.extradata)
-            .map_err(|_| invalid_value("video configuration", 1, "is not canonical"))?;
+        if !media::is_portable_packetization(&self.codec, &self.packetization) {
+            return Err(invalid_value("video configuration", 1, "is not canonical"));
+        }
         if self.extradata.len() > 65_536 {
             return Err(invalid_value(
                 "video configuration",
@@ -314,8 +315,14 @@ pub struct AudioConfiguration {
 
 impl AudioConfiguration {
     fn validate(&self) -> Result<(), MessageError> {
-        media::validate_portable_packetization(&self.codec, &self.packetization, &self.extradata)
-            .map_err(|_| invalid_value("audio configuration", 1, "is not canonical"))?;
+        media::validate_audio_initialization(
+            &self.codec,
+            &self.packetization,
+            &self.extradata,
+            self.sample_rate,
+            u16::from(self.channels),
+        )
+        .map_err(|_| invalid_value("audio configuration", 1, "is not canonical"))?;
         if self.extradata.len() > 65_536
             || !(8_000..=192_000).contains(&self.sample_rate)
             || !(1..=8).contains(&self.channels)
@@ -1029,6 +1036,44 @@ mod tests {
             target_latency_us: 50_000,
             maximum_latency_us: 250_000,
             retained_pixel_charge: 64 * 64,
+        };
+        let payload = Value::Map(configuration.payload(false).unwrap());
+        assert_eq!(
+            TrackConfiguration::decode(3, &payload, false).unwrap(),
+            configuration
+        );
+    }
+
+    #[test]
+    fn canonical_audio_track_configuration_round_trips() {
+        let mut opus_head = b"OpusHead".to_vec();
+        opus_head.extend_from_slice(&[1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]);
+        let maximum_record_body = media::audio_body_len(4_096).unwrap();
+        let configuration = TrackConfiguration {
+            context_id: 1,
+            surface_id: 2,
+            track_id: 3,
+            slot: 2,
+            mode: TrackMode::Timed,
+            lane: LaneClass::Realtime,
+            maximum_record_body,
+            maximum_rate_millihertz: 50_000,
+            maximum_encoded_bits_per_second: 512_000,
+            maximum_records_per_second: 50,
+            maximum_inflight_body_bytes: u64::from(maximum_record_body) * 4,
+            kind: KindConfiguration::Audio(AudioConfiguration {
+                codec: "opus".into(),
+                packetization: media::AUDIO_PACKETIZATION_OPUS.into(),
+                extradata: opus_head,
+                sample_rate: 48_000,
+                channels: 2,
+                channel_mask: 3,
+                maximum_access_unit_bytes: 4_096,
+                codec_string: Some("opus".into()),
+            }),
+            target_latency_us: 0,
+            maximum_latency_us: 2_000_000,
+            retained_pixel_charge: 0,
         };
         let payload = Value::Map(configuration.payload(false).unwrap());
         assert_eq!(

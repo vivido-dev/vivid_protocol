@@ -967,6 +967,294 @@ pub fn is_portable_packetization(codec: &str, packetization: &str) -> bool {
     )
 }
 
+pub const AUDIO_PACKETIZATION_OPUS: &str = "opus-packet-v1";
+pub const AUDIO_PACKETIZATION_VORBIS: &str = "vorbis-packet-v1";
+pub const AUDIO_PACKETIZATION_FLAC: &str = "flac-frame-v1";
+
+pub fn valid_audio_packetization(codec: &str, packetization: &str) -> bool {
+    match codec {
+        "mp3" => packetization == "mp3-frame-v1",
+        "aac" => packetization == "aac-raw-au-v1",
+        "alac" => packetization == "alac-frame-v1",
+        "opus" => packetization == AUDIO_PACKETIZATION_OPUS,
+        "vorbis" => packetization == AUDIO_PACKETIZATION_VORBIS,
+        "flac" => packetization == AUDIO_PACKETIZATION_FLAC,
+        "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" | "pcm_f64le"
+        | "pcm_mulaw" | "pcm_alaw" => packetization == "pcm-packet-v1",
+        _ => false,
+    }
+}
+
+pub fn validate_audio_initialization(
+    codec: &str,
+    packetization: &str,
+    extradata: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> io::Result<()> {
+    if !valid_audio_packetization(codec, packetization) || extradata.len() > 65_536 {
+        return Err(invalid("invalid portable audio initialization"));
+    }
+    match codec {
+        "opus" => validate_opus_head(extradata, sample_rate, channels),
+        "vorbis" => validate_vorbis_headers(extradata, sample_rate, channels),
+        "flac" => validate_flac_streaminfo(extradata, sample_rate, channels),
+        "aac" => validate_aac_audio_specific_config(extradata, sample_rate, channels),
+        _ => Ok(()),
+    }
+}
+
+const AAC_SAMPLE_RATES: [u32; 13] = [
+    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
+    7_350,
+];
+
+pub fn validate_aac_audio_specific_config(
+    config: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> io::Result<()> {
+    let mut reader = AscBitReader::new(config);
+    let audio_object_type = reader
+        .read_audio_object_type()
+        .ok_or_else(|| invalid("AudioSpecificConfig is truncated"))?;
+    if audio_object_type == 0 {
+        return Err(invalid("AudioSpecificConfig audio object type is null"));
+    }
+    let frequency = reader
+        .read_sampling_frequency()
+        .ok_or_else(|| invalid("AudioSpecificConfig sampling frequency is invalid"))?;
+    let channel_configuration = reader
+        .read_bits(4)
+        .ok_or_else(|| invalid("AudioSpecificConfig is truncated"))?;
+    if frequency != sample_rate && frequency.checked_mul(2) != Some(sample_rate) {
+        return Err(invalid(
+            "AudioSpecificConfig sampling frequency does not match the declared rate",
+        ));
+    }
+    let declared = u32::from(channels);
+    let configured = match channel_configuration {
+        0 => declared,
+        7 => 8,
+        other => other,
+    };
+    if configured != declared {
+        return Err(invalid(
+            "AudioSpecificConfig channel configuration does not match the declared channels",
+        ));
+    }
+    Ok(())
+}
+
+struct AscBitReader<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl<'a> AscBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, position: 0 }
+    }
+
+    fn read_bits(&mut self, count: u32) -> Option<u32> {
+        debug_assert!(count <= 24);
+        let mut value = 0_u32;
+        for _ in 0..count {
+            let byte = *self.data.get(self.position / 8)?;
+            let bit = (byte >> (7 - (self.position % 8))) & 1;
+            value = (value << 1) | u32::from(bit);
+            self.position += 1;
+        }
+        Some(value)
+    }
+
+    fn read_audio_object_type(&mut self) -> Option<u32> {
+        let base = self.read_bits(5)?;
+        if base == 31 {
+            Some(32 + self.read_bits(6)?)
+        } else {
+            Some(base)
+        }
+    }
+
+    fn read_sampling_frequency(&mut self) -> Option<u32> {
+        match self.read_bits(4)? {
+            15 => {
+                let explicit = self.read_bits(24)?;
+                (explicit > 0).then_some(explicit)
+            }
+            13 | 14 => None,
+            index => AAC_SAMPLE_RATES.get(index as usize).copied(),
+        }
+    }
+}
+
+pub fn validate_opus_head(head: &[u8], sample_rate: u32, channels: u16) -> io::Result<()> {
+    if sample_rate != 48_000 || head.len() < 19 || &head[..8] != b"OpusHead" {
+        return Err(invalid(
+            "invalid OpusHead signature, length, or decode rate",
+        ));
+    }
+    if head[8] > 15 || u16::from(head[9]) != channels || channels == 0 {
+        return Err(invalid("OpusHead version or channel count is unsupported"));
+    }
+    match head[18] {
+        0 if head.len() == 19 && channels <= 2 => Ok(()),
+        1 => {
+            let expected = 21_usize
+                .checked_add(usize::from(channels))
+                .ok_or_else(|| invalid("OpusHead channel mapping length overflow"))?;
+            if head.len() != expected {
+                return Err(invalid(
+                    "OpusHead family-1 channel mapping length is invalid",
+                ));
+            }
+            let streams = head[19];
+            let coupled = head[20];
+            let coded_channels = streams.checked_add(coupled).unwrap_or(0);
+            if streams == 0
+                || coupled > streams
+                || coded_channels == 0
+                || u16::from(coded_channels) > channels
+                || head[21..]
+                    .iter()
+                    .any(|mapping| *mapping != 255 && *mapping >= coded_channels)
+            {
+                return Err(invalid("OpusHead family-1 mapping is invalid"));
+            }
+            Ok(())
+        }
+        _ => Err(invalid("unsupported OpusHead mapping family")),
+    }
+}
+
+pub fn validate_vorbis_headers(private: &[u8], sample_rate: u32, channels: u16) -> io::Result<()> {
+    if private.first() != Some(&2) {
+        return Err(invalid(
+            "Vorbis initialization is not three-header Xiph lacing",
+        ));
+    }
+    let mut cursor = 1_usize;
+    let first = xiph_laced_length(private, &mut cursor)?;
+    let second = xiph_laced_length(private, &mut cursor)?;
+    let header_bytes = first
+        .checked_add(second)
+        .and_then(|length| length.checked_add(cursor))
+        .ok_or_else(|| invalid("Vorbis header lengths overflow"))?;
+    if header_bytes >= private.len() {
+        return Err(invalid("Vorbis headers are truncated"));
+    }
+    let first_end = cursor + first;
+    let second_end = first_end + second;
+    let identification = &private[cursor..first_end];
+    let comments = &private[first_end..second_end];
+    let setup = &private[second_end..];
+    let block_sizes = identification.get(28).copied().unwrap_or(0);
+    let small_block = block_sizes & 0x0f;
+    let large_block = block_sizes >> 4;
+    if identification.len() != 30
+        || !identification.starts_with(b"\x01vorbis")
+        || !comments.starts_with(b"\x03vorbis")
+        || !setup.starts_with(b"\x05vorbis")
+        || identification[7..11] != [0, 0, 0, 0]
+        || u16::from(identification[11]) != channels
+        || u32::from_le_bytes(identification[12..16].try_into().unwrap()) != sample_rate
+        || !(6..=13).contains(&small_block)
+        || !(small_block..=13).contains(&large_block)
+        || identification[29] != 1
+        || !valid_vorbis_comment_header(comments)
+    {
+        return Err(invalid(
+            "Vorbis identification or header signatures are invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_vorbis_comment_header(header: &[u8]) -> bool {
+    let mut cursor = 7_usize;
+    let Some(vendor_length) = take_vorbis_length(header, &mut cursor) else {
+        return false;
+    };
+    let Some(after_vendor) = cursor.checked_add(vendor_length) else {
+        return false;
+    };
+    if after_vendor > header.len() {
+        return false;
+    }
+    cursor = after_vendor;
+    let Some(comment_count) = take_vorbis_length(header, &mut cursor) else {
+        return false;
+    };
+    if comment_count > header.len().saturating_sub(cursor).saturating_sub(1) / 4 {
+        return false;
+    }
+    for _ in 0..comment_count {
+        let Some(length) = take_vorbis_length(header, &mut cursor) else {
+            return false;
+        };
+        let Some(next) = cursor.checked_add(length) else {
+            return false;
+        };
+        if next > header.len() {
+            return false;
+        }
+        cursor = next;
+    }
+    header.get(cursor) == Some(&1) && cursor + 1 == header.len()
+}
+
+fn take_vorbis_length(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
+    let end = cursor.checked_add(4)?;
+    let length = u32::from_le_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+    *cursor = end;
+    usize::try_from(length).ok()
+}
+
+fn xiph_laced_length(bytes: &[u8], cursor: &mut usize) -> io::Result<usize> {
+    let mut length = 0_usize;
+    loop {
+        let value = *bytes
+            .get(*cursor)
+            .ok_or_else(|| invalid("truncated Xiph-laced length"))?;
+        *cursor += 1;
+        length = length
+            .checked_add(usize::from(value))
+            .ok_or_else(|| invalid("Xiph-laced length overflow"))?;
+        if value != 255 {
+            return Ok(length);
+        }
+    }
+}
+
+pub fn validate_flac_streaminfo(
+    streaminfo: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> io::Result<()> {
+    if streaminfo.len() != 34 {
+        return Err(invalid(
+            "FLAC initialization is not a raw 34-byte STREAMINFO",
+        ));
+    }
+    let minimum_block = u16::from_be_bytes(streaminfo[0..2].try_into().unwrap());
+    let maximum_block = u16::from_be_bytes(streaminfo[2..4].try_into().unwrap());
+    let packed = u64::from_be_bytes(streaminfo[10..18].try_into().unwrap());
+    let header_rate = ((packed >> 44) & 0x000f_ffff) as u32;
+    let header_channels = ((packed >> 41) & 0x7) as u16 + 1;
+    let bits_per_sample = ((packed >> 36) & 0x1f) as u8 + 1;
+    if minimum_block < 16
+        || maximum_block < minimum_block
+        || header_rate == 0
+        || header_rate != sample_rate
+        || header_channels != channels
+        || !(4..=32).contains(&bits_per_sample)
+    {
+        return Err(invalid("FLAC STREAMINFO configuration is invalid"));
+    }
+    Ok(())
+}
+
 pub fn validate_portable_packetization(
     codec: &str,
     packetization: &str,
