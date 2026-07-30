@@ -12,6 +12,7 @@ pub mod cbor;
 pub mod context;
 #[cfg(feature = "native")]
 pub mod discovery;
+pub mod geometry;
 pub mod idempotency;
 pub mod identity;
 pub mod input;
@@ -23,6 +24,7 @@ pub mod resource;
 pub mod revision;
 pub mod scene;
 pub mod surface;
+pub mod target;
 #[cfg(feature = "native")]
 pub mod trace;
 pub mod track;

@@ -2,11 +2,13 @@
 
 use crate::{
     cbor::Value,
+    geometry::{Rotation, SurfaceMapping},
     messages::{
         MessageError, PayloadMap, StrictMap, invalid_value, require_nonzero, validate_header_object,
     },
     registry::{CANVAS_CONTENT, DESKTOP_CONTENT, GENERIC_CONTENT, TERMINAL_CONTENT},
     revision::{SurfaceGeneration, SurfaceRevision},
+    target::OutputDescriptor,
 };
 
 pub const POLICY_DENY_CAPTURE: u64 = 1 << 0;
@@ -321,6 +323,230 @@ impl SurfaceState {
             generation,
             input_must_be_revoked: generation_changed,
         })
+    }
+}
+
+/// Input classes a producer can inject for a `desktop-content-v1` surface, desktop §2 key 4.
+///
+/// A bit says the producer *can* inject that class. It does not grant the presenter permission —
+/// that is the input binding's job.
+pub mod input_capability {
+    pub const KEYBOARD: u64 = 1 << 0;
+    pub const POINTER_MOTION: u64 = 1 << 1;
+    pub const POINTER_BUTTON: u64 = 1 << 2;
+    pub const POINTER_AXIS: u64 = 1 << 3;
+    pub const KNOWN_MASK: u64 = (1 << 4) - 1;
+}
+
+/// Profile-specific parameters of a `desktop-content-v1` surface, desktop §2 keys 0 through 4.
+///
+/// Without this type every producer hand-encodes the map and every presenter hand-decodes it,
+/// which is how the sanitization rule gets quietly dropped: desktop §1 forbids monitor serials,
+/// user names, desktop names, window titles, and login-session identifiers anywhere in a topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopSurfaceParameters {
+    /// Captured virtual-desktop origin in producer logical pixels.
+    pub captured_origin_x: i32,
+    pub captured_origin_y: i32,
+    /// Sanitized captured-output topology, using the target output schema.
+    pub topology: Vec<OutputDescriptor>,
+    /// Producer-owned desktop semantic generation. It advances when the actual OS session,
+    /// desktop, security boundary, injected seat, display mapping, or coordinate truth changes —
+    /// never as a user name or OS identifier.
+    pub semantic_generation: u64,
+    pub input_capabilities: u64,
+}
+
+impl DesktopSurfaceParameters {
+    pub fn encode(&self) -> PayloadMap {
+        vec![
+            (0, signed(i64::from(self.captured_origin_x))),
+            (1, signed(i64::from(self.captured_origin_y))),
+            (
+                2,
+                Value::Array(self.topology.iter().map(OutputDescriptor::encode).collect()),
+            ),
+            (3, Value::Unsigned(self.semantic_generation)),
+            (4, Value::Unsigned(self.input_capabilities)),
+        ]
+    }
+
+    pub fn decode(map: &PayloadMap) -> Result<Self, MessageError> {
+        let value = Value::Map(map.clone());
+        let strict = StrictMap::new("desktop surface parameters", &value, &[0, 1, 2, 3, 4])?;
+        let topology = match strict.required(2)? {
+            Value::Array(entries) => entries
+                .iter()
+                .map(OutputDescriptor::decode)
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(invalid_value(
+                    "desktop surface parameters",
+                    2,
+                    "topology must be an array",
+                ));
+            }
+        };
+        let parameters = Self {
+            captured_origin_x: required_i32(&strict, 0)?,
+            captured_origin_y: required_i32(&strict, 1)?,
+            topology,
+            semantic_generation: strict.required_u64(3)?,
+            input_capabilities: strict.required_u64(4)?,
+        };
+        parameters.validate()?;
+        Ok(parameters)
+    }
+
+    pub fn validate(&self) -> Result<(), MessageError> {
+        if self.semantic_generation == 0 {
+            return Err(invalid_value(
+                "desktop surface parameters",
+                3,
+                "semantic generation must be nonzero",
+            ));
+        }
+        if self.input_capabilities & !input_capability::KNOWN_MASK != 0 {
+            return Err(invalid_value(
+                "desktop surface parameters",
+                4,
+                "input capability mask has unassigned bits",
+            ));
+        }
+        for (index, output) in self.topology.iter().enumerate() {
+            if self.topology[..index]
+                .iter()
+                .any(|earlier| earlier.output_id == output.output_id)
+            {
+                return Err(invalid_value(
+                    "desktop surface parameters",
+                    2,
+                    "output IDs must be unique within a topology",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The canonical-surface to OS-coordinate mapping this surface implies.
+    ///
+    /// Rotation belongs to the surface's core fields rather than these parameters, so the caller
+    /// supplies the surface's logical extent and rotation alongside.
+    pub fn mapping(
+        &self,
+        logical_width: u32,
+        logical_height: u32,
+        rotation: Rotation,
+    ) -> SurfaceMapping {
+        SurfaceMapping {
+            logical_width,
+            logical_height,
+            captured_origin_x: self.captured_origin_x,
+            captured_origin_y: self.captured_origin_y,
+            rotation,
+        }
+    }
+}
+
+fn signed(value: i64) -> Value {
+    if value >= 0 {
+        Value::Unsigned(value as u64)
+    } else {
+        Value::Negative(value)
+    }
+}
+
+fn required_i32(map: &StrictMap<'_>, key: u64) -> Result<i32, MessageError> {
+    map.required(key)?
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| {
+            invalid_value(
+                "desktop surface parameters",
+                key,
+                "must fit in a signed 32-bit integer",
+            )
+        })
+}
+
+#[cfg(test)]
+mod desktop_parameter_tests {
+    use super::*;
+
+    fn output(id: u64) -> OutputDescriptor {
+        OutputDescriptor {
+            output_id: id,
+            origin_x: 0,
+            origin_y: 0,
+            width: 1920,
+            height: 1080,
+            scale_numerator: 1,
+            scale_denominator: 1,
+            rotation: Rotation::None,
+            primary: id == 1,
+        }
+    }
+
+    fn parameters() -> DesktopSurfaceParameters {
+        DesktopSurfaceParameters {
+            captured_origin_x: -1920,
+            captured_origin_y: 0,
+            topology: vec![output(1), output(2)],
+            semantic_generation: 3,
+            input_capabilities: input_capability::KEYBOARD | input_capability::POINTER_MOTION,
+        }
+    }
+
+    #[test]
+    fn parameters_round_trip() {
+        assert_eq!(
+            DesktopSurfaceParameters::decode(&parameters().encode()).unwrap(),
+            parameters()
+        );
+    }
+
+    #[test]
+    fn a_zero_semantic_generation_is_rejected() {
+        let mut broken = parameters();
+        broken.semantic_generation = 0;
+        assert!(broken.validate().is_err());
+    }
+
+    #[test]
+    fn unassigned_capability_bits_are_rejected() {
+        let mut broken = parameters();
+        broken.input_capabilities = 1 << 8;
+        assert!(broken.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_output_ids_are_rejected() {
+        let mut broken = parameters();
+        broken.topology[1].output_id = 1;
+        assert!(broken.validate().is_err());
+    }
+
+    #[test]
+    fn an_empty_topology_is_allowed_for_a_headless_producer() {
+        let headless = DesktopSurfaceParameters {
+            topology: Vec::new(),
+            ..parameters()
+        };
+        assert!(headless.validate().is_ok());
+    }
+
+    #[test]
+    fn the_mapping_carries_the_captured_origin() {
+        let mapping = parameters().mapping(1920, 1080, Rotation::None);
+        assert_eq!(mapping.to_os_logical(0, 0).unwrap(), (-1920, 0));
+        assert_eq!(mapping.logical_width, 1920);
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let mut map = parameters().encode();
+        map.push((5, Value::Unsigned(0)));
+        assert!(DesktopSurfaceParameters::decode(&map).is_err());
     }
 }
 
