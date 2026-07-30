@@ -89,7 +89,10 @@ The following checked `u64` counters never wrap:
 | `observation_sequence` | Session | Each non-actionable observation event admitted to the writer |
 
 The presentation target has a separate `target_generation`. A target geometry or topology change
-advances it. A stale scene commit fails before mutation.
+advances it. The final transition from an unsettled target descriptor to an otherwise
+byte-identical settled descriptor does not advance it: `TARGET_CHANGED` repeats the current
+generation exactly for that `false` to `true` transition. A stale scene commit fails before
+mutation.
 
 The following domains are also distinct: capability generation, lease resume generation, channel
 generation, input epoch, presenter grant generation, media epoch, packet/frame ID, record
