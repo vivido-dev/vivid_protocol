@@ -422,7 +422,7 @@ impl HelloAuthentication {
                     context_id: nonzero("resume authentication", 1, map.required_u64(1)?)?,
                     lease_id: nonzero("resume authentication", 2, map.required_u64(2)?)?,
                     session_id: nonzero("resume authentication", 3, map.required_u64(3)?)?,
-                    resume_generation: nonzero("resume authentication", 4, map.required_u64(4)?)?,
+                    resume_generation: map.required_u64(4)?,
                     attempt_id: map.required_fixed_bytes(5)?,
                     proof: map.required_fixed_bytes(6)?,
                 })
@@ -1494,6 +1494,28 @@ mod tests {
         assert_eq!(request_id, 1);
         assert_eq!(parsed.extensions, hello.extensions);
         assert_eq!(parsed.target_profile, DESKTOP_SURFACE);
+    }
+
+    #[test]
+    fn hello_accepts_zero_as_the_initial_resume_generation() {
+        let mut hello = root_hello();
+        hello.authentication = HelloAuthentication::Resume {
+            context_id: 1,
+            lease_id: 2,
+            session_id: 3,
+            resume_generation: 0,
+            attempt_id: [4; 16],
+            proof: [5; 32],
+        };
+
+        let (_, parsed) = Hello::decode(&hello.encode(1).unwrap()).unwrap();
+        assert!(matches!(
+            parsed.authentication,
+            HelloAuthentication::Resume {
+                resume_generation: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
