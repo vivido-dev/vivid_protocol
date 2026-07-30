@@ -632,12 +632,45 @@ presenter looping/step, semantic payload channels, and unreliable input motion.
 
 ### 6.1 `vivid_protocol`
 
-- Add a versioned 1.5 module rather than mutating 1.1 types in place.
-- Parse `vivid-protocol-1.5-registry.toml` in a collision/status audit.
-- Reuse only body codecs whose exact layout is retained.
-- Add typed identity tuples, revisions, generations, profile closure, auth transcripts, resource
-  contracts, channel-open tags, cumulative flow, input tuples, and v3 anchors.
-- Maintain separate golden vectors for 1.1 envelopes and 1.5 envelopes.
+The `vivid_protocol` crate makes a direct breaking cutover. It does not retain the 1.1 Rust API or
+an in-crate dual stack. A product that still serves 1.1 pins the former crate release or keeps the
+old parser in a separately versioned component.
+
+Apply these Rust API changes:
+
+| Removed 1.1 API/model | 1.5 crate API |
+|---|---|
+| `VIVID_MINOR == 1` | `VIVID_MINOR == 5` |
+| media-specific `ConnectionKind` variants | `Control`, `Lane`, and `Track` |
+| feature-ID constants and negotiation | profile names and closure in `registry` |
+| source/revision message family | `surface`, `track`, `scene`, and typed revision modules |
+| token-in-`HELLO` authentication | `auth::Secret32`, transcript proofs, and derived session keys |
+| delegated capability/ticket structs | `lease::SessionLeaseDefinition` and `LeaseMachine` |
+| media ticket attachment | `messages::ChannelOpen` plus `track::ChannelOpenState` |
+| incremental credit state | `resource::ChannelFlow` and `MAX_CHANNEL_DATA` |
+| source-local identity structs | complete tuples in `identity`, including presenter instance |
+| anchor-v2 token derivation | session-derived `anchor::AnchorKey` and marker v3 |
+| unguarded input event payloads | `input::InputTuple`, `InputEvent`, and final `InputGate` |
+| implicit retry handling | bounded `idempotency::IdempotencyCache` |
+
+The deterministic CBOR and 24-byte record-header codecs remain, but control schemas are
+incompatible. Portable media body helpers remain only where the 1.5 media specification explicitly
+freezes their byte layout. Native discovery reads `VIVID_ENDPOINT_CONTROL`,
+`VIVID_ENDPOINT_INTERACTIVE`, `VIVID_ENDPOINT_REALTIME`, `VIVID_ENDPOINT_BULK`, and
+`VIVID_ROOT_SECRET`; the old endpoint/token names are not aliases.
+
+Before compiling a consumer:
+
+1. replace every map keyed by a local numeric object ID with an `identity` tuple;
+2. split logical surface lifetime from track/channel lifetime;
+3. construct 1.5 `Envelope`, `Hello`, and `Welcome` values rather than adapting old configs;
+4. keep channel-open, idempotency, flow, lease, and input gates for the complete logical-session
+   lifetime stated by their modules; and
+5. delete old retry, ticket, feature, and credit branches instead of translating their state into
+   the new types.
+
+The crate requires Rust 1.87 because its supported WebAssembly decompression path uses
+`ruzstd 0.9`.
 
 ### 6.2 SDK
 

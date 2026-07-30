@@ -17,7 +17,7 @@ use std::time::Duration;
 use super::DEFAULT_MAX_RECORD_BODY;
 use super::{HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
 #[cfg(feature = "native")]
-use crate::messages::{CREDIT, ERROR, PONG};
+use crate::messages::{ERROR, INPUT_RESET, INPUT_REVOKED, MAX_CHANNEL_DATA, PONG};
 
 pub const PREFACE_SIZE: usize = 16;
 pub const HEADER_SIZE: usize = 24;
@@ -42,11 +42,8 @@ pub enum FlushMode {
 #[allow(dead_code)]
 pub enum ConnectionKind {
     Control = 0,
-    Video = 1,
-    Raster = 2,
-    Blob = 3,
-    LocalBuffer = 4,
-    Audio = 5,
+    Lane = 1,
+    Track = 2,
 }
 
 impl TryFrom<u8> for ConnectionKind {
@@ -55,16 +52,39 @@ impl TryFrom<u8> for ConnectionKind {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Control),
-            1 => Ok(Self::Video),
-            2 => Ok(Self::Raster),
-            3 => Ok(Self::Blob),
-            4 => Ok(Self::LocalBuffer),
-            5 => Ok(Self::Audio),
+            1 => Ok(Self::Lane),
+            2 => Ok(Self::Track),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown Vivid connection kind {value}"),
             )),
         }
+    }
+}
+
+impl ConnectionKind {
+    pub const fn required_first_record(self) -> u16 {
+        match self {
+            Self::Control => crate::messages::HELLO,
+            Self::Lane => crate::messages::LANE_OPEN,
+            Self::Track => crate::messages::CHANNEL_OPEN,
+        }
+    }
+
+    pub fn validate_first_record(self, header: &RecordHeader) -> io::Result<()> {
+        if header.sequence != 1 || header.record_type != self.required_first_record() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "first record does not match the Vivid connection kind",
+            ));
+        }
+        if self == Self::Control && header.object_id != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HELLO must use session-level object ID zero",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -188,13 +208,19 @@ impl Endpoint {
             return Ok(Self::Unix(PathBuf::from(path)));
         }
         if let Some(address) = value.strip_prefix("tcp:") {
-            if address.is_empty() {
+            let parsed = address.parse::<std::net::SocketAddrV4>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "native TCP endpoint is not an IPv4 socket address",
+                )
+            })?;
+            if *parsed.ip() != std::net::Ipv4Addr::LOCALHOST || parsed.port() == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "empty TCP endpoint",
+                    "native TCP endpoint must use exact 127.0.0.1 and a nonzero port",
                 ));
             }
-            return Ok(Self::Tcp(address.to_owned()));
+            return Ok(Self::Tcp(parsed.to_string()));
         }
         if value.contains("://") {
             return Err(io::Error::new(
@@ -357,7 +383,10 @@ impl ConnectionWriter {
         state.unflushed_records = state.unflushed_records.saturating_add(1);
         let must_flush = state.flush_mode == FlushMode::Immediate
             || checkpoint
-            || matches!(record_type, CREDIT | PONG | ERROR)
+            || matches!(
+                record_type,
+                MAX_CHANNEL_DATA | INPUT_REVOKED | INPUT_RESET | PONG | ERROR
+            )
             || has_correlated_control_envelope(record_type, parts)
             || state.unflushed_records >= BATCH_RECORD_LIMIT;
         if must_flush {
@@ -575,12 +604,7 @@ impl Connection {
                 unflushed_records: 0,
             })),
         };
-        writer.write_raw_preface(&encode_preface_version(
-            kind,
-            DEFAULT_MAX_RECORD_BODY,
-            major,
-            minor,
-        ))?;
+        writer.write_raw_preface(&encode_preface_version(kind, body_limit, major, minor))?;
         Ok(Self {
             reader: reader.map(|io| ConnectionReader {
                 io,
@@ -1001,14 +1025,14 @@ mod tests {
 
     #[test]
     fn preface_matches_vivid_layout() {
-        let preface = encode_preface(ConnectionKind::Video, 0x0102_0304);
+        let preface = encode_preface(ConnectionKind::Track, 0x0102_0304);
         assert_eq!(&preface[0..4], b"VIVD");
-        assert_eq!(preface[4..8], [1, 1, 1, 0]);
+        assert_eq!(preface[4..8], [1, 5, 2, 0]);
         assert_eq!(preface[8..12], [1, 2, 3, 4]);
         assert_eq!(preface[12..16], [0; 4]);
         assert_eq!(
             Preface::decode(preface).unwrap().kind,
-            ConnectionKind::Video
+            ConnectionKind::Track
         );
     }
 
@@ -1016,13 +1040,10 @@ mod tests {
     fn connection_kind_registry_is_collision_free_and_contiguous() {
         let kinds = [
             ConnectionKind::Control as u8,
-            ConnectionKind::Video as u8,
-            ConnectionKind::Raster as u8,
-            ConnectionKind::Blob as u8,
-            ConnectionKind::LocalBuffer as u8,
-            ConnectionKind::Audio as u8,
+            ConnectionKind::Lane as u8,
+            ConnectionKind::Track as u8,
         ];
-        assert_eq!(kinds, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(kinds, [0, 1, 2]);
         for (expected, value) in kinds.into_iter().enumerate() {
             assert_eq!(ConnectionKind::try_from(value).unwrap() as usize, expected);
         }
@@ -1060,7 +1081,7 @@ mod tests {
         assert_eq!(reply.code, crate::messages::ERROR_UNSUPPORTED_VERSION);
         assert!(reply.fatal);
         assert_eq!(
-            reply.supported_version,
+            reply.detail.supported_version_tuple(),
             Some((u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR)))
         );
 
@@ -1124,12 +1145,12 @@ mod tests {
         let _connection = Connection::from_streams(
             Box::new(io::empty()),
             Box::new(SharedBytes(bytes.clone())),
-            ConnectionKind::Raster,
+            ConnectionKind::Track,
         )
         .unwrap();
         assert_eq!(
             bytes.lock().unwrap().as_slice(),
-            encode_preface(ConnectionKind::Raster, DEFAULT_MAX_RECORD_BODY)
+            encode_preface(ConnectionKind::Track, DEFAULT_MAX_RECORD_BODY)
         );
     }
 
@@ -1246,7 +1267,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "native")]
-    fn batched_mode_flushes_credits_correlated_records_and_bounded_batches() {
+    fn batched_mode_flushes_flow_updates_correlated_records_and_bounded_batches() {
         let stats = Arc::new(Mutex::new(WriteStats::default()));
         let writer = test_writer(
             ShortWriter {
@@ -1258,7 +1279,7 @@ mod tests {
 
         writer.write_record(0x8001, 0, 1, b"media").unwrap();
         assert_eq!(stats.lock().unwrap().flushes, 0);
-        writer.write_record(CREDIT, 0, 1, &[]).unwrap();
+        writer.write_record(MAX_CHANNEL_DATA, 0, 1, &[]).unwrap();
         assert_eq!(stats.lock().unwrap().flushes, 1);
 
         writer

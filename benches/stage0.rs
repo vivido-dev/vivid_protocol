@@ -445,12 +445,8 @@ fn run_send_sample(
 }
 
 fn connection_kind(kind: MediaKind) -> ConnectionKind {
-    match kind {
-        MediaKind::Image => ConnectionKind::Blob,
-        MediaKind::Raster { .. } => ConnectionKind::Raster,
-        MediaKind::Video => ConnectionKind::Video,
-        MediaKind::Audio => ConnectionKind::Audio,
-    }
+    let _ = kind;
+    ConnectionKind::Track
 }
 
 fn send_flow(prepared: &mut PreparedFlow<'_>, mode: SendMode) -> io::Result<()> {

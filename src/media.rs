@@ -1174,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn vivid_1_0_media_prefixes_are_frozen_golden_vectors() {
+    fn portable_media_prefixes_remain_frozen_golden_vectors() {
         let video = video_packet_prefix(&VideoPacket {
             epoch: 0x0102_0304,
             packet_id: 0x0506_0708_090a_0b0c,

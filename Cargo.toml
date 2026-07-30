@@ -1,16 +1,25 @@
 [package]
 name = "vivid_protocol"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.87.0"
 license = "Apache-2.0"
-description = "Wire types and deterministic codecs for the Vivid terminal media protocol"
+description = "Wire types, state models, and deterministic codecs for Vivid Protocol 1.5"
 readme = "README.md"
 repository = "https://github.com/vivido-dev/vivid_protocol"
 documentation = "https://docs.rs/vivid_protocol"
 keywords = ["terminal", "graphics", "media", "protocol", "cbor"]
 categories = ["encoding", "multimedia", "network-programming"]
-include = ["Cargo.toml", "README.md", "src/**/*.rs"]
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "benches/**/*.rs",
+    "src/**/*.rs",
+    "vivid-protocol-1.5-*.md",
+    "vivid-protocol-1.5-registry.toml",
+    "vivid-protocol-1.1-to-1.5-migration.md",
+]
 
 [features]
 default = ["native"]
@@ -26,7 +35,7 @@ zstd = { version = "0.13", optional = true }
 zstd-safe = { version = "7.2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-ruzstd = "0.8"
+ruzstd = "0.9"
 
 [[bench]]
 name = "stage0"
