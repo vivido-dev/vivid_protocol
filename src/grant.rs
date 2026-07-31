@@ -11,8 +11,6 @@
 //! A browser presenter compiled to WebAssembly drives the same code, which is the point — the
 //! generation and watchdog rules are exactly where two implementations would otherwise drift.
 
-use core::time::Duration;
-
 use crate::{
     cbor::Value,
     input::{
@@ -21,10 +19,8 @@ use crate::{
     },
     messages::{MessageError, PayloadMap},
     revision::SurfaceGeneration,
+    time::Monotonic,
 };
-
-#[cfg(feature = "native")]
-use std::time::Instant;
 
 /// Reasons a presenter reports on `INPUT_BOUND`, `INPUT_REVOKED`, and `INPUT_RESET`, desktop §6.
 pub mod reason {
@@ -150,13 +146,24 @@ impl InputGrant {
         })
     }
 
+    /// The state the most recent binding produced: `STATE_DISABLED`, `STATE_ENABLED`, or
+    /// `STATE_DENIED`. A presenter needs this after the outcome itself is forgotten, because the
+    /// browser binding drives its own UI from the same machine a native presenter reads directly.
+    pub fn state(&self) -> u64 {
+        self.last_state
+    }
+
+    /// The transition reason reported with `state()`.
+    pub fn reason(&self) -> u64 {
+        self.last_reason
+    }
+
     /// Apply a producer binding under the presenter's current eligibility.
-    #[cfg(feature = "native")]
     pub fn apply(
         &mut self,
         binding: &InputBinding,
         eligibility: &Eligibility,
-        now: Instant,
+        now: Monotonic,
     ) -> Result<GrantOutcome, MessageError> {
         if binding.disabled() {
             let outcome = self.gate.apply_binding(binding.clone(), 0, 0, now)?;
@@ -214,7 +221,6 @@ impl InputGrant {
     /// End the current grant, advancing the generation.
     ///
     /// Returns the payload identity for `INPUT_REVOKED`, or `None` when nothing was granted.
-    #[cfg(feature = "native")]
     pub fn revoke(&mut self, reason: u64) -> Option<PayloadMap> {
         let active = self.gate.active()?.binding;
         let generation = self.gate.revoke().ok()?;
@@ -237,11 +243,11 @@ impl InputGrant {
     ///
     /// Desktop §6 requires a renewal no less often than half the effective timeout, and ordinary
     /// input events never extend the watchdog — only a renewal does.
-    #[cfg(feature = "native")]
-    pub fn due_renewal(&mut self, now: Instant) -> Option<Renewal> {
+    pub fn due_renewal(&mut self, now: Monotonic) -> Option<Renewal> {
         let active = self.gate.active()?;
-        let half = Duration::from_micros(self.watchdog_us / 2);
-        let elapsed_deadline = active.watchdog_deadline.checked_sub(half)?;
+        let elapsed_deadline = active
+            .watchdog_deadline
+            .checked_sub_micros(self.watchdog_us / 2)?;
         if now < elapsed_deadline {
             return None;
         }
@@ -341,7 +347,7 @@ pub fn event_payload(tag: PayloadMap, event: &InputEvent) -> PayloadMap {
     payload
 }
 
-#[cfg(all(test, feature = "native"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::input::{
@@ -391,7 +397,11 @@ mod tests {
         let mut grant = InputGrant::new();
         let requested = INPUT_CLASS_KEYBOARD | INPUT_CLASS_POINTER_AXIS;
         let outcome = grant
-            .apply(&binding(1, requested), &eligible(), Instant::now())
+            .apply(
+                &binding(1, requested),
+                &eligible(),
+                Monotonic::from_micros(1_000_000),
+            )
             .unwrap();
         assert_eq!(outcome, GrantOutcome::Enabled);
         // Axis was requested but is outside the surface capability mask, so it is narrowed away.
@@ -406,7 +416,7 @@ mod tests {
             .apply(
                 &binding(1, INPUT_CLASS_KEYBOARD),
                 &eligible(),
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         assert_eq!(grant.effective_classes(), INPUT_CLASS_KEYBOARD);
@@ -432,7 +442,7 @@ mod tests {
                 .apply(
                     &binding(1, INPUT_CLASS_KEYBOARD),
                     &eligibility,
-                    Instant::now(),
+                    Monotonic::from_micros(1_000_000),
                 )
                 .unwrap();
             assert_eq!(outcome, GrantOutcome::Denied { reason: expected });
@@ -445,7 +455,9 @@ mod tests {
         let mut grant = InputGrant::new();
         let mut wrong = binding(1, INPUT_CLASS_KEYBOARD);
         wrong.surface_generation = SurfaceGeneration::new(2);
-        let outcome = grant.apply(&wrong, &eligible(), Instant::now()).unwrap();
+        let outcome = grant
+            .apply(&wrong, &eligible(), Monotonic::from_micros(1_000_000))
+            .unwrap();
         assert_eq!(
             outcome,
             GrantOutcome::Denied {
@@ -464,7 +476,7 @@ mod tests {
             .apply(
                 &binding(1, INPUT_CLASS_KEYBOARD),
                 &ineligible,
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         assert_eq!(grant.effective_classes(), 0);
@@ -474,7 +486,7 @@ mod tests {
             .apply(
                 &binding(1, INPUT_CLASS_KEYBOARD),
                 &eligible(),
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         assert_eq!(outcome, GrantOutcome::ExactRetry);
@@ -489,7 +501,7 @@ mod tests {
             .apply(
                 &binding(2, INPUT_CLASS_KEYBOARD),
                 &eligible(),
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         assert_eq!(outcome, GrantOutcome::Enabled);
@@ -502,7 +514,7 @@ mod tests {
             .apply(
                 &binding(3, INPUT_CLASS_KEYBOARD),
                 &eligible(),
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         assert!(
@@ -510,7 +522,7 @@ mod tests {
                 .apply(
                     &binding(2, INPUT_CLASS_KEYBOARD),
                     &eligible(),
-                    Instant::now()
+                    Monotonic::from_micros(1_000_000)
                 )
                 .is_err()
         );
@@ -523,7 +535,7 @@ mod tests {
             .apply(
                 &binding(1, INPUT_CLASS_KEYBOARD),
                 &eligible(),
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         let first = grant.grant_generation();
@@ -535,7 +547,7 @@ mod tests {
             .apply(
                 &binding(2, INPUT_CLASS_KEYBOARD),
                 &eligible(),
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         assert!(grant.grant_generation() > after_revoke);
@@ -554,11 +566,11 @@ mod tests {
             .apply(
                 &binding(1, INPUT_CLASS_KEYBOARD),
                 &eligible(),
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         let outcome = grant
-            .apply(&disabled(2), &eligible(), Instant::now())
+            .apply(&disabled(2), &eligible(), Monotonic::from_micros(1_000_000))
             .unwrap();
         assert_eq!(outcome, GrantOutcome::Disabled);
         assert_eq!(grant.effective_classes(), 0);
@@ -569,7 +581,7 @@ mod tests {
 
     #[test]
     fn a_renewal_is_due_at_half_the_effective_timeout() {
-        let start = Instant::now();
+        let start = Monotonic::from_micros(1_000_000);
         let mut grant = InputGrant::new();
         grant
             .apply(&binding(1, INPUT_CLASS_KEYBOARD), &eligible(), start)
@@ -579,16 +591,20 @@ mod tests {
             "nothing is due immediately"
         );
 
-        let half = Duration::from_micros(DEFAULT_WATCHDOG_US / 2);
+        let half = DEFAULT_WATCHDOG_US / 2;
         let renewal = grant
-            .due_renewal(start + half)
+            .due_renewal(start.checked_add_micros(half).unwrap())
             .expect("a renewal falls due");
         assert_eq!(renewal.sequence, 1);
         assert_eq!(renewal.watchdog_us, DEFAULT_WATCHDOG_US);
         // Renewing moves the deadline, so the next is due another half period on.
-        assert!(grant.due_renewal(start + half).is_none());
+        assert!(
+            grant
+                .due_renewal(start.checked_add_micros(half).unwrap())
+                .is_none()
+        );
         let next = grant
-            .due_renewal(start + half + half)
+            .due_renewal(start.checked_add_micros(half * 2).unwrap())
             .expect("the next renewal");
         assert_eq!(next.sequence, 2, "renewal sequences strictly increase");
     }
@@ -600,11 +616,19 @@ mod tests {
         let mut grant = InputGrant::new();
         let mut fast = binding(1, INPUT_CLASS_KEYBOARD);
         fast.requested_watchdog_us = 1;
-        assert!(grant.apply(&fast, &eligible(), Instant::now()).is_err());
+        assert!(
+            grant
+                .apply(&fast, &eligible(), Monotonic::from_micros(1_000_000))
+                .is_err()
+        );
 
         let mut slow = binding(1, INPUT_CLASS_KEYBOARD);
         slow.requested_watchdog_us = u64::MAX;
-        assert!(grant.apply(&slow, &eligible(), Instant::now()).is_err());
+        assert!(
+            grant
+                .apply(&slow, &eligible(), Monotonic::from_micros(1_000_000))
+                .is_err()
+        );
     }
 
     #[test]
@@ -613,7 +637,9 @@ mod tests {
             let mut grant = InputGrant::new();
             let mut edge = binding(1, INPUT_CLASS_KEYBOARD);
             edge.requested_watchdog_us = requested;
-            grant.apply(&edge, &eligible(), Instant::now()).unwrap();
+            grant
+                .apply(&edge, &eligible(), Monotonic::from_micros(1_000_000))
+                .unwrap();
             assert_eq!(grant.bound_payload(1)[8].1.as_u64(), Some(requested));
         }
     }
@@ -625,7 +651,7 @@ mod tests {
             .apply(
                 &binding(1, INPUT_CLASS_KEYBOARD),
                 &eligible(),
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         let tag = grant
@@ -652,7 +678,7 @@ mod tests {
             .apply(
                 &binding(4, INPUT_CLASS_KEYBOARD),
                 &eligible(),
-                Instant::now(),
+                Monotonic::from_micros(1_000_000),
             )
             .unwrap();
         let payload = grant.revoke(reason::WATCHDOG).unwrap();

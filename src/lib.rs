@@ -14,6 +14,7 @@ pub mod context;
 pub mod discovery;
 pub mod geometry;
 pub mod grant;
+pub mod hid;
 pub mod idempotency;
 pub mod identity;
 pub mod input;
@@ -27,9 +28,11 @@ pub mod revision;
 pub mod scene;
 pub mod surface;
 pub mod target;
+pub mod time;
 #[cfg(feature = "native")]
 pub mod trace;
 pub mod track;
+pub mod web;
 pub mod wire;
 
 /// Version of the Vivid wire protocol, used by both the connection preface and HELLO/WELCOME.

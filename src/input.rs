@@ -1,6 +1,6 @@
 //! Generation-checked desktop input schemas and final-injection gating.
 
-use std::time::{Duration, Instant};
+use crate::time::Monotonic;
 
 use crate::{
     cbor::Value,
@@ -337,8 +337,9 @@ impl InputEvent {
 pub struct ActiveGrant {
     pub binding: InputTuple,
     pub effective_classes: u64,
-    pub watchdog_timeout: Duration,
-    pub watchdog_deadline: Instant,
+    /// The effective watchdog in microseconds.
+    pub watchdog_timeout_us: u64,
+    pub watchdog_deadline: Monotonic,
     pub renewal_sequence: u64,
 }
 
@@ -381,7 +382,7 @@ impl InputGate {
         binding: InputBinding,
         effective_classes: u64,
         effective_watchdog_us: u64,
-        now: Instant,
+        now: Monotonic,
     ) -> Result<BindingOutcome, MessageError> {
         binding.validate(binding.surface_id)?;
         if let Some(previous) = &self.latest_binding {
@@ -423,14 +424,13 @@ impl InputGate {
         {
             return Ok(BindingOutcome::Denied(tuple));
         }
-        let watchdog_timeout = Duration::from_micros(effective_watchdog_us);
         let watchdog_deadline = now
-            .checked_add(watchdog_timeout)
+            .checked_add_micros(effective_watchdog_us)
             .ok_or_else(|| invalid_value("INPUT_BOUND", 8, "overflows local time"))?;
         self.active = Some(ActiveGrant {
             binding: tuple,
             effective_classes,
-            watchdog_timeout,
+            watchdog_timeout_us: effective_watchdog_us,
             watchdog_deadline,
             renewal_sequence: 0,
         });
@@ -442,7 +442,7 @@ impl InputGate {
         binding: InputTuple,
         renewal_sequence: u64,
         watchdog_us: u64,
-        received_at: Instant,
+        received_at: Monotonic,
     ) -> Result<(), MessageError> {
         let active = self
             .active
@@ -451,7 +451,7 @@ impl InputGate {
         if active.binding != binding
             || renewal_sequence <= active.renewal_sequence
             || received_at >= active.watchdog_deadline
-            || watchdog_us != active.watchdog_timeout.as_micros() as u64
+            || watchdog_us != active.watchdog_timeout_us
         {
             return Err(invalid_value(
                 "INPUT_LEASE_RENEW",
@@ -461,7 +461,7 @@ impl InputGate {
         }
         active.renewal_sequence = renewal_sequence;
         active.watchdog_deadline = received_at
-            .checked_add(active.watchdog_timeout)
+            .checked_add_micros(active.watchdog_timeout_us)
             .ok_or_else(|| invalid_value("INPUT_LEASE_RENEW", 6, "overflows local time"))?;
         Ok(())
     }
@@ -476,7 +476,7 @@ impl InputGate {
         &self,
         event: InputEvent,
         current_surface_generation: SurfaceGeneration,
-        now: Instant,
+        now: Monotonic,
     ) -> Result<(), InjectionRejection> {
         let active = self
             .active
@@ -506,7 +506,7 @@ impl InputGate {
         &mut self,
         event: InputEvent,
         current_surface_generation: SurfaceGeneration,
-        now: Instant,
+        now: Monotonic,
         operation: impl FnOnce(InputEvent) -> R,
     ) -> Result<R, InjectionRejection> {
         self.authorize(event, current_surface_generation, now)?;
@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn queued_old_event_fails_after_revocation() {
-        let now = Instant::now();
+        let now = Monotonic::from_micros(1_000_000);
         let mut gate = InputGate::default();
         let BindingOutcome::Enabled(tuple) = gate
             .apply_binding(binding(1), INPUT_CLASS_KEYBOARD, 1_000_000, now)
@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn generation_change_rejects_at_final_gate() {
-        let now = Instant::now();
+        let now = Monotonic::from_micros(1_000_000);
         let mut gate = InputGate::default();
         let BindingOutcome::Enabled(tuple) = gate
             .apply_binding(binding(1), INPUT_CLASS_KEYBOARD, 1_000_000, now)
@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn old_epoch_never_auto_restores() {
-        let now = Instant::now();
+        let now = Monotonic::from_micros(1_000_000);
         let mut gate = InputGate::default();
         gate.apply_binding(binding(2), INPUT_CLASS_KEYBOARD, 1_000_000, now)
             .unwrap();
