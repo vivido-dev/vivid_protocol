@@ -199,25 +199,38 @@ pub enum Endpoint {
 
 #[cfg(feature = "native")]
 struct ConnectedIo {
-    reader: Box<dyn Read + Send>,
+    reader: ReaderIo,
     writer: Box<dyn Write + Send>,
-    establishment_read_deadline: EstablishmentReadDeadline,
 }
 
 #[cfg(feature = "native")]
-enum EstablishmentReadDeadline {
+enum ReaderIo {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
+    Other(Box<dyn Read + Send>),
 }
 
 #[cfg(feature = "native")]
-impl EstablishmentReadDeadline {
-    fn clear(&self) -> io::Result<()> {
+impl ReaderIo {
+    fn clear_establishment_read_deadline(&self) -> io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.set_read_timeout(None),
             #[cfg(unix)]
             Self::Unix(stream) => stream.set_read_timeout(None),
+            Self::Other(_) => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl Read for ReaderIo {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(buffer),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.read(buffer),
+            Self::Other(reader) => reader.read(buffer),
         }
     }
 }
@@ -274,12 +287,9 @@ impl Endpoint {
                 stream.set_write_timeout(Some(Duration::from_secs(30)))?;
                 stream.set_nodelay(true)?;
                 let writer = stream.try_clone()?;
-                let establishment_read_deadline =
-                    EstablishmentReadDeadline::Tcp(stream.try_clone()?);
                 Ok(ConnectedIo {
-                    reader: Box::new(stream),
+                    reader: ReaderIo::Tcp(stream),
                     writer: Box::new(writer),
-                    establishment_read_deadline,
                 })
             }
         }
@@ -292,11 +302,9 @@ fn connect_unix(path: &Path) -> io::Result<ConnectedIo> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let writer = stream.try_clone()?;
-    let establishment_read_deadline = EstablishmentReadDeadline::Unix(stream.try_clone()?);
     Ok(ConnectedIo {
-        reader: Box::new(stream),
+        reader: ReaderIo::Unix(stream),
         writer: Box::new(writer),
-        establishment_read_deadline,
     })
 }
 
@@ -479,10 +487,9 @@ impl ConnectionWriter {
 /// Blocking receive half of a live Vivid connection.
 #[cfg(feature = "native")]
 pub struct ConnectionReader {
-    io: Box<dyn Read + Send>,
+    io: ReaderIo,
     receive_sequence: u64,
     receive_body_limit: u32,
-    establishment_read_deadline: Option<EstablishmentReadDeadline>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,10 +504,7 @@ pub struct BorrowedRecord<'a> {
 #[cfg(feature = "native")]
 impl ConnectionReader {
     fn clear_establishment_read_deadline(&mut self) -> io::Result<()> {
-        if let Some(deadline) = self.establishment_read_deadline.take() {
-            deadline.clear()?;
-        }
-        Ok(())
+        self.io.clear_establishment_read_deadline()
     }
 
     pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
@@ -591,19 +595,8 @@ impl Connection {
         major: u8,
         minor: u8,
     ) -> io::Result<Self> {
-        let ConnectedIo {
-            reader,
-            writer,
-            establishment_read_deadline,
-        } = endpoint.connect()?;
-        Self::new_version(
-            Some(reader),
-            Some(establishment_read_deadline),
-            WriterIo::Live(writer),
-            kind,
-            major,
-            minor,
-        )
+        let ConnectedIo { reader, writer } = endpoint.connect()?;
+        Self::new_version(Some(reader), WriterIo::Live(writer), kind, major, minor)
     }
 
     /// Start an initiator-side Vivid connection over an already authenticated transport.
@@ -616,7 +609,7 @@ impl Connection {
         writer: Box<dyn Write + Send>,
         kind: ConnectionKind,
     ) -> io::Result<Self> {
-        Self::new(Some(reader), WriterIo::Live(writer), kind)
+        Self::new(Some(ReaderIo::Other(reader)), WriterIo::Live(writer), kind)
     }
 
     pub fn trace(path: &Path, kind: ConnectionKind) -> io::Result<Self> {
@@ -630,17 +623,12 @@ impl Connection {
         Self::new(None, WriterIo::Sink(io::sink()), kind)
     }
 
-    fn new(
-        reader: Option<Box<dyn Read + Send>>,
-        io: WriterIo,
-        kind: ConnectionKind,
-    ) -> io::Result<Self> {
-        Self::new_version(reader, None, io, kind, VIVID_MAJOR, VIVID_MINOR)
+    fn new(reader: Option<ReaderIo>, io: WriterIo, kind: ConnectionKind) -> io::Result<Self> {
+        Self::new_version(reader, io, kind, VIVID_MAJOR, VIVID_MINOR)
     }
 
     fn new_version(
-        reader: Option<Box<dyn Read + Send>>,
-        establishment_read_deadline: Option<EstablishmentReadDeadline>,
+        reader: Option<ReaderIo>,
         io: WriterIo,
         kind: ConnectionKind,
         major: u8,
@@ -666,7 +654,6 @@ impl Connection {
                 io,
                 receive_sequence: 0,
                 receive_body_limit: body_limit,
-                establishment_read_deadline,
             }),
             writer,
         })
@@ -1224,11 +1211,8 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
-        let observer = stream.try_clone().unwrap();
-        let deadline = EstablishmentReadDeadline::Unix(stream.try_clone().unwrap());
         let connection = Connection::new_version(
-            Some(Box::new(stream)),
-            Some(deadline),
+            Some(ReaderIo::Unix(stream)),
             WriterIo::Sink(io::sink()),
             ConnectionKind::Control,
             VIVID_MAJOR,
@@ -1236,13 +1220,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            observer.read_timeout().unwrap(),
-            Some(Duration::from_secs(30))
-        );
         let (reader, _writer) = connection.split().unwrap();
-        assert!(reader.establishment_read_deadline.is_none());
-        assert_eq!(observer.read_timeout().unwrap(), None);
+        let ReaderIo::Unix(stream) = reader.io else {
+            panic!("native Unix connection lost its concrete reader");
+        };
+        assert_eq!(stream.read_timeout().unwrap(), None);
     }
 
     #[test]
@@ -1254,11 +1236,8 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
-        let observer = stream.try_clone().unwrap();
-        let deadline = EstablishmentReadDeadline::Tcp(stream.try_clone().unwrap());
         let connection = Connection::new_version(
-            Some(Box::new(stream)),
-            Some(deadline),
+            Some(ReaderIo::Tcp(stream)),
             WriterIo::Sink(io::sink()),
             ConnectionKind::Control,
             VIVID_MAJOR,
@@ -1266,13 +1245,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            observer.read_timeout().unwrap(),
-            Some(Duration::from_secs(30))
-        );
         let (reader, _writer) = connection.split().unwrap();
-        assert!(reader.establishment_read_deadline.is_none());
-        assert_eq!(observer.read_timeout().unwrap(), None);
+        let ReaderIo::Tcp(stream) = reader.io else {
+            panic!("native TCP connection lost its concrete reader");
+        };
+        assert_eq!(stream.read_timeout().unwrap(), None);
     }
 
     #[test]
@@ -1434,10 +1411,9 @@ mod tests {
         input.extend_from_slice(&second.encode());
         input.extend_from_slice(&[2; 32]);
         let mut reader = ConnectionReader {
-            io: Box::new(io::Cursor::new(input)),
+            io: ReaderIo::Other(Box::new(io::Cursor::new(input))),
             receive_sequence: 0,
             receive_body_limit: 32,
-            establishment_read_deadline: None,
         };
         let mut body = Vec::new();
         assert_eq!(reader.read_record_into(&mut body).unwrap().body, &[1; 32]);
@@ -1454,10 +1430,9 @@ mod tests {
             sequence: 1,
         };
         let mut reader = ConnectionReader {
-            io: Box::new(io::Cursor::new(oversized.encode())),
+            io: ReaderIo::Other(Box::new(io::Cursor::new(oversized.encode()))),
             receive_sequence: 0,
             receive_body_limit: 32,
-            establishment_read_deadline: None,
         };
         let mut untouched = vec![9; 8];
         let capacity = untouched.capacity();
