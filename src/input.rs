@@ -360,7 +360,7 @@ pub enum InjectionRejection {
     ClassNotGranted,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InputGate {
     latest_binding: Option<InputBinding>,
     grant_generation: GrantGeneration,

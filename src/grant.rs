@@ -120,7 +120,7 @@ pub struct Renewal {
 }
 
 /// The presenter's view of one session's input grant.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InputGrant {
     gate: InputGate,
     watchdog_us: u64,

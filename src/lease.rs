@@ -197,6 +197,7 @@ pub enum LeaseTransitionError {
     Exhausted,
 }
 
+#[derive(Clone)]
 pub struct LeaseMachine {
     state: LeaseState,
     revision: u64,
