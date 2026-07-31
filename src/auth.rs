@@ -278,6 +278,14 @@ pub fn channel_tag(
     ))
 }
 
+/// Constant-time comparison of a 32-byte transcript proof.
+///
+/// Security §2: every authentication tag and secret verifier is compared in constant time after an
+/// exact-length check, and neither the bytes nor a digest of them is logged.
+pub fn verify_proof(expected: &[u8; 32], supplied: &[u8]) -> bool {
+    supplied.len() == 32 && expected.ct_eq(supplied).into()
+}
+
 pub fn verify_tag(expected: &[u8; 16], supplied: &[u8]) -> bool {
     supplied.len() == 16 && expected.ct_eq(supplied).into()
 }
