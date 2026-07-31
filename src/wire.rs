@@ -200,7 +200,7 @@ pub enum Endpoint {
 #[cfg(feature = "native")]
 struct ConnectedIo {
     reader: ReaderIo,
-    writer: Box<dyn Write + Send>,
+    writer: WriterIo,
 }
 
 #[cfg(feature = "native")]
@@ -289,7 +289,7 @@ impl Endpoint {
                 let writer = stream.try_clone()?;
                 Ok(ConnectedIo {
                     reader: ReaderIo::Tcp(stream),
-                    writer: Box::new(writer),
+                    writer: WriterIo::Tcp(writer),
                 })
             }
         }
@@ -304,7 +304,7 @@ fn connect_unix(path: &Path) -> io::Result<ConnectedIo> {
     let writer = stream.try_clone()?;
     Ok(ConnectedIo {
         reader: ReaderIo::Unix(stream),
-        writer: Box::new(writer),
+        writer: WriterIo::Unix(writer),
     })
 }
 
@@ -318,9 +318,24 @@ fn connect_unix(_path: &Path) -> io::Result<ConnectedIo> {
 
 #[cfg(feature = "native")]
 enum WriterIo {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
     Live(Box<dyn Write + Send>),
     Trace(File),
     Sink(io::Sink),
+}
+
+#[cfg(feature = "native")]
+impl WriterIo {
+    fn clear_establishment_write_deadline(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_write_timeout(None),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_write_timeout(None),
+            Self::Live(_) | Self::Trace(_) | Self::Sink(_) => Ok(()),
+        }
+    }
 }
 
 #[cfg(feature = "native")]
@@ -596,7 +611,7 @@ impl Connection {
         minor: u8,
     ) -> io::Result<Self> {
         let ConnectedIo { reader, writer } = endpoint.connect()?;
-        Self::new_version(Some(reader), WriterIo::Live(writer), kind, major, minor)
+        Self::new_version(Some(reader), writer, kind, major, minor)
     }
 
     /// Start an initiator-side Vivid connection over an already authenticated transport.
@@ -661,9 +676,10 @@ impl Connection {
 
     /// Commit a positively established connection to its long-lived reader.
     ///
-    /// Native endpoints use a bounded read deadline while waiting for the first positive
-    /// handshake response. Once the caller has validated that response, `split` removes that
-    /// transport deadline: ordinary protocol idleness is not a framing error or loss signal.
+    /// Native endpoints use bounded read and write deadlines while waiting for the first positive
+    /// handshake response. Once the caller has validated that response, `split` removes those
+    /// transport deadlines: ordinary protocol idleness and backpressure are not framing errors or
+    /// loss signals.
     pub fn split(self) -> io::Result<(ConnectionReader, ConnectionWriter)> {
         let mut reader = self.reader.ok_or_else(|| {
             io::Error::new(
@@ -672,6 +688,12 @@ impl Connection {
             )
         })?;
         reader.clear_establishment_read_deadline()?;
+        self.writer
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?
+            .io
+            .clear_establishment_write_deadline()?;
         Ok((reader, self.writer))
     }
 
@@ -798,6 +820,9 @@ impl DirectionalLimits {
 #[cfg(feature = "native")]
 fn write_writer(io: &mut WriterIo, bytes: &[u8]) -> io::Result<()> {
     match io {
+        WriterIo::Tcp(stream) => stream.write_all(bytes),
+        #[cfg(unix)]
+        WriterIo::Unix(stream) => stream.write_all(bytes),
         WriterIo::Live(stream) => stream.write_all(bytes),
         WriterIo::Trace(file) => file.write_all(bytes),
         WriterIo::Sink(sink) => sink.write_all(bytes),
@@ -840,6 +865,9 @@ fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::
 
         let written = loop {
             let result = match io {
+                WriterIo::Tcp(stream) => stream.write_vectored(&slices[..slice_count]),
+                #[cfg(unix)]
+                WriterIo::Unix(stream) => stream.write_vectored(&slices[..slice_count]),
                 WriterIo::Live(stream) => stream.write_vectored(&slices[..slice_count]),
                 WriterIo::Trace(file) => file.write_vectored(&slices[..slice_count]),
                 WriterIo::Sink(sink) => sink.write_vectored(&slices[..slice_count]),
@@ -928,6 +956,9 @@ fn read_control_uint(bytes: &mut impl Iterator<Item = u8>, length: usize) -> Opt
 #[cfg(feature = "native")]
 fn flush_writer(io: &mut WriterIo) -> io::Result<()> {
     match io {
+        WriterIo::Tcp(stream) => stream.flush(),
+        #[cfg(unix)]
+        WriterIo::Unix(stream) => stream.flush(),
         WriterIo::Live(stream) => stream.flush(),
         WriterIo::Trace(file) => file.flush(),
         WriterIo::Sink(sink) => sink.flush(),
@@ -1206,50 +1237,68 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "native", unix))]
-    fn split_clears_the_unix_establishment_read_deadline() {
+    fn split_clears_the_unix_establishment_deadlines() {
         let (stream, _peer) = UnixStream::pair().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
+        let writer = stream.try_clone().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let connection = Connection::new_version(
             Some(ReaderIo::Unix(stream)),
-            WriterIo::Sink(io::sink()),
+            WriterIo::Unix(writer),
             ConnectionKind::Control,
             VIVID_MAJOR,
             VIVID_MINOR,
         )
         .unwrap();
 
-        let (reader, _writer) = connection.split().unwrap();
+        let (reader, writer) = connection.split().unwrap();
         let ReaderIo::Unix(stream) = reader.io else {
             panic!("native Unix connection lost its concrete reader");
         };
         assert_eq!(stream.read_timeout().unwrap(), None);
+        let state = writer.state.lock().unwrap();
+        let WriterIo::Unix(stream) = &state.io else {
+            panic!("native Unix connection lost its concrete writer");
+        };
+        assert_eq!(stream.write_timeout().unwrap(), None);
     }
 
     #[test]
     #[cfg(all(feature = "native", not(unix)))]
-    fn split_clears_the_tcp_establishment_read_deadline() {
+    fn split_clears_the_tcp_establishment_deadlines() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (_peer, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
+        let writer = stream.try_clone().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let connection = Connection::new_version(
             Some(ReaderIo::Tcp(stream)),
-            WriterIo::Sink(io::sink()),
+            WriterIo::Tcp(writer),
             ConnectionKind::Control,
             VIVID_MAJOR,
             VIVID_MINOR,
         )
         .unwrap();
 
-        let (reader, _writer) = connection.split().unwrap();
+        let (reader, writer) = connection.split().unwrap();
         let ReaderIo::Tcp(stream) = reader.io else {
             panic!("native TCP connection lost its concrete reader");
         };
         assert_eq!(stream.read_timeout().unwrap(), None);
+        let state = writer.state.lock().unwrap();
+        let WriterIo::Tcp(stream) = &state.io else {
+            panic!("native TCP connection lost its concrete writer");
+        };
+        assert_eq!(stream.write_timeout().unwrap(), None);
     }
 
     #[test]
