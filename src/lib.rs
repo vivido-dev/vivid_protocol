@@ -13,6 +13,7 @@ pub mod context;
 #[cfg(feature = "native")]
 pub mod discovery;
 pub mod geometry;
+pub mod grant;
 pub mod idempotency;
 pub mod identity;
 pub mod input;

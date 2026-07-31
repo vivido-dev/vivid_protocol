@@ -183,6 +183,16 @@ impl InputEvent {
         }
     }
 
+    /// The record type this event travels as on the interactive lane.
+    pub const fn record_type(self) -> u16 {
+        match self {
+            Self::Key { .. } => crate::messages::KEY_INPUT,
+            Self::PointerMotion { .. } => crate::messages::POINTER_MOTION,
+            Self::PointerButton { .. } => crate::messages::POINTER_BUTTON,
+            Self::PointerAxis { .. } => crate::messages::POINTER_AXIS,
+        }
+    }
+
     pub const fn class(self) -> u64 {
         match self {
             Self::Key { .. } => INPUT_CLASS_KEYBOARD,
