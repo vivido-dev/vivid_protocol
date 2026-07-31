@@ -20,6 +20,7 @@ pub mod input;
 pub mod lease;
 pub mod media;
 pub mod messages;
+pub mod observation;
 pub mod registry;
 pub mod resource;
 pub mod revision;
