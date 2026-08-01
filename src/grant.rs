@@ -264,6 +264,17 @@ impl InputGrant {
         Some(renewal)
     }
 
+    /// Whether the active grant's local watchdog deadline has elapsed.
+    ///
+    /// Presenters use this before attempting a renewal after a stalled event loop: a renewal that
+    /// reaches the producer at or after the deadline is invalid, so continuing to emit events with
+    /// that tuple would only create stale input traffic.
+    pub fn watchdog_expired(&self, now: Monotonic) -> bool {
+        self.gate
+            .active()
+            .is_some_and(|active| now >= active.watchdog_deadline)
+    }
+
     /// `INPUT_BOUND`, desktop §5.2.
     pub fn bound_payload(&self, producer_epoch: u64) -> PayloadMap {
         let active = self.gate.active();
@@ -607,6 +618,24 @@ mod tests {
             .due_renewal(start.checked_add_micros(half * 2).unwrap())
             .expect("the next renewal");
         assert_eq!(next.sequence, 2, "renewal sequences strictly increase");
+    }
+
+    #[test]
+    fn a_stalled_presenter_observes_watchdog_expiry_instead_of_renewing_late() {
+        let start = Monotonic::from_micros(1_000_000);
+        let mut grant = InputGrant::new();
+        grant
+            .apply(&binding(1, INPUT_CLASS_KEYBOARD), &eligible(), start)
+            .unwrap();
+        assert!(
+            !grant.watchdog_expired(start.checked_add_micros(DEFAULT_WATCHDOG_US - 1).unwrap())
+        );
+        assert!(grant.watchdog_expired(start.checked_add_micros(DEFAULT_WATCHDOG_US).unwrap()));
+        assert!(
+            grant
+                .due_renewal(start.checked_add_micros(DEFAULT_WATCHDOG_US).unwrap())
+                .is_none()
+        );
     }
 
     #[test]
