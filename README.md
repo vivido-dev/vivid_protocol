@@ -33,7 +33,7 @@ its display root.
 | --- | --- |
 | Terminal-free streamed desktop | Veston or Vvsway → vvbridge → vvweb browser canvas |
 | Rich terminal media | Vivi → Vivido |
-| Browser terminal media | Vivid producer → vvbridge → vivido.js |
+| Browser terminal media | Vivid producer → vvmux_server/web |
 | Detachable and nested sessions | Vivid producer → vvmux → Vivido |
 | Custom applications | Your producer → your presenter |
 
