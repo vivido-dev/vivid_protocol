@@ -273,6 +273,34 @@ impl TokenBucket {
         Ok(())
     }
 
+    /// How long until `units` can be charged.
+    ///
+    /// `Ok(None)` means now. `Err` means never: a charge larger than the bucket can ever hold is
+    /// something the caller has to reject, not wait out — waiting would be an unbounded stall on
+    /// whatever thread is shaping the stream.
+    pub fn time_until(&self, units: u64) -> Result<Option<Duration>, ResourceError> {
+        if units <= self.tokens {
+            return Ok(None);
+        }
+        if units > self.capacity || self.rate_per_second == 0 {
+            return Err(ResourceError::ExceedsContract(
+                Resource::MediaRecordsPerSecond,
+            ));
+        }
+        let deficit = u128::from(units - self.tokens);
+        // Tokens already part-earned since the last replenish count toward the deficit.
+        let owed_nanos = deficit
+            .checked_mul(1_000_000_000)
+            .ok_or(ResourceError::Overflow)?
+            .saturating_sub(u128::from(self.remainder_nanos));
+        let rate = u128::from(self.rate_per_second);
+        // Round up: waiting the floor would wake with the charge still one token short.
+        let nanos = owed_nanos.div_ceil(rate);
+        Ok(Some(Duration::from_nanos(
+            u64::try_from(nanos).map_err(|_| ResourceError::Overflow)?,
+        )))
+    }
+
     pub fn charge(&mut self, units: u64) -> Result<(), ResourceError> {
         self.tokens = self
             .tokens
@@ -287,6 +315,34 @@ impl TokenBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_bucket_reports_the_exact_wait_for_a_charge_it_cannot_yet_admit() {
+        let mut bucket = TokenBucket::new(1_000, 1_000);
+        assert_eq!(
+            bucket.time_until(1_000),
+            Ok(None),
+            "a full bucket admits its capacity now"
+        );
+        bucket.charge(1_000).unwrap();
+        // Empty, earning 1000 tokens per second: 250 tokens is a quarter of a second.
+        assert_eq!(bucket.time_until(250), Ok(Some(Duration::from_millis(250))));
+        // Waiting exactly that long must be enough, not one token short.
+        bucket.replenish(Duration::from_millis(250)).unwrap();
+        assert_eq!(bucket.time_until(250), Ok(None));
+        assert!(bucket.charge(250).is_ok());
+    }
+
+    #[test]
+    fn a_charge_larger_than_the_bucket_is_refused_rather_than_waited_out() {
+        let bucket = TokenBucket::new(1_000, 1_000);
+        assert!(bucket.time_until(1_001).is_err());
+        // A bucket that earns nothing can never admit a charge it does not already hold.
+        let mut idle = TokenBucket::new(0, 10);
+        assert_eq!(idle.time_until(10), Ok(None));
+        idle.charge(10).unwrap();
+        assert!(idle.time_until(1).is_err());
+    }
 
     #[test]
     fn contract_requires_all_fields() {
