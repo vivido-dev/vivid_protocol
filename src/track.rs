@@ -26,6 +26,39 @@ pub const MILESTONE_CHANNEL_DETACHED: u64 = 1 << 9;
 pub const MILESTONE_TRACK_LOST: u64 = 1 << 10;
 pub const MILESTONE_KNOWN_MASK: u64 = (1 << 11) - 1;
 
+/// Unsigned Q32.32 linear amplitude used by `audio-gain-v1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AudioGain(u64);
+
+impl AudioGain {
+    pub const SILENT: Self = Self(0);
+    pub const UNITY: Self = Self(1_u64 << 32);
+    pub const MAX: Self = Self(2_u64 << 32);
+
+    pub const fn new(raw: u64) -> Option<Self> {
+        if raw <= Self::MAX.0 {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub fn from_percent(percent: u32) -> Option<Self> {
+        if percent > 200 {
+            return None;
+        }
+        Some(Self((u64::from(percent) << 32) / 100))
+    }
+
+    pub fn as_f32(self) -> f32 {
+        self.0 as f32 / (1_u64 << 32) as f32
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AcceptedOpen {
     generation: ChannelGeneration,
@@ -933,6 +966,15 @@ impl SignedValue for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_gain_covers_the_kitim_volume_range() {
+        assert_eq!(AudioGain::from_percent(0), Some(AudioGain::SILENT));
+        assert_eq!(AudioGain::from_percent(100), Some(AudioGain::UNITY));
+        assert_eq!(AudioGain::from_percent(200), Some(AudioGain::MAX));
+        assert_eq!(AudioGain::from_percent(201), None);
+        assert_eq!(AudioGain::new(AudioGain::MAX.raw() + 1), None);
+    }
 
     #[test]
     fn channel_generation_resets_generation_local_state() {

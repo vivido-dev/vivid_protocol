@@ -129,6 +129,7 @@ implements the entire profile and every declared prerequisite.
 | `canvas-surface-v1` | Optional | Core | Logical terminal-free canvas target |
 | `live-media-v1` | Optional | Core and one surface profile | Immediate/live video, audio, raster, and image tracks |
 | `timed-media-v1` | Optional | `live-media-v1` | Exact-PTS playback, pause, flush, EOS, and drain |
+| `audio-gain-v1` | Optional | `timed-media-v1` | Track-scoped audio output gain |
 | `desktop-input-v1` | Optional | `desktop-surface-v1`, `live-media-v1` | Epoch-checked input binding and watchdog |
 | `observability-v1` | Optional | Core | Bounded status, change events, and waits |
 | `web-carrier-v1` | Binding-selected | Core | WebTransport and WebSocket carrier constraints |

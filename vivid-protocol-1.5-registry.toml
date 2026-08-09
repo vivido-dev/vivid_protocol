@@ -56,6 +56,11 @@ state = "standards-track"
 prerequisites = ["live-media-v1"]
 
 [[profile]]
+name = "audio-gain-v1"
+state = "standards-track"
+prerequisites = ["timed-media-v1"]
+
+[[profile]]
 name = "desktop-input-v1"
 state = "standards-track"
 prerequisites = ["desktop-surface-v1", "live-media-v1"]
@@ -389,6 +394,11 @@ state = "standards-track"
 [[record]]
 value = 0x0306
 name = "PLAYBACK_STATE"
+state = "standards-track"
+
+[[record]]
+value = 0x0307
+name = "SET_AUDIO_GAIN"
 state = "standards-track"
 
 [[record]]

@@ -11,6 +11,7 @@ pub const DESKTOP_SURFACE: &str = "desktop-surface-v1";
 pub const CANVAS_SURFACE: &str = "canvas-surface-v1";
 pub const LIVE_MEDIA: &str = "live-media-v1";
 pub const TIMED_MEDIA: &str = "timed-media-v1";
+pub const AUDIO_GAIN: &str = "audio-gain-v1";
 pub const DESKTOP_INPUT: &str = "desktop-input-v1";
 pub const OBSERVABILITY: &str = "observability-v1";
 pub const WEB_CARRIER: &str = "web-carrier-v1";
@@ -83,6 +84,7 @@ pub mod record {
     pub const FLUSH: u16 = 0x0303;
     pub const DRAIN: u16 = 0x0304;
     pub const PLAYBACK_STATE: u16 = 0x0306;
+    pub const SET_AUDIO_GAIN: u16 = 0x0307;
 
     pub const CREATE_CONTEXT: u16 = 0x0600;
     pub const CONTEXT_READY: u16 = 0x0601;
@@ -235,6 +237,7 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
         | WEB_CARRIER
         | MULTIPLEXED_SESSION_CARRIER => Some(&[CORE_CONTROL]),
         TIMED_MEDIA => Some(&[LIVE_MEDIA]),
+        AUDIO_GAIN => Some(&[TIMED_MEDIA]),
         DESKTOP_INPUT => Some(&[DESKTOP_SURFACE, LIVE_MEDIA]),
         _ => None,
     }

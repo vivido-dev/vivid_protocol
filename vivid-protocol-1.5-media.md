@@ -475,6 +475,7 @@ not change. Old tracks remain valid but inactive until destroyed.
 | 20 | uint | Ingress depth bucket |
 | 21 | map, optional | Playback state |
 | 22 | uint, optional | Terminal loss code |
+| 23 | uint, optional | Unsigned 32.32 audio gain (`audio-gain-v1`, audio tracks only) |
 
 Keys 10 through 17 are presenter-accepted progress, not producer-submission acknowledgments.
 Control and track connections are independently ordered, including when they are carried through
@@ -779,6 +780,19 @@ device samples. It is bounded pending state and does not block control.
 | 10 | Track revision |
 
 Already-buffered media plays to completion after EOS. EOS is never an implicit pause.
+
+### 15.1 Audio gain
+
+This subsection requires `audio-gain-v1`. `SET_AUDIO_GAIN` (`0x0307`) carries complete track
+identity in keys 0 through 2 and an unsigned 32.32 linear-amplitude gain in key 3. The target MUST
+be an audio track. The inclusive range is zero through 2.0 (`0x0000000200000000`); 1.0
+(`0x0000000100000000`) is the initial value. Success returns `OK`.
+
+Gain changes affect device samples emitted after the request is applied. They do not change media
+timestamps, buffering, trim, the audio master clock, or encoded data. Gain is retained across
+`PAUSE`, `FLUSH`, and channel-generation advance and is discarded with the track. Applying a new
+gain advances the track revision and sets changed-field bit 4 in `TRACK_CHANGED`. When this
+profile is accepted, `TRACK_STATUS` key 23 reports the current gain for audio tracks.
 
 ## 16. Media conformance
 
