@@ -94,9 +94,12 @@ impl TraceDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceObjectKind {
     Session,
-    Source,
+    Surface,
+    Track,
     Node,
+    Transaction,
     Context,
+    Lease,
     Anchor,
     Connection,
     Trace,
@@ -106,9 +109,12 @@ impl TraceObjectKind {
     const fn name(self) -> &'static str {
         match self {
             Self::Session => "session",
-            Self::Source => "source",
+            Self::Surface => "surface",
+            Self::Track => "track",
             Self::Node => "node",
+            Self::Transaction => "transaction",
             Self::Context => "context",
+            Self::Lease => "lease",
             Self::Anchor => "anchor",
             Self::Connection => "connection",
             Self::Trace => "trace",
@@ -285,8 +291,8 @@ impl TraceEmitter {
         );
     }
 
-    /// Emit a policy-restricted source state without its hop-local source ID.
-    pub fn emit_restricted_source(
+    /// Emit a policy-restricted track state without its hop-local track ID.
+    pub fn emit_restricted_track(
         &self,
         direction: TraceDirection,
         record_type: u16,
@@ -298,7 +304,7 @@ impl TraceEmitter {
             record_type,
             body_length,
             connection_sequence,
-            TraceObjectKind::Source,
+            TraceObjectKind::Track,
             None,
             None,
             None,
@@ -437,14 +443,35 @@ pub fn object_kind(record_type: u16, object_id: u64) -> TraceObjectKind {
         messages::CREATE_NODE | messages::UPDATE_NODE | messages::DELETE_NODE => {
             TraceObjectKind::Node
         }
-        messages::CREATE_CONTEXT
-        | messages::REVOKE_CONTEXT
-        | messages::CONTEXT_CAPABILITY
-        | messages::CONTEXT_CHANGED => TraceObjectKind::Context,
+        messages::BEGIN_TXN | messages::COMMIT_TXN | messages::ABORT_TXN => {
+            TraceObjectKind::Transaction
+        }
+        messages::CREATE_CONTEXT | messages::REVOKE_CONTEXT | messages::CONTEXT_CHANGED => {
+            TraceObjectKind::Context
+        }
+        messages::CREATE_SESSION_LEASE
+        | messages::SESSION_LEASE_READY
+        | messages::REVOKE_SESSION_LEASE
+        | messages::SESSION_LEASE_CHANGED => TraceObjectKind::Lease,
         messages::ANCHOR_READY | messages::ANCHOR_GONE | messages::ANCHOR_STATUS => {
             TraceObjectKind::Anchor
         }
-        _ => TraceObjectKind::Source,
+        messages::CREATE_SURFACE
+        | messages::UPDATE_SURFACE
+        | messages::DESTROY_SURFACE
+        | messages::QUERY_SURFACE
+        | messages::SURFACE_STATUS
+        | messages::SURFACE_CHANGED
+        | messages::SET_INPUT_BINDING
+        | messages::INPUT_BOUND
+        | messages::INPUT_REVOKED
+        | messages::INPUT_LEASE_RENEW
+        | messages::INPUT_RESET
+        | messages::KEY_INPUT
+        | messages::POINTER_MOTION
+        | messages::POINTER_BUTTON
+        | messages::POINTER_AXIS => TraceObjectKind::Surface,
+        _ => TraceObjectKind::Track,
     }
 }
 
@@ -471,23 +498,22 @@ mod tests {
 
     #[test]
     fn trace_line_has_the_common_vocabulary_and_no_free_form_body() {
-        let body = messages::encode_hello(
-            7,
-            &messages::HelloConfig {
-                minimum_major: 1,
-                minimum_minor: 1,
-                maximum_major: 1,
-                maximum_minor: 1,
-                token: "secret-token",
-                producer: "private title",
-                producer_version: "1",
-                required_features: &[],
-                optional_features: &[],
-                maximum_record_body: crate::CONTROL_MAX_RECORD_BODY,
-                authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
-                preserved_fields: &[],
-            },
-        );
+        let body = messages::Hello {
+            producer_name: "private title".into(),
+            producer_version: "1".into(),
+            required_profiles: vec![
+                crate::registry::TERMINAL_SURFACE.into(),
+                crate::registry::CORE_CONTROL.into(),
+            ],
+            optional_profiles: vec![],
+            maximum_control_body: crate::CONTROL_MAX_RECORD_BODY,
+            client_nonce: [1; 32],
+            authentication: messages::HelloAuthentication::Root { proof: [2; 32] },
+            target_profile: crate::registry::TERMINAL_SURFACE.into(),
+            extensions: vec![],
+        }
+        .encode(7)
+        .unwrap();
         let records = Arc::new(Mutex::new(Vec::new()));
         let output = records.clone();
         let guard = TraceGuard::callback(

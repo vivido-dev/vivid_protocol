@@ -433,7 +433,7 @@ fn invariants() -> [(&'static str, &'static str); 8] {
         ),
         (
             "INV-4",
-            "CREDIT, PONG, errors, correlated replies, and checkpoints bypass batched flushing.",
+            "MAX_CHANNEL_DATA, PONG, errors, correlated replies, and checkpoints bypass batched flushing.",
         ),
         (
             "INV-5",

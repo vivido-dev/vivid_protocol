@@ -1,0 +1,852 @@
+registry_version = 1
+protocol_major = 1
+protocol_minor = 5
+unlisted_numeric_state = "unassigned"
+
+# This file is the authoritative numeric-assignment source for Vivid 1.5.
+# Valid states are: reserved, experimental, standards-track, retired.
+# Numeric assignments are append-only within the Vivid 1.5 version.
+
+[[record_range]]
+start = 0x7000
+end = 0x7fff
+state = "reserved"
+purpose = "future standards-track extensions"
+
+[[record_range]]
+start = 0x9000
+end = 0xbfff
+state = "experimental"
+purpose = "explicitly negotiated experiments"
+
+[[record_range]]
+start = 0xc000
+end = 0xffff
+state = "reserved"
+purpose = "vendor-specific records, disabled without explicit negotiation"
+
+[[profile]]
+name = "vivid-core-control-v1"
+state = "standards-track"
+prerequisites = []
+
+[[profile]]
+name = "terminal-surface-v1"
+state = "standards-track"
+prerequisites = ["vivid-core-control-v1"]
+
+[[profile]]
+name = "desktop-surface-v1"
+state = "standards-track"
+prerequisites = ["vivid-core-control-v1"]
+
+[[profile]]
+name = "canvas-surface-v1"
+state = "standards-track"
+prerequisites = ["vivid-core-control-v1"]
+
+[[profile]]
+name = "live-media-v1"
+state = "standards-track"
+prerequisites = ["vivid-core-control-v1"]
+
+[[profile]]
+name = "timed-media-v1"
+state = "standards-track"
+prerequisites = ["live-media-v1"]
+
+[[profile]]
+name = "audio-gain-v1"
+state = "standards-track"
+prerequisites = ["timed-media-v1"]
+
+[[profile]]
+name = "desktop-input-v1"
+state = "standards-track"
+prerequisites = ["desktop-surface-v1", "live-media-v1"]
+
+[[profile]]
+name = "observability-v1"
+state = "standards-track"
+prerequisites = ["vivid-core-control-v1"]
+
+[[profile]]
+name = "web-carrier-v1"
+state = "standards-track"
+prerequisites = ["vivid-core-control-v1"]
+
+[[profile]]
+name = "multiplexed-session-carrier-v1"
+state = "experimental"
+prerequisites = ["vivid-core-control-v1"]
+
+[[surface_profile]]
+name = "generic-content-v1"
+state = "standards-track"
+
+[[surface_profile]]
+name = "terminal-content-v1"
+state = "standards-track"
+
+[[surface_profile]]
+name = "desktop-content-v1"
+state = "standards-track"
+
+[[surface_profile]]
+name = "canvas-content-v1"
+state = "standards-track"
+
+[[connection_kind]]
+value = 0
+name = "CONTROL"
+state = "standards-track"
+
+[[connection_kind]]
+value = 1
+name = "LANE"
+state = "standards-track"
+
+[[connection_kind]]
+value = 2
+name = "TRACK"
+state = "standards-track"
+
+[[record]]
+value = 0x0001
+name = "HELLO"
+state = "standards-track"
+
+[[record]]
+value = 0x0002
+name = "WELCOME"
+state = "standards-track"
+
+[[record]]
+value = 0x0003
+name = "OK"
+state = "standards-track"
+
+[[record]]
+value = 0x0004
+name = "ERROR"
+state = "standards-track"
+
+[[record]]
+value = 0x0005
+name = "PING"
+state = "standards-track"
+
+[[record]]
+value = 0x0006
+name = "PONG"
+state = "standards-track"
+
+[[record]]
+value = 0x0007
+name = "GOODBYE"
+state = "standards-track"
+
+[[record]]
+value = 0x0008
+name = "QUERY_SESSION"
+state = "standards-track"
+
+[[record]]
+value = 0x0009
+name = "SESSION_STATUS"
+state = "standards-track"
+
+[[record]]
+value = 0x000a
+name = "LANE_OPEN"
+state = "standards-track"
+
+[[record]]
+value = 0x000b
+name = "LANE_ACCEPTED"
+state = "standards-track"
+
+[[record]]
+value = 0x000c
+name = "TARGET_CHANGED"
+state = "standards-track"
+
+[[record]]
+value = 0x000d
+name = "CAPS_CHANGED"
+state = "standards-track"
+
+[[record]]
+value = 0x000e
+name = "SET_OBSERVATION"
+state = "standards-track"
+
+[[record]]
+value = 0x000f
+name = "OBSERVATION_GAP"
+state = "standards-track"
+
+[[record]]
+value = 0x0100
+name = "CREATE_SURFACE"
+state = "standards-track"
+
+[[record]]
+value = 0x0101
+name = "SURFACE_READY"
+state = "standards-track"
+
+[[record]]
+value = 0x0102
+name = "UPDATE_SURFACE"
+state = "standards-track"
+
+[[record]]
+value = 0x0103
+name = "DESTROY_SURFACE"
+state = "standards-track"
+
+[[record]]
+value = 0x0104
+name = "QUERY_SURFACE"
+state = "standards-track"
+
+[[record]]
+value = 0x0105
+name = "SURFACE_STATUS"
+state = "standards-track"
+
+[[record]]
+value = 0x0106
+name = "SURFACE_CHANGED"
+state = "standards-track"
+
+[[record]]
+value = 0x0120
+name = "PROBE_TRACK_CONFIG"
+state = "standards-track"
+
+[[record]]
+value = 0x0121
+name = "TRACK_SUPPORT"
+state = "standards-track"
+
+[[record]]
+value = 0x0122
+name = "CREATE_TRACK"
+state = "standards-track"
+
+[[record]]
+value = 0x0123
+name = "TRACK_READY"
+state = "standards-track"
+
+[[record]]
+value = 0x0124
+name = "DESTROY_TRACK"
+state = "standards-track"
+
+[[record]]
+value = 0x0125
+name = "TRACK_LOST"
+state = "standards-track"
+
+[[record]]
+value = 0x0126
+name = "ACTIVATE_TRACK"
+state = "standards-track"
+
+[[record]]
+value = 0x0127
+name = "TRACK_ACTIVATED"
+state = "standards-track"
+
+[[record]]
+value = 0x0128
+name = "ADVANCE_CHANNEL"
+state = "standards-track"
+
+[[record]]
+value = 0x0129
+name = "CHANNEL_ADVANCED"
+state = "standards-track"
+
+[[record]]
+value = 0x012a
+name = "QUERY_TRACK"
+state = "standards-track"
+
+[[record]]
+value = 0x012b
+name = "TRACK_STATUS"
+state = "standards-track"
+
+[[record]]
+value = 0x012c
+name = "WAIT_TRACK"
+state = "standards-track"
+
+[[record]]
+value = 0x012d
+name = "WAIT_SATISFIED"
+state = "standards-track"
+
+[[record]]
+value = 0x012e
+name = "CANCEL_WAIT"
+state = "standards-track"
+
+[[record]]
+value = 0x012f
+name = "TRACK_CHANGED"
+state = "standards-track"
+
+[[record]]
+value = 0x0200
+name = "BEGIN_TXN"
+state = "standards-track"
+
+[[record]]
+value = 0x0201
+name = "CREATE_NODE"
+state = "standards-track"
+
+[[record]]
+value = 0x0202
+name = "UPDATE_NODE"
+state = "standards-track"
+
+[[record]]
+value = 0x0203
+name = "DELETE_NODE"
+state = "standards-track"
+
+[[record]]
+value = 0x0204
+name = "COMMIT_TXN"
+state = "standards-track"
+
+[[record]]
+value = 0x0205
+name = "ABORT_TXN"
+state = "standards-track"
+
+[[record]]
+value = 0x0206
+name = "SCENE_PRESENTED"
+state = "standards-track"
+
+[[record]]
+value = 0x0207
+name = "QUERY_SCENE"
+state = "standards-track"
+
+[[record]]
+value = 0x0208
+name = "SCENE_STATUS"
+state = "standards-track"
+
+[[record]]
+value = 0x0209
+name = "SCENE_CHANGED"
+state = "standards-track"
+
+[[record]]
+value = 0x020a
+name = "ANCHOR_READY"
+state = "standards-track"
+
+[[record]]
+value = 0x020b
+name = "ANCHOR_GONE"
+state = "standards-track"
+
+[[record]]
+value = 0x020c
+name = "QUERY_ANCHOR"
+state = "standards-track"
+
+[[record]]
+value = 0x020d
+name = "ANCHOR_STATUS"
+state = "standards-track"
+
+[[record]]
+value = 0x0300
+name = "PLAY"
+state = "standards-track"
+
+[[record]]
+value = 0x0301
+name = "PAUSE"
+state = "standards-track"
+
+[[record]]
+value = 0x0303
+name = "FLUSH"
+state = "standards-track"
+
+[[record]]
+value = 0x0304
+name = "DRAIN"
+state = "standards-track"
+
+[[record]]
+value = 0x0306
+name = "PLAYBACK_STATE"
+state = "standards-track"
+
+[[record]]
+value = 0x0307
+name = "SET_AUDIO_GAIN"
+state = "standards-track"
+
+[[record]]
+value = 0x0600
+name = "CREATE_CONTEXT"
+state = "standards-track"
+
+[[record]]
+value = 0x0601
+name = "CONTEXT_READY"
+state = "standards-track"
+
+[[record]]
+value = 0x0602
+name = "REVOKE_CONTEXT"
+state = "standards-track"
+
+[[record]]
+value = 0x0603
+name = "CONTEXT_CHANGED"
+state = "standards-track"
+
+[[record]]
+value = 0x0610
+name = "CREATE_SESSION_LEASE"
+state = "standards-track"
+
+[[record]]
+value = 0x0611
+name = "SESSION_LEASE_READY"
+state = "standards-track"
+
+[[record]]
+value = 0x0612
+name = "REVOKE_SESSION_LEASE"
+state = "standards-track"
+
+[[record]]
+value = 0x0613
+name = "SESSION_LEASE_CHANGED"
+state = "standards-track"
+
+[[record]]
+value = 0x0700
+name = "SET_INPUT_BINDING"
+state = "standards-track"
+
+[[record]]
+value = 0x0701
+name = "INPUT_BOUND"
+state = "standards-track"
+
+[[record]]
+value = 0x0702
+name = "INPUT_REVOKED"
+state = "standards-track"
+
+[[record]]
+value = 0x0703
+name = "INPUT_LEASE_RENEW"
+state = "standards-track"
+
+[[record]]
+value = 0x0704
+name = "INPUT_RESET"
+state = "standards-track"
+
+[[record]]
+value = 0x0710
+name = "KEY_INPUT"
+state = "standards-track"
+
+[[record]]
+value = 0x0711
+name = "POINTER_MOTION"
+state = "standards-track"
+
+[[record]]
+value = 0x0712
+name = "POINTER_BUTTON"
+state = "standards-track"
+
+[[record]]
+value = 0x0713
+name = "POINTER_AXIS"
+state = "standards-track"
+
+[[record]]
+value = 0x8000
+name = "CHANNEL_OPEN"
+state = "standards-track"
+
+[[record]]
+value = 0x8001
+name = "VIDEO_PACKET"
+state = "standards-track"
+
+[[record]]
+value = 0x8002
+name = "VIDEO_FRAGMENT"
+state = "retired"
+
+[[record]]
+value = 0x8003
+name = "RASTER_FRAME"
+state = "standards-track"
+
+[[record]]
+value = 0x8004
+name = "BLOB_CHUNK"
+state = "retired"
+
+[[record]]
+value = 0x8005
+name = "BUFFER_SUBMIT"
+state = "retired"
+
+[[record]]
+value = 0x8006
+name = "IMAGE_DATA"
+state = "standards-track"
+
+[[record]]
+value = 0x8007
+name = "AUDIO_PACKET"
+state = "standards-track"
+
+[[record]]
+value = 0x8008
+name = "CHANNEL_ACCEPTED"
+state = "standards-track"
+
+[[record]]
+value = 0x8009
+name = "MAX_CHANNEL_DATA"
+state = "standards-track"
+
+[[record]]
+value = 0x800a
+name = "CHANNEL_EOS"
+state = "standards-track"
+
+[[record]]
+value = 0x800b
+name = "NEED_KEYFRAME"
+state = "standards-track"
+
+[[record]]
+value = 0x800c
+name = "NEED_FULL_FRAME"
+state = "standards-track"
+
+[[error]]
+value = 1
+name = "AUTH_FAILED"
+state = "standards-track"
+
+[[error]]
+value = 2
+name = "UNSUPPORTED_VERSION"
+state = "standards-track"
+
+[[error]]
+value = 3
+name = "UNSUPPORTED_PROFILE"
+state = "standards-track"
+
+[[error]]
+value = 4
+name = "UNSUPPORTED_CONFIG"
+state = "standards-track"
+
+[[error]]
+value = 5
+name = "BAD_MESSAGE"
+state = "standards-track"
+
+[[error]]
+value = 6
+name = "BAD_STATE"
+state = "standards-track"
+
+[[error]]
+value = 7
+name = "DUPLICATE_ID"
+state = "standards-track"
+
+[[error]]
+value = 8
+name = "NOT_FOUND"
+state = "standards-track"
+
+[[error]]
+value = 9
+name = "LIMIT_EXCEEDED"
+state = "standards-track"
+
+[[error]]
+value = 10
+name = "NO_MEMORY"
+state = "standards-track"
+
+[[error]]
+value = 11
+name = "FLOW_CONTROL"
+state = "standards-track"
+
+[[error]]
+value = 12
+name = "HASH_MISMATCH"
+state = "standards-track"
+
+[[error]]
+value = 13
+name = "NEED_KEYFRAME"
+state = "standards-track"
+
+[[error]]
+value = 14
+name = "STALE_EPOCH"
+state = "standards-track"
+
+[[error]]
+value = 15
+name = "STALE_TARGET_GENERATION"
+state = "standards-track"
+
+[[error]]
+value = 16
+name = "ANCHOR_INVALIDATED"
+state = "standards-track"
+
+[[error]]
+value = 17
+name = "AUTHORITY_REVOKED"
+state = "standards-track"
+
+[[error]]
+value = 18
+name = "DECODER"
+state = "standards-track"
+
+[[error]]
+value = 19
+name = "DEVICE_LOST"
+state = "standards-track"
+
+[[error]]
+value = 20
+name = "TIMEOUT"
+state = "standards-track"
+
+[[error]]
+value = 21
+name = "PRECONDITION_FAILED"
+state = "standards-track"
+
+[[error]]
+value = 22
+name = "ALREADY_APPLIED"
+state = "standards-track"
+
+[[error]]
+value = 23
+name = "NOT_VISIBLE"
+state = "standards-track"
+
+[[error]]
+value = 24
+name = "CANCELLED"
+state = "standards-track"
+
+[[error]]
+value = 25
+name = "UNKNOWN_OUTCOME"
+state = "standards-track"
+
+[[error]]
+value = 26
+name = "CHANNEL_BUSY"
+state = "standards-track"
+
+[[error]]
+value = 27
+name = "STALE_CHANNEL_GENERATION"
+state = "standards-track"
+
+[[error]]
+value = 28
+name = "LEASE_SUSPENDED"
+state = "standards-track"
+
+[[error]]
+value = 29
+name = "RATE_LIMITED"
+state = "standards-track"
+
+[[error]]
+value = 30
+name = "INTEGRITY_FAILED"
+state = "standards-track"
+
+[[limit]]
+value = 1
+name = "CONCURRENT_SESSIONS"
+state = "standards-track"
+
+[[limit]]
+value = 2
+name = "CONCURRENT_CONNECTIONS"
+state = "standards-track"
+
+[[limit]]
+value = 3
+name = "CONTEXTS"
+state = "standards-track"
+
+[[limit]]
+value = 4
+name = "SESSION_LEASES"
+state = "standards-track"
+
+[[limit]]
+value = 5
+name = "SURFACES"
+state = "standards-track"
+
+[[limit]]
+value = 6
+name = "TRACKS"
+state = "standards-track"
+
+[[limit]]
+value = 7
+name = "NODES"
+state = "standards-track"
+
+[[limit]]
+value = 8
+name = "DECODER_INSTANCES"
+state = "standards-track"
+
+[[limit]]
+value = 9
+name = "CODED_PIXELS_PER_TRACK"
+state = "standards-track"
+
+[[limit]]
+value = 10
+name = "DECODED_PIXELS_PER_SECOND"
+state = "standards-track"
+
+[[limit]]
+value = 11
+name = "ENCODED_BITS_PER_SECOND"
+state = "standards-track"
+
+[[limit]]
+value = 12
+name = "MEDIA_RECORDS_PER_SECOND"
+state = "standards-track"
+
+[[limit]]
+value = 13
+name = "AUDIO_SAMPLE_RATE"
+state = "standards-track"
+
+[[limit]]
+value = 14
+name = "AUDIO_CHANNELS_PER_TRACK"
+state = "standards-track"
+
+[[limit]]
+value = 15
+name = "INFLIGHT_MEDIA_BYTES"
+state = "standards-track"
+
+[[limit]]
+value = 16
+name = "RETAINED_PIXELS"
+state = "standards-track"
+
+[[limit]]
+value = 17
+name = "MEDIA_RECORD_BODY"
+state = "standards-track"
+
+[[limit]]
+value = 18
+name = "CONTROL_RECORD_BODY"
+state = "standards-track"
+
+[[limit]]
+value = 19
+name = "PENDING_REQUESTS"
+state = "standards-track"
+
+[[limit]]
+value = 20
+name = "REGISTERED_WAITS"
+state = "standards-track"
+
+[[limit]]
+value = 21
+name = "IDEMPOTENCY_ENTRIES"
+state = "standards-track"
+
+[[limit]]
+value = 22
+name = "SUSPENDED_SESSIONS"
+state = "standards-track"
+
+[[limit]]
+value = 23
+name = "DISCONNECT_GRACE"
+state = "standards-track"
+
+[[limit]]
+value = 24
+name = "INPUT_EVENTS_PER_SECOND"
+state = "standards-track"
+
+[[limit]]
+value = 25
+name = "OBSERVATION_QUEUE"
+state = "standards-track"
+
+[[limit]]
+value = 26
+name = "IMAGE_CACHE_BYTES"
+state = "standards-track"
+
+[[limit]]
+value = 27
+name = "CHANNEL_OPEN_ATTEMPTS"
+state = "standards-track"
+
+[[limit]]
+value = 28
+name = "OPEN_SCENE_TRANSACTIONS"
+state = "standards-track"
+
+[[limit]]
+value = 29
+name = "ACTIVE_ANCHORS"
+state = "standards-track"
+
+[[limit]]
+value = 30
+name = "SEEN_ANCHOR_IDS"
+state = "standards-track"

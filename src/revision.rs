@@ -1,34 +1,15 @@
-//! Strongly typed, checked revision domains used by Vivid 1.1 observability.
+//! Checked Vivid 1.5 revision and generation domains.
 
-use std::error::Error;
-use std::fmt::{self, Display, Formatter};
+use std::{fmt, io};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RevisionExhausted {
-    domain: &'static str,
-}
-
-impl RevisionExhausted {
-    pub const fn domain(self) -> &'static str {
-        self.domain
-    }
-}
-
-impl Display for RevisionExhausted {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} exhausted", self.domain)
-    }
-}
-
-impl Error for RevisionExhausted {}
-
-macro_rules! revision_type {
-    ($name:ident, $domain:literal) => {
-        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+macro_rules! counter_type {
+    ($name:ident, $label:literal) => {
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(u64);
 
         impl $name {
             pub const ZERO: Self = Self(0);
+            pub const ONE: Self = Self(1);
 
             pub const fn new(value: u64) -> Self {
                 Self(value)
@@ -38,55 +19,72 @@ macro_rules! revision_type {
                 self.0
             }
 
-            pub fn advance(self) -> Result<Self, RevisionExhausted> {
-                self.0
-                    .checked_add(1)
-                    .map(Self)
-                    .ok_or(RevisionExhausted { domain: $domain })
+            pub fn advance(self) -> io::Result<Self> {
+                self.0.checked_add(1).map(Self).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, concat!($label, " exhausted"))
+                })
             }
-        }
 
-        impl From<u64> for $name {
-            fn from(value: u64) -> Self {
-                Self::new(value)
+            pub fn require_nonzero(self) -> io::Result<Self> {
+                if self.0 == 0 {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        concat!($label, " must be nonzero"),
+                    ))
+                } else {
+                    Ok(self)
+                }
             }
         }
 
         impl From<$name> for u64 {
             fn from(value: $name) -> Self {
-                value.get()
+                value.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
             }
         }
     };
 }
 
-revision_type!(SceneRevision, "scene revision");
-revision_type!(SourceRevision, "source revision");
-revision_type!(ObservationSequence, "observation sequence");
+counter_type!(SessionRevision, "session revision");
+counter_type!(ContextRevision, "context revision");
+counter_type!(SurfaceRevision, "surface revision");
+counter_type!(SurfaceGeneration, "surface generation");
+counter_type!(TrackRevision, "track revision");
+counter_type!(SceneRevision, "scene revision");
+counter_type!(ObservationSequence, "observation sequence");
+counter_type!(TargetGeneration, "target generation");
+counter_type!(CapabilityGeneration, "capability generation");
+counter_type!(ResumeGeneration, "lease resume generation");
+counter_type!(ChannelGeneration, "channel generation");
+counter_type!(InputEpoch, "input epoch");
+counter_type!(GrantGeneration, "presenter grant generation");
+counter_type!(MediaEpoch, "media epoch");
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn revision_domains_advance_without_aliasing() {
-        assert_eq!(SceneRevision::ZERO.advance().unwrap().get(), 1);
-        assert_eq!(SourceRevision::new(4).advance().unwrap().get(), 5);
-        assert_eq!(ObservationSequence::new(8).advance().unwrap().get(), 9);
+    fn domains_advance_independently() {
+        assert_eq!(SessionRevision::ONE.advance().unwrap().get(), 2);
+        assert_eq!(SurfaceGeneration::ONE.advance().unwrap().get(), 2);
+        assert_eq!(TrackRevision::ONE.advance().unwrap().get(), 2);
     }
 
     #[test]
-    fn revision_exhaustion_is_typed_and_never_wraps() {
-        for error in [
-            SceneRevision::new(u64::MAX).advance().unwrap_err(),
-            SourceRevision::new(u64::MAX).advance().unwrap_err(),
-            ObservationSequence::new(u64::MAX).advance().unwrap_err(),
-        ] {
-            assert!(error.to_string().ends_with("exhausted"));
-        }
+    fn exhaustion_is_an_error() {
         assert_eq!(
-            SceneRevision::new(u64::MAX).advance().unwrap_err().domain(),
-            "scene revision"
+            ChannelGeneration::new(u64::MAX)
+                .advance()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
         );
     }
 }

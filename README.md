@@ -22,8 +22,8 @@ its display root.
   of escape-sequence payloads.
 - **Built for real playback.** Retained scenes, exact-PTS playback, linked audio/video, flow
   control, visibility, recovery, and observability are part of the protocol.
-- **Secure by design.** Private endpoints, capability authentication, bounded records, and
-  source-scoped failure are core expectations—not application-specific extras.
+- **Secure by design.** Private endpoints, transcript authentication, bounded records, and
+  track-scoped failure are core expectations—not application-specific extras.
 - **Renderer and transport independent.** Implement a producer, presenter, relay, multiplexer, or
   language binding without adopting a particular UI stack.
 
@@ -33,7 +33,7 @@ its display root.
 | --- | --- |
 | Terminal-free streamed desktop | Veston or Vvsway → vvbridge → vvweb browser canvas |
 | Rich terminal media | Vivi → Vivido |
-| Browser terminal media | Vivid producer → vvbridge → vivido.js |
+| Browser terminal media | Vivid producer → vvmux_server/web |
 | Detachable and nested sessions | Vivid producer → vvmux → Vivido |
 | Custom applications | Your producer → your presenter |
 
@@ -41,10 +41,6 @@ The [vvweb demo](../vvweb/demo/) is the clearest terminal-free example: a native
 streams H.264 video and linked Opus audio through an authenticated WebSocket bridge, while the
 browser renders the Vivid root scene and returns physical input. No terminal emulator, shell, or
 PTY is involved.
-
-For a small, dependency-free protocol example, see
-[`examples/vivid_image.py`](examples/vivid_image.py). It sends a retained PNG or JPEG directly to a
-Vivid presenter using only Python's standard library.
 
 ## Choose your starting point
 
@@ -65,31 +61,36 @@ For a WebAssembly target:
 cargo add vivid_protocol --no-default-features
 ```
 
-The crate provides deterministic bounded CBOR, framing, typed control messages, media record
-layouts and validation, scene revisions, and authenticated terminal anchors. Native builds also
-include protocol tracing. The crate contains no renderer and does not choose your application
-architecture.
+The crate provides deterministic bounded CBOR, framing, profile and numeric registries,
+root/lease/resume authentication, finite resource accounting, stable surface and scene state,
+immutable track and channel-generation state, final-gated desktop input, portable media record
+layouts, and authenticated terminal anchors. Native builds also include metadata-only protocol
+tracing. The crate contains no renderer and does not choose your application architecture.
 
 API documentation is on [docs.rs](https://docs.rs/vivid_protocol).
 
 ## Protocol in 30 seconds
 
 ```text
-producer ── control + per-source media streams ──> presenter ──> any render surface
+producer ── control + lanes + per-track channels ──> presenter ──> any render surface
 ```
 
-A producer creates media sources and commits retained scene updates. A presenter validates,
-buffers, schedules, and renders them. Terminal anchors are available when text-relative placement
-is useful; they are absent from terminal-free root-scene deployments.
+A producer creates stable surfaces, attaches immutable media tracks, and commits retained scene
+updates. A presenter validates, buffers, schedules, and renders them. Track replacement does not
+change surface, scene, or input identity. Terminal anchors are available when text-relative
+placement is useful; they are absent from terminal-free root-scene deployments.
 
-For record layouts, state machines, feature negotiation, security requirements, and interoperability
-rules, read the normative
-**[Vivid Protocol 1.1 specification](vivid-protocol-1.1-spec.md)**.
+For record layouts, state machines, profile negotiation, security requirements, and
+interoperability rules, read the normative multipart
+**[Vivid Protocol 1.5 specification](vivid-protocol-1.5-spec.md)**. Implementers migrating from
+the retired source/ticket/credit model should also read the
+**[1.1 to 1.5 migration guide](vivid-protocol-1.1-to-1.5-migration.md)**.
 
 ## Compatibility
 
-This crate implements Vivid Protocol 1.1 and requires Rust 1.85 or newer. Protocol support is
-negotiated by feature; do not infer optional behavior from the minor version alone.
+This crate implements Vivid Protocol 1.5 and requires Rust 1.87 or newer. Vivid 1.5 is not
+wire-compatible with Vivid 1.1. Protocol support is negotiated by coherent named profiles; the
+preface selects the exact wire version.
 
 ## Contributing
 

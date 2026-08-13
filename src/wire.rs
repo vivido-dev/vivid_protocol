@@ -6,6 +6,8 @@ use std::fs::{self, File};
 use std::io::{IoSlice, Read, Write};
 #[cfg(feature = "native")]
 use std::net::TcpStream;
+#[cfg(all(feature = "native", unix))]
+use std::os::unix::net::UnixStream;
 #[cfg(feature = "native")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "native")]
@@ -17,7 +19,7 @@ use std::time::Duration;
 use super::DEFAULT_MAX_RECORD_BODY;
 use super::{HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
 #[cfg(feature = "native")]
-use crate::messages::{CREDIT, ERROR, PONG};
+use crate::messages::{ERROR, INPUT_RESET, INPUT_REVOKED, MAX_CHANNEL_DATA, PONG};
 
 pub const PREFACE_SIZE: usize = 16;
 pub const HEADER_SIZE: usize = 24;
@@ -42,11 +44,8 @@ pub enum FlushMode {
 #[allow(dead_code)]
 pub enum ConnectionKind {
     Control = 0,
-    Video = 1,
-    Raster = 2,
-    Blob = 3,
-    LocalBuffer = 4,
-    Audio = 5,
+    Lane = 1,
+    Track = 2,
 }
 
 impl TryFrom<u8> for ConnectionKind {
@@ -55,16 +54,39 @@ impl TryFrom<u8> for ConnectionKind {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Control),
-            1 => Ok(Self::Video),
-            2 => Ok(Self::Raster),
-            3 => Ok(Self::Blob),
-            4 => Ok(Self::LocalBuffer),
-            5 => Ok(Self::Audio),
+            1 => Ok(Self::Lane),
+            2 => Ok(Self::Track),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown Vivid connection kind {value}"),
             )),
         }
+    }
+}
+
+impl ConnectionKind {
+    pub const fn required_first_record(self) -> u16 {
+        match self {
+            Self::Control => crate::messages::HELLO,
+            Self::Lane => crate::messages::LANE_OPEN,
+            Self::Track => crate::messages::CHANNEL_OPEN,
+        }
+    }
+
+    pub fn validate_first_record(self, header: &RecordHeader) -> io::Result<()> {
+        if header.sequence != 1 || header.record_type != self.required_first_record() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "first record does not match the Vivid connection kind",
+            ));
+        }
+        if self == Self::Control && header.object_id != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HELLO must use session-level object ID zero",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -176,6 +198,44 @@ pub enum Endpoint {
 }
 
 #[cfg(feature = "native")]
+struct ConnectedIo {
+    reader: ReaderIo,
+    writer: WriterIo,
+}
+
+#[cfg(feature = "native")]
+enum ReaderIo {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+    Other(Box<dyn Read + Send>),
+}
+
+#[cfg(feature = "native")]
+impl ReaderIo {
+    fn clear_establishment_read_deadline(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_read_timeout(None),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_read_timeout(None),
+            Self::Other(_) => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl Read for ReaderIo {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(buffer),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.read(buffer),
+            Self::Other(reader) => reader.read(buffer),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
 impl Endpoint {
     pub fn parse(value: &str) -> io::Result<Self> {
         if let Some(path) = value.strip_prefix("unix:") {
@@ -188,13 +248,19 @@ impl Endpoint {
             return Ok(Self::Unix(PathBuf::from(path)));
         }
         if let Some(address) = value.strip_prefix("tcp:") {
-            if address.is_empty() {
+            let parsed = address.parse::<std::net::SocketAddrV4>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "native TCP endpoint is not an IPv4 socket address",
+                )
+            })?;
+            if *parsed.ip() != std::net::Ipv4Addr::LOCALHOST || parsed.port() == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "empty TCP endpoint",
+                    "native TCP endpoint must use exact 127.0.0.1 and a nonzero port",
                 ));
             }
-            return Ok(Self::Tcp(address.to_owned()));
+            return Ok(Self::Tcp(parsed.to_string()));
         }
         if value.contains("://") {
             return Err(io::Error::new(
@@ -212,7 +278,7 @@ impl Endpoint {
         Ok(Self::Unix(path))
     }
 
-    fn connect(&self) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    fn connect(&self) -> io::Result<ConnectedIo> {
         match self {
             Self::Unix(path) => connect_unix(path),
             Self::Tcp(address) => {
@@ -221,25 +287,29 @@ impl Endpoint {
                 stream.set_write_timeout(Some(Duration::from_secs(30)))?;
                 stream.set_nodelay(true)?;
                 let writer = stream.try_clone()?;
-                Ok((Box::new(stream), Box::new(writer)))
+                Ok(ConnectedIo {
+                    reader: ReaderIo::Tcp(stream),
+                    writer: WriterIo::Tcp(writer),
+                })
             }
         }
     }
 }
 
 #[cfg(all(feature = "native", unix))]
-fn connect_unix(path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
-    use std::os::unix::net::UnixStream;
-
+fn connect_unix(path: &Path) -> io::Result<ConnectedIo> {
     let stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let writer = stream.try_clone()?;
-    Ok((Box::new(stream), Box::new(writer)))
+    Ok(ConnectedIo {
+        reader: ReaderIo::Unix(stream),
+        writer: WriterIo::Unix(writer),
+    })
 }
 
 #[cfg(all(feature = "native", not(unix)))]
-fn connect_unix(_path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+fn connect_unix(_path: &Path) -> io::Result<ConnectedIo> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Unix Vivid endpoints are not supported on this platform; named-pipe support is pending",
@@ -248,9 +318,24 @@ fn connect_unix(_path: &Path) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write
 
 #[cfg(feature = "native")]
 enum WriterIo {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
     Live(Box<dyn Write + Send>),
     Trace(File),
     Sink(io::Sink),
+}
+
+#[cfg(feature = "native")]
+impl WriterIo {
+    fn clear_establishment_write_deadline(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_write_timeout(None),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_write_timeout(None),
+            Self::Live(_) | Self::Trace(_) | Self::Sink(_) => Ok(()),
+        }
+    }
 }
 
 #[cfg(feature = "native")]
@@ -357,7 +442,10 @@ impl ConnectionWriter {
         state.unflushed_records = state.unflushed_records.saturating_add(1);
         let must_flush = state.flush_mode == FlushMode::Immediate
             || checkpoint
-            || matches!(record_type, CREDIT | PONG | ERROR)
+            || matches!(
+                record_type,
+                MAX_CHANNEL_DATA | INPUT_REVOKED | INPUT_RESET | PONG | ERROR
+            )
             || has_correlated_control_envelope(record_type, parts)
             || state.unflushed_records >= BATCH_RECORD_LIMIT;
         if must_flush {
@@ -414,7 +502,7 @@ impl ConnectionWriter {
 /// Blocking receive half of a live Vivid connection.
 #[cfg(feature = "native")]
 pub struct ConnectionReader {
-    io: Box<dyn Read + Send>,
+    io: ReaderIo,
     receive_sequence: u64,
     receive_body_limit: u32,
 }
@@ -430,6 +518,10 @@ pub struct BorrowedRecord<'a> {
 
 #[cfg(feature = "native")]
 impl ConnectionReader {
+    fn clear_establishment_read_deadline(&mut self) -> io::Result<()> {
+        self.io.clear_establishment_read_deadline()
+    }
+
     pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
         validate_body_limit(maximum)?;
         self.receive_body_limit = maximum;
@@ -518,8 +610,8 @@ impl Connection {
         major: u8,
         minor: u8,
     ) -> io::Result<Self> {
-        let (reader, writer) = endpoint.connect()?;
-        Self::new_version(Some(reader), WriterIo::Live(writer), kind, major, minor)
+        let ConnectedIo { reader, writer } = endpoint.connect()?;
+        Self::new_version(Some(reader), writer, kind, major, minor)
     }
 
     /// Start an initiator-side Vivid connection over an already authenticated transport.
@@ -532,7 +624,7 @@ impl Connection {
         writer: Box<dyn Write + Send>,
         kind: ConnectionKind,
     ) -> io::Result<Self> {
-        Self::new(Some(reader), WriterIo::Live(writer), kind)
+        Self::new(Some(ReaderIo::Other(reader)), WriterIo::Live(writer), kind)
     }
 
     pub fn trace(path: &Path, kind: ConnectionKind) -> io::Result<Self> {
@@ -546,16 +638,12 @@ impl Connection {
         Self::new(None, WriterIo::Sink(io::sink()), kind)
     }
 
-    fn new(
-        reader: Option<Box<dyn Read + Send>>,
-        io: WriterIo,
-        kind: ConnectionKind,
-    ) -> io::Result<Self> {
+    fn new(reader: Option<ReaderIo>, io: WriterIo, kind: ConnectionKind) -> io::Result<Self> {
         Self::new_version(reader, io, kind, VIVID_MAJOR, VIVID_MINOR)
     }
 
     fn new_version(
-        reader: Option<Box<dyn Read + Send>>,
+        reader: Option<ReaderIo>,
         io: WriterIo,
         kind: ConnectionKind,
         major: u8,
@@ -575,12 +663,7 @@ impl Connection {
                 unflushed_records: 0,
             })),
         };
-        writer.write_raw_preface(&encode_preface_version(
-            kind,
-            DEFAULT_MAX_RECORD_BODY,
-            major,
-            minor,
-        ))?;
+        writer.write_raw_preface(&encode_preface_version(kind, body_limit, major, minor))?;
         Ok(Self {
             reader: reader.map(|io| ConnectionReader {
                 io,
@@ -591,13 +674,26 @@ impl Connection {
         })
     }
 
+    /// Commit a positively established connection to its long-lived reader.
+    ///
+    /// Native endpoints use bounded read and write deadlines while waiting for the first positive
+    /// handshake response. Once the caller has validated that response, `split` removes those
+    /// transport deadlines: ordinary protocol idleness and backpressure are not framing errors or
+    /// loss signals.
     pub fn split(self) -> io::Result<(ConnectionReader, ConnectionWriter)> {
-        let reader = self.reader.ok_or_else(|| {
+        let mut reader = self.reader.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "trace connections do not have presenter replies",
             )
         })?;
+        reader.clear_establishment_read_deadline()?;
+        self.writer
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?
+            .io
+            .clear_establishment_write_deadline()?;
         Ok((reader, self.writer))
     }
 
@@ -724,6 +820,9 @@ impl DirectionalLimits {
 #[cfg(feature = "native")]
 fn write_writer(io: &mut WriterIo, bytes: &[u8]) -> io::Result<()> {
     match io {
+        WriterIo::Tcp(stream) => stream.write_all(bytes),
+        #[cfg(unix)]
+        WriterIo::Unix(stream) => stream.write_all(bytes),
         WriterIo::Live(stream) => stream.write_all(bytes),
         WriterIo::Trace(file) => file.write_all(bytes),
         WriterIo::Sink(sink) => sink.write_all(bytes),
@@ -766,6 +865,9 @@ fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::
 
         let written = loop {
             let result = match io {
+                WriterIo::Tcp(stream) => stream.write_vectored(&slices[..slice_count]),
+                #[cfg(unix)]
+                WriterIo::Unix(stream) => stream.write_vectored(&slices[..slice_count]),
                 WriterIo::Live(stream) => stream.write_vectored(&slices[..slice_count]),
                 WriterIo::Trace(file) => file.write_vectored(&slices[..slice_count]),
                 WriterIo::Sink(sink) => sink.write_vectored(&slices[..slice_count]),
@@ -854,6 +956,9 @@ fn read_control_uint(bytes: &mut impl Iterator<Item = u8>, length: usize) -> Opt
 #[cfg(feature = "native")]
 fn flush_writer(io: &mut WriterIo) -> io::Result<()> {
     match io {
+        WriterIo::Tcp(stream) => stream.flush(),
+        #[cfg(unix)]
+        WriterIo::Unix(stream) => stream.flush(),
         WriterIo::Live(stream) => stream.flush(),
         WriterIo::Trace(file) => file.flush(),
         WriterIo::Sink(sink) => sink.flush(),
@@ -1001,14 +1106,14 @@ mod tests {
 
     #[test]
     fn preface_matches_vivid_layout() {
-        let preface = encode_preface(ConnectionKind::Video, 0x0102_0304);
+        let preface = encode_preface(ConnectionKind::Track, 0x0102_0304);
         assert_eq!(&preface[0..4], b"VIVD");
-        assert_eq!(preface[4..8], [1, 1, 1, 0]);
+        assert_eq!(preface[4..8], [1, 5, 2, 0]);
         assert_eq!(preface[8..12], [1, 2, 3, 4]);
         assert_eq!(preface[12..16], [0; 4]);
         assert_eq!(
             Preface::decode(preface).unwrap().kind,
-            ConnectionKind::Video
+            ConnectionKind::Track
         );
     }
 
@@ -1016,13 +1121,10 @@ mod tests {
     fn connection_kind_registry_is_collision_free_and_contiguous() {
         let kinds = [
             ConnectionKind::Control as u8,
-            ConnectionKind::Video as u8,
-            ConnectionKind::Raster as u8,
-            ConnectionKind::Blob as u8,
-            ConnectionKind::LocalBuffer as u8,
-            ConnectionKind::Audio as u8,
+            ConnectionKind::Lane as u8,
+            ConnectionKind::Track as u8,
         ];
-        assert_eq!(kinds, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(kinds, [0, 1, 2]);
         for (expected, value) in kinds.into_iter().enumerate() {
             assert_eq!(ConnectionKind::try_from(value).unwrap() as usize, expected);
         }
@@ -1060,7 +1162,7 @@ mod tests {
         assert_eq!(reply.code, crate::messages::ERROR_UNSUPPORTED_VERSION);
         assert!(reply.fatal);
         assert_eq!(
-            reply.supported_version,
+            reply.detail.supported_version_tuple(),
             Some((u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR)))
         );
 
@@ -1124,13 +1226,79 @@ mod tests {
         let _connection = Connection::from_streams(
             Box::new(io::empty()),
             Box::new(SharedBytes(bytes.clone())),
-            ConnectionKind::Raster,
+            ConnectionKind::Track,
         )
         .unwrap();
         assert_eq!(
             bytes.lock().unwrap().as_slice(),
-            encode_preface(ConnectionKind::Raster, DEFAULT_MAX_RECORD_BODY)
+            encode_preface(ConnectionKind::Track, DEFAULT_MAX_RECORD_BODY)
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "native", unix))]
+    fn split_clears_the_unix_establishment_deadlines() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let writer = stream.try_clone().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let connection = Connection::new_version(
+            Some(ReaderIo::Unix(stream)),
+            WriterIo::Unix(writer),
+            ConnectionKind::Control,
+            VIVID_MAJOR,
+            VIVID_MINOR,
+        )
+        .unwrap();
+
+        let (reader, writer) = connection.split().unwrap();
+        let ReaderIo::Unix(stream) = reader.io else {
+            panic!("native Unix connection lost its concrete reader");
+        };
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        let state = writer.state.lock().unwrap();
+        let WriterIo::Unix(stream) = &state.io else {
+            panic!("native Unix connection lost its concrete writer");
+        };
+        assert_eq!(stream.write_timeout().unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(all(feature = "native", not(unix)))]
+    fn split_clears_the_tcp_establishment_deadlines() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let writer = stream.try_clone().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let connection = Connection::new_version(
+            Some(ReaderIo::Tcp(stream)),
+            WriterIo::Tcp(writer),
+            ConnectionKind::Control,
+            VIVID_MAJOR,
+            VIVID_MINOR,
+        )
+        .unwrap();
+
+        let (reader, writer) = connection.split().unwrap();
+        let ReaderIo::Tcp(stream) = reader.io else {
+            panic!("native TCP connection lost its concrete reader");
+        };
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        let state = writer.state.lock().unwrap();
+        let WriterIo::Tcp(stream) = &state.io else {
+            panic!("native TCP connection lost its concrete writer");
+        };
+        assert_eq!(stream.write_timeout().unwrap(), None);
     }
 
     #[test]
@@ -1246,7 +1414,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "native")]
-    fn batched_mode_flushes_credits_correlated_records_and_bounded_batches() {
+    fn batched_mode_flushes_flow_updates_correlated_records_and_bounded_batches() {
         let stats = Arc::new(Mutex::new(WriteStats::default()));
         let writer = test_writer(
             ShortWriter {
@@ -1258,7 +1426,7 @@ mod tests {
 
         writer.write_record(0x8001, 0, 1, b"media").unwrap();
         assert_eq!(stats.lock().unwrap().flushes, 0);
-        writer.write_record(CREDIT, 0, 1, &[]).unwrap();
+        writer.write_record(MAX_CHANNEL_DATA, 0, 1, &[]).unwrap();
         assert_eq!(stats.lock().unwrap().flushes, 1);
 
         writer
@@ -1292,7 +1460,7 @@ mod tests {
         input.extend_from_slice(&second.encode());
         input.extend_from_slice(&[2; 32]);
         let mut reader = ConnectionReader {
-            io: Box::new(io::Cursor::new(input)),
+            io: ReaderIo::Other(Box::new(io::Cursor::new(input))),
             receive_sequence: 0,
             receive_body_limit: 32,
         };
@@ -1311,7 +1479,7 @@ mod tests {
             sequence: 1,
         };
         let mut reader = ConnectionReader {
-            io: Box::new(io::Cursor::new(oversized.encode())),
+            io: ReaderIo::Other(Box::new(io::Cursor::new(oversized.encode()))),
             receive_sequence: 0,
             receive_body_limit: 32,
         };
