@@ -23,7 +23,8 @@ include = [
 
 [features]
 default = ["native"]
-native = ["dep:zstd", "dep:zstd-safe"]
+native = ["native-transport", "dep:zstd", "dep:zstd-safe"]
+native-transport = []
 
 [dependencies]
 base64 = "0.23"

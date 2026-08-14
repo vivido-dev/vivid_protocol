@@ -64,6 +64,9 @@ counter_type!(ResumeGeneration, "lease resume generation");
 counter_type!(ChannelGeneration, "channel generation");
 counter_type!(InputEpoch, "input epoch");
 counter_type!(GrantGeneration, "presenter grant generation");
+counter_type!(FileDropEpoch, "file-drop epoch");
+counter_type!(FileDropGrantGeneration, "file-drop grant generation");
+counter_type!(FileTransferGeneration, "file-transfer generation");
 counter_type!(MediaEpoch, "media epoch");
 
 #[cfg(test)]

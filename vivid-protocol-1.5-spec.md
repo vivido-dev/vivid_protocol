@@ -32,6 +32,8 @@ normative:
    canvas target.
 7. [Vivid 1.5 web bindings](vivid-protocol-1.5-web-bindings.md) defines WebTransport and WebSocket
    carriers, explicit degraded modes, finite browser buffering, and terminating gateways.
+8. [Vivid 1.5 file drop](vivid-protocol-1.5-file-drop.md) defines consent-gated regular-file
+   copying from a presenter into a producer-selected directory.
 
 The machine-readable
 [Vivid 1.5 registry](vivid-protocol-1.5-registry.toml) is normative for numeric assignments and
@@ -131,6 +133,7 @@ implements the entire profile and every declared prerequisite.
 | `timed-media-v1` | Optional | `live-media-v1` | Exact-PTS playback, pause, flush, EOS, and drain |
 | `audio-gain-v1` | Optional | `timed-media-v1` | Track-scoped audio output gain |
 | `desktop-input-v1` | Optional | `desktop-surface-v1`, `live-media-v1` | Epoch-checked input binding and watchdog |
+| `file-drop-v1` | Optional | Core | User-gesture regular-file copy from presenter to producer |
 | `observability-v1` | Optional | Core | Bounded status, change events, and waits |
 | `web-carrier-v1` | Binding-selected | Core | WebTransport and WebSocket carrier constraints |
 | `multiplexed-session-carrier-v1` | Experimental | Core | Non-normative carrier research only |
@@ -223,8 +226,9 @@ The following are not standards-track Vivid 1.5 behavior:
 - in-place mutation of an immutable track's codec configuration;
 - implicit input restoration after focus, policy, transport, or target loss;
 - unbounded capability catalogs, observation streams, or browser receive queues;
-- generic file transfer, clipboard, secure-attention sequence, credential transport, or login
-  approval; and
+- generic file transfer, filesystem browsing, clipboard, secure-attention sequence, credential
+  transport, or login approval; `file-drop-v1` is only the bounded user-gesture copy defined by
+  its normative part; and
 - treating capture-policy bits as operating-system content protection.
 
 The experimental multiplexed carrier may be developed after the baseline object, authority, and

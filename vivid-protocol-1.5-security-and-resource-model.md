@@ -148,6 +148,7 @@ capacity.
 | 3 | Create terminal anchors |
 | 4 | Establish and receive desktop input for owned surfaces |
 | 5 | Create child contexts and session leases |
+| 6 | Bind owned contexts or surfaces to receive user-initiated regular-file drops |
 
 A resource limit never grants an operation class. A class bit without sufficient resource
 capacity does not make an operation admissible.

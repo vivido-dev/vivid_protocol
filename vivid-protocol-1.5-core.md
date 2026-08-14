@@ -202,8 +202,9 @@ The producer initiates every Vivid connection and writes one 16-byte preface:
 | 8 | 4 | Initiator transmit-body limit |
 | 12 | 4 | Reserved; zero |
 
-Connection kinds are `CONTROL` (`0`), `LANE` (`1`), and `TRACK` (`2`). The presenter does not send
-a reciprocal preface.
+Connection kinds are `CONTROL` (`0`), `LANE` (`1`), `TRACK` (`2`), and `FILE_TRANSFER` (`3`). The
+presenter does not send a reciprocal preface. `FILE_TRANSFER` is legal only after negotiating
+`file-drop-v1` and accepting one drop.
 
 The transmit-body limit is nonzero and no greater than 67,108,864 bytes. Reserved fields, unknown
 connection kinds, and invalid limits are fatal framing errors.
@@ -212,7 +213,8 @@ The first record is:
 
 - `HELLO` on `CONTROL`;
 - `LANE_OPEN` on `LANE`; or
-- `CHANNEL_OPEN` on `TRACK`.
+- `CHANNEL_OPEN` on `TRACK`; or
+- `FILE_TRANSFER_OPEN` on `FILE_TRANSFER`.
 
 No allocation other than bounded pre-authentication parsing occurs before that first record has
 been validated and authenticated.

@@ -66,6 +66,11 @@ state = "standards-track"
 prerequisites = ["desktop-surface-v1", "live-media-v1"]
 
 [[profile]]
+name = "file-drop-v1"
+state = "standards-track"
+prerequisites = ["vivid-core-control-v1"]
+
+[[profile]]
 name = "observability-v1"
 state = "standards-track"
 prerequisites = ["vivid-core-control-v1"]
@@ -109,6 +114,11 @@ state = "standards-track"
 [[connection_kind]]
 value = 2
 name = "TRACK"
+state = "standards-track"
+
+[[connection_kind]]
+value = 3
+name = "FILE_TRANSFER"
 state = "standards-track"
 
 [[record]]
@@ -484,6 +494,96 @@ state = "standards-track"
 [[record]]
 value = 0x0713
 name = "POINTER_AXIS"
+state = "standards-track"
+
+[[record]]
+value = 0x7000
+name = "SET_FILE_DROP_BINDING"
+state = "standards-track"
+
+[[record]]
+value = 0x7001
+name = "FILE_DROP_BOUND"
+state = "standards-track"
+
+[[record]]
+value = 0x7002
+name = "FILE_DROP_OFFER"
+state = "standards-track"
+
+[[record]]
+value = 0x7003
+name = "ACCEPT_FILE_DROP"
+state = "standards-track"
+
+[[record]]
+value = 0x7004
+name = "FILE_DROP_ACCEPTED"
+state = "standards-track"
+
+[[record]]
+value = 0x7005
+name = "CANCEL_FILE_DROP"
+state = "standards-track"
+
+[[record]]
+value = 0x7006
+name = "FILE_DROP_CANCELLED"
+state = "standards-track"
+
+[[record]]
+value = 0x7007
+name = "ADVANCE_FILE_TRANSFER"
+state = "standards-track"
+
+[[record]]
+value = 0x7008
+name = "FILE_TRANSFER_ADVANCED"
+state = "standards-track"
+
+[[record]]
+value = 0x7009
+name = "QUERY_FILE_DROP"
+state = "standards-track"
+
+[[record]]
+value = 0x700a
+name = "FILE_DROP_STATUS"
+state = "standards-track"
+
+[[record]]
+value = 0x7010
+name = "FILE_TRANSFER_OPEN"
+state = "standards-track"
+
+[[record]]
+value = 0x7011
+name = "FILE_TRANSFER_ACCEPTED"
+state = "standards-track"
+
+[[record]]
+value = 0x7012
+name = "FILE_DATA"
+state = "standards-track"
+
+[[record]]
+value = 0x7013
+name = "MAX_FILE_DATA"
+state = "standards-track"
+
+[[record]]
+value = 0x7014
+name = "FILE_FINISH"
+state = "standards-track"
+
+[[record]]
+value = 0x7015
+name = "FILE_RESULT"
+state = "standards-track"
+
+[[record]]
+value = 0x7016
+name = "FILE_TRANSFER_ABORT"
 state = "standards-track"
 
 [[record]]
