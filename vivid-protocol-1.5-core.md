@@ -174,10 +174,13 @@ Host names, wildcard addresses, and IPv6 are not part of that profile.
 
 ### 3.2 SSH binding
 
-SSH maps each remote private Unix socket connection to one local endpoint connection. The remote
-sockets are owner-only. `VIVID_ROOT_SECRET` or a lease activation secret is delivered inside the
-authenticated SSH session through a protected environment request, file descriptor, or standard
-input channel, never a command argument.
+On POSIX, SSH maps each remote private Unix socket connection to one local endpoint connection; the
+remote sockets are owner-only. On Windows, where OpenSSH stream-local forwarding is unavailable,
+the binding MAY instead use an exact IPv4 `127.0.0.1` remote TCP listener. That listener MUST NOT
+bind a wildcard, non-loopback, hostname, or IPv6 address, and every Vivid connection remains
+root-authenticated. `VIVID_ROOT_SECRET` or a lease activation secret is delivered inside the
+authenticated SSH session through a protected environment request, file descriptor, owner-only
+temporary file, or standard-input channel, never a command argument.
 
 An SSH binding MAY use separate lifecycle-bound SSH TCP connections for logical lanes. If several
 lanes share one SSH TCP connection, the binding reports that they share retransmission ordering.
