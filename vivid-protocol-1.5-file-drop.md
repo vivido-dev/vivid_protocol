@@ -12,8 +12,10 @@ move, drag-out, native application drag injection, metadata preservation, or loc
 references.
 
 The presenter MUST NOT create an offer without a current OS file-drop gesture and an effective
-binding. A suggested name is inert. No record contains a source path, destination path, URI,
-machine identifier, timestamp, mode, or source hash. File bytes never use a terminal PTY.
+binding. A suggested name is inert. No record contains a source path, URI, machine identifier,
+timestamp, mode, or source hash. A destination path appears in exactly one place: `FILE_RESULT`
+key 5, only under `file-drop-path-v1` and only on a committed or already-committed result, as
+defined in section 8. File bytes never use a terminal PTY.
 
 One OS `DroppedFile` event creates at most one logical drop. Implementations MUST cap one binding
 at 16 pending offers and four active transfers; the recommended limits are four and one. Source
@@ -148,6 +150,9 @@ The producer compares its independently computed length and hash before commit.
 `FILE_RESULT` travels producer to presenter and contains transfer ID, generation, result
 (committed `0`, rejected `1`, cancelled `2`, hash mismatch `3`, I/O error `4`, already committed
 `5`), committed length, and final basename. Only successful results carry a nonempty basename.
+Under `file-drop-path-v1` a committed or already-committed result MAY additionally carry key 5,
+the UTF-8 absolute path of the committed file on the producer's host, as defined in section 8.
+Every other result omits it.
 `FILE_TRANSFER_ABORT` can travel either way and contains transfer ID, generation, bounded reason,
 and final offset. Diagnostics never contain a path or digest.
 
@@ -167,7 +172,9 @@ returns its cached terminal result and never creates a second file.
 `QUERY_FILE_DROP` is correlated and contains the drop ID. `FILE_DROP_STATUS` returns drop ID,
 state (offered `1`, accepted `2`, transferring `3`, committed `4`, cancelled `5`, failed `6`),
 transfer ID, generation, committed offset, optional result, and final basename. Status never
-returns a directory or absolute path.
+returns a directory or absolute path. This holds under `file-drop-path-v1` as well: the committed
+path travels only on the authenticated file-transfer connection that produced it, and the replayed
+already-committed result carries the identical path.
 
 After sending `FILE_RESULT`, the receiver queries status on the control connection. If the result
 was lost, it advances to the next generation at the full committed offset, accepts the presenter's
@@ -191,10 +198,35 @@ this profile and remains unchanged.
 
 A byte-transparent carrier may relay kind 3 only when its admission layer permits that kind. A
 terminating gateway accepts an outer drop and independently re-originates an inner drop with new
-IDs, generations, HMAC, credit, and consent. It never forwards authentication tags or introduces
-path references. A component that does not implement this behavior omits `file-drop-v1` and
+IDs, generations, HMAC, credit, and consent. It never forwards authentication tags, and it never
+introduces or forwards path references: a terminating gateway MUST NOT negotiate
+`file-drop-path-v1` on either session, because an inner destination path names a filesystem the
+outer presenter does not have. A component that does not implement this behavior omits `file-drop-v1` and
 rejects kind 3.
 
 Conformance tests cover canonical decoding, checked lengths and offsets before allocation,
 malformed prefixes, zero credit, hash mismatch, collision/symlink races, lost replies, generation
 advance, result replay, cancellation, timeout, and two owners reusing every local numeric ID.
+
+## 8. `file-drop-path-v1`
+
+Prerequisite `file-drop-v1`. It adds one optional key to `FILE_RESULT` and no records, bindings,
+authority, operation-class bits, or registry assignments.
+
+When negotiated, a producer whose destination is a real filesystem directory MAY add key 5 to
+`FILE_RESULT`: the UTF-8 absolute path of the committed file on the producer's host. It is present
+only with result committed (`0`) or already committed (`5`), and a replayed already-committed
+result carries the byte-identical path. It is absent from every other result, from
+`FILE_DROP_STATUS`, and from every diagnostic and log.
+
+Key 5 is at most 4096 bytes, begins with `/`, contains no control character, contains no `..`
+component, and its final `/`-separated component is byte-identical to key 4. A decoder that finds
+key 5 without all of those properties rejects the record rather than repairing it. A producer that
+has not negotiated the profile MUST omit key 5, and a presenter that has not negotiated it rejects
+key 5 as an unknown key — which is what makes the profile safe across version skew in both
+directions.
+
+Key 5 is producer-supplied data, never a presenter-trusted identity. A presenter MUST revalidate
+every property above before use and MUST NOT treat the value as evidence about the producer's
+host. A presenter that types the path into a terminal types it as ordinary text for a binding the
+presenter itself created, never as a command.

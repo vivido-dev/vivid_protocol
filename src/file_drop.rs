@@ -16,6 +16,7 @@ pub const FILE_TRANSFER_NONCE_BYTES: usize = 16;
 pub const FILE_TRANSFER_TAG_BYTES: usize = 16;
 pub const FILE_HASH_BYTES: usize = 32;
 pub const MAX_FILE_DROP_NAME_BYTES: usize = 255;
+pub const MAX_COMMITTED_PATH_BYTES: usize = 4096;
 pub const MAX_PENDING_FILE_DROPS: u64 = 16;
 pub const MAX_ACTIVE_FILE_TRANSFERS: u64 = 4;
 pub const DEFAULT_PENDING_FILE_DROPS: u64 = 4;
@@ -1084,6 +1085,8 @@ pub struct FileResult {
     pub result: FileResultCode,
     pub committed_length: u64,
     pub final_name: String,
+    /// The committed absolute path, carried only under `file-drop-path-v1` on a successful result.
+    pub committed_path: Option<String>,
 }
 
 impl FileResult {
@@ -1104,24 +1107,42 @@ impl FileResult {
                 "must omit the final name on failure",
             ));
         }
-        encode_raw(vec![
+        let mut entries = vec![
             (0, Value::Unsigned(self.transfer_id)),
             (1, Value::Unsigned(self.transfer_generation.get())),
             (2, Value::Unsigned(self.result as u64)),
             (3, Value::Unsigned(self.committed_length)),
             (4, Value::Text(self.final_name.clone())),
-        ])
+        ];
+        // Absent by default, so a producer without `file-drop-path-v1` re-encodes byte for byte
+        // as it did before the profile existed.
+        if let Some(path) = &self.committed_path {
+            if !matches!(
+                self.result,
+                FileResultCode::Committed | FileResultCode::AlreadyCommitted
+            ) {
+                return Err(invalid_value(
+                    "FILE_RESULT",
+                    5,
+                    "is only carried by a committed result",
+                ));
+            }
+            validate_committed_path(path, &self.final_name)?;
+            entries.push((5, Value::Text(path.clone())));
+        }
+        encode_raw(entries)
     }
 
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         let value = cbor::decode(body)?;
-        let map = StrictMap::new("FILE_RESULT", &value, &[0, 1, 2, 3, 4])?;
+        let map = StrictMap::new("FILE_RESULT", &value, &[0, 1, 2, 3, 4, 5])?;
         let result = Self {
             transfer_id: map.required_u64(0)?,
             transfer_generation: FileTransferGeneration::new(map.required_u64(1)?),
             result: map.required_u64(2)?.try_into()?,
             committed_length: map.required_u64(3)?,
             final_name: map.required_text(4)?.to_owned(),
+            committed_path: map.optional_text(5)?.map(ToOwned::to_owned),
         };
         result.encode()?;
         Ok(result)
@@ -1489,6 +1510,31 @@ fn validate_deadline(schema: &'static str, key: u64, timeout_us: u64) -> Result<
     }
 }
 
+/// Validate a producer-supplied absolute destination path from `FILE_RESULT` key 5.
+///
+/// This is the one place `file-drop-v1` discloses a path, and a presenter may type it into a
+/// terminal, so the value is rejected outright rather than repaired. `char::is_control` covers
+/// `\n`, `\r`, `\x1b`, `\x03`, `\x07`, and NUL, all of which a Linux directory name may
+/// legally contain. Pinning the final component to the already-validated `final_name` leaves the
+/// directory prefix as the only producer-controlled part, and that is bounded to absolute,
+/// control-free, non-`..` components.
+pub fn validate_committed_path(path: &str, final_name: &str) -> Result<(), MessageError> {
+    if path.is_empty()
+        || path.len() > MAX_COMMITTED_PATH_BYTES
+        || !path.starts_with('/')
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|component| component == "..")
+        || path.rsplit('/').next() != Some(final_name)
+    {
+        return Err(invalid_value(
+            "FILE_RESULT",
+            5,
+            "is not a safe absolute committed path",
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_suggested_name(name: &str) -> Result<(), MessageError> {
     if name.is_empty()
         || name.len() > MAX_FILE_DROP_NAME_BYTES
@@ -1787,6 +1833,7 @@ mod tests {
             result: FileResultCode::Committed,
             committed_length: 9,
             final_name: "file.txt".into(),
+            committed_path: None,
         };
         assert_eq!(
             FileResult::decode(&result.encode().unwrap()).unwrap(),
@@ -1901,5 +1948,153 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn committed(path: Option<&str>, name: &str, code: FileResultCode) -> FileResult {
+        FileResult {
+            transfer_id: 4,
+            transfer_generation: FileTransferGeneration::ONE,
+            result: code,
+            committed_length: 9,
+            final_name: name.into(),
+            committed_path: path.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_committed_path_round_trips() {
+        for (path, name) in [
+            ("/home/u/report.txt", "report.txt"),
+            ("/report.txt", "report.txt"),
+            ("/home/u/my report.txt", "my report.txt"),
+            ("/home/u (1)/report (1).txt", "report (1).txt"),
+        ] {
+            let result = committed(Some(path), name, FileResultCode::Committed);
+            assert_eq!(
+                FileResult::decode(&result.encode().unwrap()).unwrap(),
+                result
+            );
+        }
+        let replay = committed(
+            Some("/home/u/report.txt"),
+            "report.txt",
+            FileResultCode::AlreadyCommitted,
+        );
+        assert_eq!(
+            FileResult::decode(&replay.encode().unwrap()).unwrap(),
+            replay
+        );
+    }
+
+    #[test]
+    fn an_absent_committed_path_encodes_exactly_as_it_did_before_the_profile() {
+        // The pre-`file-drop-path-v1` bytes, pinned so a producer that never negotiated the
+        // profile can never be told apart from an older one.
+        let result = committed(None, "file.txt", FileResultCode::Committed);
+        assert_eq!(
+            result.encode().unwrap(),
+            vec![
+                0xa5, 0x00, 0x04, 0x01, 0x01, 0x02, 0x00, 0x03, 0x09, 0x04, 0x68, 0x66, 0x69, 0x6c,
+                0x65, 0x2e, 0x74, 0x78, 0x74,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_committed_path_is_refused_on_every_failure_result() {
+        for code in [
+            FileResultCode::Rejected,
+            FileResultCode::Cancelled,
+            FileResultCode::HashMismatch,
+            FileResultCode::IoError,
+        ] {
+            // A failure result also carries no final name, so both guards must hold.
+            assert!(
+                committed(Some("/home/u/report.txt"), "", code)
+                    .encode()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsafe_committed_path_is_refused_rather_than_repaired() {
+        let unsafe_paths = [
+            "home/u/report.txt",
+            "",
+            "/home/u/../etc/report.txt",
+            "/home/u/other.txt",
+            "/home/u/report.txt/",
+            "/home/u/",
+        ];
+        for path in unsafe_paths {
+            assert!(
+                committed(Some(path), "report.txt", FileResultCode::Committed)
+                    .encode()
+                    .is_err(),
+                "{path:?} was accepted"
+            );
+        }
+        // A Linux directory name may legally hold any of these, so none may reach a terminal.
+        for control in ['\n', '\r', '\u{1b}', '\u{3}', '\u{7}', '\0'] {
+            let path = format!("/home/u{control}x/report.txt");
+            assert!(
+                committed(Some(&path), "report.txt", FileResultCode::Committed)
+                    .encode()
+                    .is_err(),
+                "{control:?} was accepted"
+            );
+        }
+        let long = format!("/{}/report.txt", "d".repeat(MAX_COMMITTED_PATH_BYTES));
+        assert!(
+            committed(Some(&long), "report.txt", FileResultCode::Committed)
+                .encode()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decoding_enforces_every_committed_path_rule() {
+        let good = committed(
+            Some("/home/u/report.txt"),
+            "report.txt",
+            FileResultCode::Committed,
+        );
+        let body = good.encode().unwrap();
+        assert!(FileResult::decode(&body).is_ok());
+
+        // Hand-rolled records that `encode` would never produce still have to be rejected.
+        let relative = encode_raw(vec![
+            (0, Value::Unsigned(4)),
+            (1, Value::Unsigned(1)),
+            (2, Value::Unsigned(FileResultCode::Committed as u64)),
+            (3, Value::Unsigned(9)),
+            (4, Value::Text("report.txt".into())),
+            (5, Value::Text("home/u/report.txt".into())),
+        ])
+        .unwrap();
+        assert!(FileResult::decode(&relative).is_err());
+
+        let wrong_type = encode_raw(vec![
+            (0, Value::Unsigned(4)),
+            (1, Value::Unsigned(1)),
+            (2, Value::Unsigned(FileResultCode::Committed as u64)),
+            (3, Value::Unsigned(9)),
+            (4, Value::Text("report.txt".into())),
+            (5, Value::Bytes(b"/home/u/report.txt".to_vec())),
+        ])
+        .unwrap();
+        assert!(FileResult::decode(&wrong_type).is_err());
+
+        let unknown_key = encode_raw(vec![
+            (0, Value::Unsigned(4)),
+            (1, Value::Unsigned(1)),
+            (2, Value::Unsigned(FileResultCode::Committed as u64)),
+            (3, Value::Unsigned(9)),
+            (4, Value::Text("report.txt".into())),
+            (6, Value::Text("/home/u/report.txt".into())),
+        ])
+        .unwrap();
+        assert!(FileResult::decode(&unknown_key).is_err());
     }
 }

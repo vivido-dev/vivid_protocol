@@ -14,6 +14,7 @@ pub const TIMED_MEDIA: &str = "timed-media-v1";
 pub const AUDIO_GAIN: &str = "audio-gain-v1";
 pub const DESKTOP_INPUT: &str = "desktop-input-v1";
 pub const FILE_DROP: &str = "file-drop-v1";
+pub const FILE_DROP_PATH: &str = "file-drop-path-v1";
 pub const OBSERVABILITY: &str = "observability-v1";
 pub const WEB_CARRIER: &str = "web-carrier-v1";
 pub const MULTIPLEXED_SESSION_CARRIER: &str = "multiplexed-session-carrier-v1";
@@ -257,6 +258,7 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
         | WEB_CARRIER
         | FILE_DROP
         | MULTIPLEXED_SESSION_CARRIER => Some(&[CORE_CONTROL]),
+        FILE_DROP_PATH => Some(&[FILE_DROP]),
         TIMED_MEDIA => Some(&[LIVE_MEDIA]),
         AUDIO_GAIN => Some(&[TIMED_MEDIA]),
         DESKTOP_INPUT => Some(&[DESKTOP_SURFACE, LIVE_MEDIA]),
@@ -296,6 +298,15 @@ mod tests {
         validate_profile_set([DESKTOP_INPUT, DESKTOP_SURFACE, LIVE_MEDIA, CORE_CONTROL]).unwrap();
         assert!(matches!(
             validate_profile_set([DESKTOP_INPUT, CORE_CONTROL]),
+            Err(ProfileError::MissingPrerequisite { .. })
+        ));
+    }
+
+    #[test]
+    fn the_file_drop_path_profile_requires_file_drop() {
+        validate_profile_set([FILE_DROP_PATH, FILE_DROP, CORE_CONTROL]).unwrap();
+        assert!(matches!(
+            validate_profile_set([FILE_DROP_PATH, CORE_CONTROL]),
             Err(ProfileError::MissingPrerequisite { .. })
         ));
     }

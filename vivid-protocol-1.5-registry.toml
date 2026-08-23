@@ -71,6 +71,11 @@ state = "standards-track"
 prerequisites = ["vivid-core-control-v1"]
 
 [[profile]]
+name = "file-drop-path-v1"
+state = "standards-track"
+prerequisites = ["file-drop-v1"]
+
+[[profile]]
 name = "observability-v1"
 state = "standards-track"
 prerequisites = ["vivid-core-control-v1"]
