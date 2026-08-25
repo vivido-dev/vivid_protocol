@@ -1436,6 +1436,264 @@ fn put_i64(bytes: &mut [u8], offset: usize, value: i64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
 }
 
+// ---------------------------------------------------------------------------------------------
+// H.264 Annex-B normalization and decoder description
+//
+// `h264-annexb-au-v1` requires Annex-B access units and forbids AVCC length prefixes, but real
+// encoders emit both: Windows Media Foundation produces AVCC. Normalization therefore belongs
+// beside `access_unit_is_key`, which is what every producer cross-checks the result against.
+//
+// Pure byte transforms over buffers a caller obtained from an encoder. Nothing here touches
+// FFmpeg, which is what makes it exhaustively testable.
+// ---------------------------------------------------------------------------------------------
+
+/// Largest decoder configuration accepted from an encoder.
+const MAX_H264_EXTRADATA: usize = 4096;
+
+fn annexb_invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("H.264: {message}"))
+}
+
+/// The immutable H.264 parameters a Vivid `VideoConfiguration` needs.
+///
+/// Every field is derived from the opened encoder's extradata, never from CLI input: the track's
+/// coded dimensions, profile, and level are immutable once negotiated, so a claim that disagrees
+/// with the bitstream is a defect the presenter cannot recover from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H264DecoderDescription {
+    pub profile: i32,
+    pub level: i32,
+    pub codec_string: String,
+    /// Annex-B parameter sets, for prepending to key access units.
+    pub extradata: Vec<u8>,
+    /// avcC form, for the track's `decoder_configuration`.
+    pub decoder_config: Vec<u8>,
+}
+
+/// Largest decoder configuration accepted from an encoder.
+
+/// Derive the decoder description from an encoder's extradata, in either avcC or Annex-B form.
+pub fn h264_decoder_description(extradata: &[u8]) -> io::Result<H264DecoderDescription> {
+    let avcc = if extradata.first() == Some(&1) {
+        if extradata.len() < 7 || extradata.len() > MAX_H264_EXTRADATA {
+            return Err(annexb_invalid("avcC decoder configuration is invalid"));
+        }
+        extradata.to_vec()
+    } else {
+        avcc_from_annexb(extradata)?
+    };
+    let profile = i32::from(avcc[1]);
+    let level = i32::from(avcc[3]);
+    let portable_extradata = annexb_from_avcc(&avcc)?;
+    Ok(H264DecoderDescription {
+        profile,
+        level,
+        codec_string: format!("avc1.{:02X}{:02X}{:02X}", avcc[1], avcc[2], avcc[3]),
+        extradata: portable_extradata,
+        decoder_config: avcc,
+    })
+}
+
+/// Return `unit` as Annex-B, converting from AVCC length-prefixed form when necessary.
+///
+/// A buffer that is neither well-formed Annex-B nor well-formed AVCC is rejected rather than
+/// passed through: sending a mangled access unit produces a silent green picture at the
+/// presenter, while an error here names the encoder that produced it on the very first frame.
+pub fn ensure_annexb(unit: &[u8]) -> io::Result<Cow<'_, [u8]>> {
+    if unit.is_empty() {
+        return Err(annexb_invalid("access unit is empty"));
+    }
+    if starts_with_start_code(unit) {
+        return Ok(Cow::Borrowed(unit));
+    }
+    Ok(Cow::Owned(annexb_from_length_prefixed(unit)?))
+}
+
+fn starts_with_start_code(unit: &[u8]) -> bool {
+    unit.starts_with(&[0, 0, 0, 1]) || unit.starts_with(&[0, 0, 1])
+}
+
+/// Rewrite a 4-byte-length-prefixed access unit as Annex-B.
+///
+/// The buffer must be consumed exactly: a trailing remainder means the guess that this was AVCC
+/// was wrong, and continuing would emit a truncated access unit.
+fn annexb_from_length_prefixed(unit: &[u8]) -> io::Result<Vec<u8>> {
+    let mut annexb = Vec::with_capacity(unit.len());
+    let mut cursor = 0_usize;
+    while cursor < unit.len() {
+        let length_end = cursor
+            .checked_add(4)
+            .filter(|end| *end <= unit.len())
+            .ok_or_else(|| annexb_invalid("access unit is neither Annex-B nor AVCC"))?;
+        let length = u32::from_be_bytes(unit[cursor..length_end].try_into().unwrap());
+        let length = usize::try_from(length)
+            .map_err(|_| annexb_invalid("AVCC access unit length is out of range"))?;
+        if length == 0 {
+            return Err(annexb_invalid(
+                "AVCC access unit contains an empty NAL unit",
+            ));
+        }
+        cursor = length_end;
+        let end = cursor
+            .checked_add(length)
+            .filter(|end| *end <= unit.len())
+            .ok_or_else(|| annexb_invalid("AVCC access unit is truncated"))?;
+        annexb.extend_from_slice(&[0, 0, 0, 1]);
+        annexb.extend_from_slice(&unit[cursor..end]);
+        cursor = end;
+    }
+    if annexb.is_empty() {
+        return Err(annexb_invalid("access unit contains no NAL units"));
+    }
+    Ok(annexb)
+}
+
+/// Prepend Annex-B parameter sets to a key access unit.
+///
+/// Encoders that do not repeat SPS/PPS on every IDR need this: the track's immutable extradata
+/// stays empty (matching what real Vivido and vvmux presenters already accept from `vvland`), so
+/// the parameter sets have to ride the bitstream instead.
+pub fn with_parameter_sets(parameter_sets: &[u8], unit: &[u8]) -> Vec<u8> {
+    let mut prefixed = Vec::with_capacity(parameter_sets.len().saturating_add(unit.len()));
+    prefixed.extend_from_slice(parameter_sets);
+    prefixed.extend_from_slice(unit);
+    prefixed
+}
+
+/// Convert an avcC decoder configuration into Annex-B parameter sets.
+pub fn annexb_from_avcc(avcc: &[u8]) -> io::Result<Vec<u8>> {
+    if avcc.len() < 7 || avcc[0] != 1 {
+        return Err(annexb_invalid("avcC decoder configuration is invalid"));
+    }
+    let mut cursor = 6;
+    let sps_count = usize::from(avcc[5] & 0x1f);
+    if sps_count == 0 {
+        return Err(annexb_invalid("avcC decoder configuration has no SPS"));
+    }
+    let mut parameter_sets = Vec::with_capacity(sps_count.saturating_add(1));
+    for _ in 0..sps_count {
+        let sps = take_avcc_nal(avcc, &mut cursor)?;
+        if sps.first().is_none_or(|header| header & 0x1f != 7) {
+            return Err(annexb_invalid(
+                "avcC decoder configuration has an invalid SPS",
+            ));
+        }
+        parameter_sets.push(sps);
+    }
+    let pps_count = avcc
+        .get(cursor)
+        .copied()
+        .map(usize::from)
+        .ok_or_else(|| annexb_invalid("avcC decoder configuration has no PPS count"))?;
+    cursor += 1;
+    if pps_count == 0 {
+        return Err(annexb_invalid("avcC decoder configuration has no PPS"));
+    }
+    for _ in 0..pps_count {
+        let pps = take_avcc_nal(avcc, &mut cursor)?;
+        if pps.first().is_none_or(|header| header & 0x1f != 8) {
+            return Err(annexb_invalid(
+                "avcC decoder configuration has an invalid PPS",
+            ));
+        }
+        parameter_sets.push(pps);
+    }
+    let capacity = parameter_sets
+        .iter()
+        .try_fold(0_usize, |total, parameter_set| {
+            total.checked_add(4)?.checked_add(parameter_set.len())
+        })
+        .ok_or_else(|| annexb_invalid("Annex-B decoder initialization is oversized"))?;
+    let mut annexb = Vec::with_capacity(capacity);
+    for parameter_set in parameter_sets {
+        annexb.extend_from_slice(&[0, 0, 0, 1]);
+        annexb.extend_from_slice(parameter_set);
+    }
+    Ok(annexb)
+}
+
+fn take_avcc_nal<'a>(avcc: &'a [u8], cursor: &mut usize) -> io::Result<&'a [u8]> {
+    let length_end = cursor
+        .checked_add(2)
+        .filter(|end| *end <= avcc.len())
+        .ok_or_else(|| annexb_invalid("avcC parameter-set length is truncated"))?;
+    let length = usize::from(u16::from_be_bytes(
+        avcc[*cursor..length_end].try_into().unwrap(),
+    ));
+    *cursor = length_end;
+    let end = cursor
+        .checked_add(length)
+        .filter(|end| *end <= avcc.len())
+        .ok_or_else(|| annexb_invalid("avcC parameter set is truncated"))?;
+    let nal = &avcc[*cursor..end];
+    *cursor = end;
+    if nal.is_empty() {
+        return Err(annexb_invalid("avcC parameter set is empty"));
+    }
+    Ok(nal)
+}
+
+/// Build an avcC decoder configuration from Annex-B parameter sets.
+pub fn avcc_from_annexb(extradata: &[u8]) -> io::Result<Vec<u8>> {
+    let nals = annexb_nals(extradata);
+    let sps = nals
+        .iter()
+        .copied()
+        .find(|nal| nal.first().is_some_and(|header| header & 0x1f == 7))
+        .filter(|sps| sps.len() >= 4)
+        .ok_or_else(|| annexb_invalid("extradata has no SPS"))?;
+    let pps = nals
+        .iter()
+        .copied()
+        .find(|nal| nal.first().is_some_and(|header| header & 0x1f == 8))
+        .ok_or_else(|| annexb_invalid("extradata has no PPS"))?;
+    let sps_length = u16::try_from(sps.len()).map_err(|_| annexb_invalid("SPS is oversized"))?;
+    let pps_length = u16::try_from(pps.len()).map_err(|_| annexb_invalid("PPS is oversized"))?;
+    let capacity = 11_usize
+        .checked_add(sps.len())
+        .and_then(|length| length.checked_add(pps.len()))
+        .filter(|length| *length <= MAX_H264_EXTRADATA)
+        .ok_or_else(|| annexb_invalid("decoder configuration is oversized"))?;
+    let mut avcc = Vec::with_capacity(capacity);
+    avcc.extend_from_slice(&[1, sps[1], sps[2], sps[3], 0xff, 0xe1]);
+    avcc.extend_from_slice(&sps_length.to_be_bytes());
+    avcc.extend_from_slice(sps);
+    avcc.push(1);
+    avcc.extend_from_slice(&pps_length.to_be_bytes());
+    avcc.extend_from_slice(pps);
+    Ok(avcc)
+}
+
+/// Split an Annex-B buffer into NAL units, dropping trailing zero padding from each.
+pub fn annexb_nals(mut data: &[u8]) -> Vec<&[u8]> {
+    let mut nals = Vec::new();
+    while let Some((start, prefix)) = find_start_code(data) {
+        data = &data[start + prefix..];
+        let end = find_start_code(data).map_or(data.len(), |(index, _)| index);
+        let mut nal = &data[..end];
+        while nal.last() == Some(&0) {
+            nal = &nal[..nal.len() - 1];
+        }
+        if !nal.is_empty() {
+            nals.push(nal);
+        }
+        data = &data[end..];
+    }
+    nals
+}
+
+fn find_start_code(data: &[u8]) -> Option<(usize, usize)> {
+    (0..data.len().saturating_sub(2)).find_map(|index| {
+        if data[index..].starts_with(&[0, 0, 0, 1]) {
+            Some((index, 4))
+        } else if data[index..].starts_with(&[0, 0, 1]) {
+            Some((index, 3))
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1916,5 +2174,197 @@ mod tests {
         assert!(!access_unit_is_key("vp9", &[0x84]).unwrap());
         assert!(access_unit_is_key("av1", &[0x32, 0x01, 0x00]).unwrap());
         assert!(!access_unit_is_key("av1", &[0x32, 0x01, 0x20]).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod h264_annexb_tests {
+    use super::*;
+
+    /// A minimal but structurally valid SPS: NAL header 0x67, then profile/compat/level.
+    fn sps() -> Vec<u8> {
+        vec![0x67, 0x64, 0x00, 0x29, 0xac, 0x1b]
+    }
+
+    fn pps() -> Vec<u8> {
+        vec![0x68, 0xee, 0x3c, 0xb0]
+    }
+
+    fn annexb_extradata() -> Vec<u8> {
+        let mut data = vec![0, 0, 0, 1];
+        data.extend_from_slice(&sps());
+        data.extend_from_slice(&[0, 0, 0, 1]);
+        data.extend_from_slice(&pps());
+        data
+    }
+
+    fn avcc_extradata() -> Vec<u8> {
+        avcc_from_annexb(&annexb_extradata()).unwrap()
+    }
+
+    #[test]
+    fn derives_description_from_either_extradata_form() {
+        let from_annexb = h264_decoder_description(&annexb_extradata()).unwrap();
+        let from_avcc = h264_decoder_description(&avcc_extradata()).unwrap();
+        assert_eq!(from_annexb, from_avcc);
+        // High profile (0x64 = 100), level 4.1 (0x29 = 41).
+        assert_eq!(from_annexb.profile, 100);
+        assert_eq!(from_annexb.level, 41);
+        assert_eq!(from_annexb.codec_string, "avc1.640029");
+    }
+
+    #[test]
+    fn avcc_and_annexb_round_trip() {
+        let avcc = avcc_extradata();
+        let annexb = annexb_from_avcc(&avcc).unwrap();
+        assert_eq!(annexb, annexb_extradata());
+        assert_eq!(avcc_from_annexb(&annexb).unwrap(), avcc);
+    }
+
+    #[test]
+    fn accepts_three_byte_start_codes() {
+        let mut data = vec![0, 0, 1];
+        data.extend_from_slice(&sps());
+        data.extend_from_slice(&[0, 0, 1]);
+        data.extend_from_slice(&pps());
+        let description = h264_decoder_description(&data).unwrap();
+        assert_eq!(description.codec_string, "avc1.640029");
+    }
+
+    #[test]
+    fn strips_trailing_zero_padding_from_nals() {
+        let mut data = vec![0, 0, 0, 1];
+        data.extend_from_slice(&sps());
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&[0, 0, 0, 1]);
+        data.extend_from_slice(&pps());
+        data.extend_from_slice(&[0]);
+        let nals = annexb_nals(&data);
+        assert_eq!(nals.len(), 2);
+        assert_eq!(nals[0], sps().as_slice());
+        assert_eq!(nals[1], pps().as_slice());
+    }
+
+    #[test]
+    fn carries_multiple_parameter_sets() {
+        // Two SPS then one PPS, hand-built because avcc_from_annexb only emits one of each.
+        let mut avcc = vec![1, 0x64, 0x00, 0x29, 0xff, 0xe2];
+        for _ in 0..2 {
+            avcc.extend_from_slice(&(sps().len() as u16).to_be_bytes());
+            avcc.extend_from_slice(&sps());
+        }
+        avcc.push(1);
+        avcc.extend_from_slice(&(pps().len() as u16).to_be_bytes());
+        avcc.extend_from_slice(&pps());
+        let annexb = annexb_from_avcc(&avcc).unwrap();
+        assert_eq!(annexb_nals(&annexb).len(), 3);
+    }
+
+    #[test]
+    fn rejects_malformed_avcc() {
+        let avcc = avcc_extradata();
+        // Zero SPS count.
+        let mut no_sps = avcc.clone();
+        no_sps[5] = 0xe0;
+        assert!(annexb_from_avcc(&no_sps).is_err());
+        // Zero PPS count: the PPS count byte follows the single SPS.
+        let mut no_pps = avcc.clone();
+        let pps_count_index = 6 + 2 + sps().len();
+        no_pps[pps_count_index] = 0;
+        assert!(annexb_from_avcc(&no_pps).is_err());
+        // Truncated parameter-set body.
+        assert!(annexb_from_avcc(&avcc[..avcc.len() - 2]).is_err());
+        // Wrong configuration version.
+        let mut wrong_version = avcc.clone();
+        wrong_version[0] = 2;
+        assert!(annexb_from_avcc(&wrong_version).is_err());
+        // Too short to carry a header at all.
+        assert!(annexb_from_avcc(&[1, 0x64, 0, 0x29, 0xff]).is_err());
+    }
+
+    #[test]
+    fn rejects_extradata_missing_a_parameter_set() {
+        let mut only_sps = vec![0, 0, 0, 1];
+        only_sps.extend_from_slice(&sps());
+        assert!(avcc_from_annexb(&only_sps).is_err());
+        let mut only_pps = vec![0, 0, 0, 1];
+        only_pps.extend_from_slice(&pps());
+        assert!(avcc_from_annexb(&only_pps).is_err());
+        assert!(avcc_from_annexb(&[]).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_extradata() {
+        let oversized = vec![1_u8; MAX_H264_EXTRADATA + 1];
+        assert!(h264_decoder_description(&oversized).is_err());
+    }
+
+    #[test]
+    fn ensure_annexb_passes_annexb_through_without_copying() {
+        let unit = annexb_extradata();
+        let normalized = ensure_annexb(&unit).unwrap();
+        assert!(matches!(normalized, Cow::Borrowed(_)));
+        assert_eq!(normalized.as_ref(), unit.as_slice());
+
+        let three_byte = {
+            let mut data = vec![0, 0, 1];
+            data.extend_from_slice(&sps());
+            data
+        };
+        assert!(matches!(
+            ensure_annexb(&three_byte).unwrap(),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn ensure_annexb_converts_length_prefixed_units() {
+        let mut avcc_unit = Vec::new();
+        for nal in [sps(), pps()] {
+            avcc_unit.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            avcc_unit.extend_from_slice(&nal);
+        }
+        let normalized = ensure_annexb(&avcc_unit).unwrap();
+        assert!(matches!(normalized, Cow::Owned(_)));
+        assert_eq!(normalized.as_ref(), annexb_extradata().as_slice());
+    }
+
+    #[test]
+    fn ensure_annexb_rejects_rather_than_mangles() {
+        // Empty.
+        assert!(ensure_annexb(&[]).is_err());
+        // A length prefix that overruns the buffer.
+        assert!(ensure_annexb(&[0x00, 0x00, 0x10, 0x00, 0x67, 0x64]).is_err());
+        // A zero-length NAL unit.
+        assert!(ensure_annexb(&[0x00, 0x00, 0x00, 0x00]).is_err());
+        // A trailing remainder too short to be another length prefix.
+        let mut trailing = Vec::new();
+        trailing.extend_from_slice(&(sps().len() as u32).to_be_bytes());
+        trailing.extend_from_slice(&sps());
+        trailing.extend_from_slice(&[0x00, 0x02]);
+        assert!(ensure_annexb(&trailing).is_err());
+    }
+
+    #[test]
+    fn with_parameter_sets_prefixes_without_reordering() {
+        let parameter_sets = annexb_extradata();
+        let mut unit = vec![0, 0, 0, 1];
+        unit.extend_from_slice(&[0x65, 0x88, 0x84]);
+        let prefixed = with_parameter_sets(&parameter_sets, &unit);
+        assert!(prefixed.starts_with(&parameter_sets));
+        assert!(prefixed.ends_with(&unit));
+        assert_eq!(annexb_nals(&prefixed).len(), 3);
+    }
+
+    #[test]
+    fn a_normalized_key_unit_is_still_recognized_as_key() {
+        // The guard every producer relies on: whatever normalization produced must remain
+        // classifiable, or a wrong guess becomes a silent green picture instead of an error.
+        let mut unit = annexb_extradata();
+        unit.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84]);
+        assert!(access_unit_is_key("h264", &unit).unwrap());
+
+        let delta = [0, 0, 0, 1, 0x41, 0x9a, 0x00];
+        assert!(!access_unit_is_key("h264", &delta).unwrap());
     }
 }
