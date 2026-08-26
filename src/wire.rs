@@ -1,25 +1,29 @@
 use std::io;
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 use std::fs::{self, File};
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 use std::io::{IoSlice, Read, Write};
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 use std::net::TcpStream;
-#[cfg(all(feature = "native", unix))]
+#[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
 use std::os::unix::net::UnixStream;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 use std::sync::{Arc, Mutex};
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 use std::time::Duration;
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 use super::DEFAULT_MAX_RECORD_BODY;
 use super::{HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
-#[cfg(feature = "native")]
-use crate::messages::{ERROR, INPUT_RESET, INPUT_REVOKED, MAX_CHANNEL_DATA, PONG};
+#[cfg(any(feature = "native", feature = "native-transport"))]
+use crate::messages::{
+    ERROR, FILE_DROP_CANCELLED, FILE_FINISH, FILE_RESULT, FILE_TRANSFER_ABORT,
+    FILE_TRANSFER_ACCEPTED, FILE_TRANSFER_OPEN, INPUT_RESET, INPUT_REVOKED, MAX_CHANNEL_DATA,
+    MAX_FILE_DATA, PONG,
+};
 
 pub const PREFACE_SIZE: usize = 16;
 pub const HEADER_SIZE: usize = 24;
@@ -27,9 +31,9 @@ const MAGIC: &[u8; 4] = b"VIVD";
 
 pub const RECORD_OPTIONAL: u16 = 1 << 0;
 pub const RECORD_KNOWN_FLAGS: u16 = RECORD_OPTIONAL;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 const BATCH_RECORD_LIMIT: usize = 32;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 const MAX_VECTORED_SLICES: usize = 16;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +50,7 @@ pub enum ConnectionKind {
     Control = 0,
     Lane = 1,
     Track = 2,
+    FileTransfer = 3,
 }
 
 impl TryFrom<u8> for ConnectionKind {
@@ -56,6 +61,7 @@ impl TryFrom<u8> for ConnectionKind {
             0 => Ok(Self::Control),
             1 => Ok(Self::Lane),
             2 => Ok(Self::Track),
+            3 => Ok(Self::FileTransfer),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown Vivid connection kind {value}"),
@@ -70,6 +76,7 @@ impl ConnectionKind {
             Self::Control => crate::messages::HELLO,
             Self::Lane => crate::messages::LANE_OPEN,
             Self::Track => crate::messages::CHANNEL_OPEN,
+            Self::FileTransfer => crate::messages::FILE_TRANSFER_OPEN,
         }
     }
 
@@ -169,7 +176,7 @@ pub fn unsupported_version_record() -> Vec<u8> {
 }
 
 /// Validate an accepted preface, emitting one typed rejection only for a version mismatch.
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 pub fn accept_preface<W: Write + ?Sized>(
     bytes: [u8; PREFACE_SIZE],
     writer: &mut W,
@@ -191,19 +198,19 @@ pub fn accept_preface<W: Write + ?Sized>(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 pub enum Endpoint {
     Unix(PathBuf),
     Tcp(String),
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 struct ConnectedIo {
     reader: ReaderIo,
     writer: WriterIo,
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 enum ReaderIo {
     Tcp(TcpStream),
     #[cfg(unix)]
@@ -211,7 +218,7 @@ enum ReaderIo {
     Other(Box<dyn Read + Send>),
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 impl ReaderIo {
     fn clear_establishment_read_deadline(&self) -> io::Result<()> {
         match self {
@@ -223,7 +230,7 @@ impl ReaderIo {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 impl Read for ReaderIo {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -235,7 +242,7 @@ impl Read for ReaderIo {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 impl Endpoint {
     pub fn parse(value: &str) -> io::Result<Self> {
         if let Some(path) = value.strip_prefix("unix:") {
@@ -296,7 +303,7 @@ impl Endpoint {
     }
 }
 
-#[cfg(all(feature = "native", unix))]
+#[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
 fn connect_unix(path: &Path) -> io::Result<ConnectedIo> {
     let stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -308,7 +315,7 @@ fn connect_unix(path: &Path) -> io::Result<ConnectedIo> {
     })
 }
 
-#[cfg(all(feature = "native", not(unix)))]
+#[cfg(all(any(feature = "native", feature = "native-transport"), not(unix)))]
 fn connect_unix(_path: &Path) -> io::Result<ConnectedIo> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -316,7 +323,7 @@ fn connect_unix(_path: &Path) -> io::Result<ConnectedIo> {
     ))
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 enum WriterIo {
     Tcp(TcpStream),
     #[cfg(unix)]
@@ -326,7 +333,7 @@ enum WriterIo {
     Sink(io::Sink),
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 impl WriterIo {
     fn clear_establishment_write_deadline(&self) -> io::Result<()> {
         match self {
@@ -338,7 +345,7 @@ impl WriterIo {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 struct WriterState {
     io: WriterIo,
     send_sequence: u64,
@@ -349,12 +356,12 @@ struct WriterState {
 
 /// Cloneable, sequence-safe half of a Vivid connection.
 #[derive(Clone)]
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 pub struct ConnectionWriter {
     state: Arc<Mutex<WriterState>>,
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 impl ConnectionWriter {
     pub fn write_record(
         &self,
@@ -444,7 +451,18 @@ impl ConnectionWriter {
             || checkpoint
             || matches!(
                 record_type,
-                MAX_CHANNEL_DATA | INPUT_REVOKED | INPUT_RESET | PONG | ERROR
+                MAX_CHANNEL_DATA
+                    | MAX_FILE_DATA
+                    | FILE_TRANSFER_OPEN
+                    | FILE_TRANSFER_ACCEPTED
+                    | FILE_FINISH
+                    | FILE_RESULT
+                    | FILE_TRANSFER_ABORT
+                    | FILE_DROP_CANCELLED
+                    | INPUT_REVOKED
+                    | INPUT_RESET
+                    | PONG
+                    | ERROR
             )
             || has_correlated_control_envelope(record_type, parts)
             || state.unflushed_records >= BATCH_RECORD_LIMIT;
@@ -500,7 +518,7 @@ impl ConnectionWriter {
 }
 
 /// Blocking receive half of a live Vivid connection.
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 pub struct ConnectionReader {
     io: ReaderIo,
     receive_sequence: u64,
@@ -516,7 +534,7 @@ pub struct BorrowedRecord<'a> {
     pub body: &'a [u8],
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 impl ConnectionReader {
     fn clear_establishment_read_deadline(&mut self) -> io::Result<()> {
         self.io.clear_establishment_read_deadline()
@@ -591,13 +609,13 @@ impl ConnectionReader {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 pub struct Connection {
     reader: Option<ConnectionReader>,
     writer: ConnectionWriter,
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 impl Connection {
     pub fn open(endpoint: &Endpoint, kind: ConnectionKind) -> io::Result<Self> {
         Self::open_version(endpoint, kind, VIVID_MAJOR, VIVID_MINOR)
@@ -792,7 +810,7 @@ impl Connection {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 fn validate_body_limit(maximum: u32) -> io::Result<()> {
     if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
         Err(io::Error::new(
@@ -817,7 +835,7 @@ impl DirectionalLimits {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 fn write_writer(io: &mut WriterIo, bytes: &[u8]) -> io::Result<()> {
     match io {
         WriterIo::Tcp(stream) => stream.write_all(bytes),
@@ -829,7 +847,7 @@ fn write_writer(io: &mut WriterIo, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
     let mut part_index = 0_usize;
     let mut part_offset = 0_usize;
@@ -916,7 +934,7 @@ fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::
     Ok(())
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 fn has_correlated_control_envelope(record_type: u16, parts: &[&[u8]]) -> bool {
     if record_type >= 0x8000 {
         return false;
@@ -946,14 +964,14 @@ fn has_correlated_control_envelope(record_type: u16, parts: &[&[u8]]) -> bool {
     request_id != 0
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 fn read_control_uint(bytes: &mut impl Iterator<Item = u8>, length: usize) -> Option<u64> {
     (0..length).try_fold(0_u64, |value, _| {
         bytes.next().map(|byte| (value << 8) | u64::from(byte))
     })
 }
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 fn flush_writer(io: &mut WriterIo) -> io::Result<()> {
     match io {
         WriterIo::Tcp(stream) => stream.flush(),
@@ -1028,11 +1046,11 @@ pub fn encode_preface_version(
 mod tests {
     use super::*;
 
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     #[derive(Clone)]
     struct SharedBytes(Arc<Mutex<Vec<u8>>>);
 
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     impl Write for SharedBytes {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
@@ -1044,21 +1062,21 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     #[derive(Default)]
     struct WriteStats {
         bytes: Vec<u8>,
         flushes: usize,
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     #[derive(Clone)]
     struct ShortWriter {
         stats: Arc<Mutex<WriteStats>>,
         maximum: usize,
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     impl Write for ShortWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             let length = bytes.len().min(self.maximum);
@@ -1091,7 +1109,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn test_writer(writer: impl Write + Send + 'static, flush_mode: FlushMode) -> ConnectionWriter {
         ConnectionWriter {
             state: Arc::new(Mutex::new(WriterState {
@@ -1145,7 +1163,7 @@ mod tests {
         assert!(Preface::decode(preface).is_err());
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     #[test]
     fn version_mismatch_emits_one_typed_error_but_malformed_magic_is_silent() {
         let mut mismatched = encode_preface(ConnectionKind::Control, 4096);
@@ -1173,7 +1191,7 @@ mod tests {
         assert!(silent.is_empty());
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn assert_stream_version_rejection<S>(mut initiator: S, mut receiver: S)
     where
         S: Read + Write + Send + 'static,
@@ -1193,14 +1211,14 @@ mod tests {
         assert_eq!(received, unsupported_version_record());
     }
 
-    #[cfg(all(feature = "native", unix))]
+    #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
     #[test]
     fn unix_transport_emits_exactly_one_typed_version_rejection_then_closes() {
         let (initiator, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
         assert_stream_version_rejection(initiator, receiver);
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     #[test]
     fn loopback_tcp_and_ssh_forward_transport_reject_versions_identically() {
         for _transport in ["loopback TCP", "SSH-forwarded loopback TCP"] {
@@ -1213,14 +1231,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn connection_rejects_reserved_record_flags() {
         let mut connection = Connection::sink(ConnectionKind::Control).unwrap();
         assert!(connection.write_record(1, 2, 0, &[]).is_err());
     }
 
     #[test]
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn connection_from_streams_emits_the_normal_preface() {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let _connection = Connection::from_streams(
@@ -1236,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "native", unix))]
+    #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
     fn split_clears_the_unix_establishment_deadlines() {
         let (stream, _peer) = UnixStream::pair().unwrap();
         stream
@@ -1268,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "native", not(unix)))]
+    #[cfg(all(any(feature = "native", feature = "native-transport"), not(unix)))]
     fn split_clears_the_tcp_establishment_deadlines() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1302,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn cloned_writers_serialize_complete_records_and_sequences() {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writer = ConnectionWriter {
@@ -1352,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn vectored_records_match_contiguous_records_under_short_writes() {
         let vectored_stats = Arc::new(Mutex::new(WriteStats::default()));
         let vectored = test_writer(
@@ -1385,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn returned_sequences_match_wire_headers_and_restart_per_writer() {
         let stats = Arc::new(Mutex::new(WriteStats::default()));
         let writer = test_writer(
@@ -1413,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn batched_mode_flushes_flow_updates_correlated_records_and_bounded_batches() {
         let stats = Arc::new(Mutex::new(WriteStats::default()));
         let writer = test_writer(
@@ -1441,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn read_record_into_reuses_capacity_and_rejects_oversize_before_resize() {
         let first = RecordHeader {
             body_length: 32,
@@ -1502,7 +1520,7 @@ mod tests {
         assert_eq!(RecordHeader::decode(header.encode()), header);
     }
 
-    #[cfg(all(feature = "native", unix))]
+    #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
     #[test]
     fn endpoint_parser_accepts_explicit_and_bare_unix_paths() {
         assert_eq!(
@@ -1516,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn endpoint_parser_accepts_tcp() {
         assert_eq!(
             Endpoint::parse("tcp:127.0.0.1:12345").unwrap(),

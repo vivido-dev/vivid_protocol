@@ -13,6 +13,8 @@ pub const LIVE_MEDIA: &str = "live-media-v1";
 pub const TIMED_MEDIA: &str = "timed-media-v1";
 pub const AUDIO_GAIN: &str = "audio-gain-v1";
 pub const DESKTOP_INPUT: &str = "desktop-input-v1";
+pub const FILE_DROP: &str = "file-drop-v1";
+pub const FILE_DROP_PATH: &str = "file-drop-path-v1";
 pub const OBSERVABILITY: &str = "observability-v1";
 pub const WEB_CARRIER: &str = "web-carrier-v1";
 pub const MULTIPLEXED_SESSION_CARRIER: &str = "multiplexed-session-carrier-v1";
@@ -104,6 +106,25 @@ pub mod record {
     pub const POINTER_MOTION: u16 = 0x0711;
     pub const POINTER_BUTTON: u16 = 0x0712;
     pub const POINTER_AXIS: u16 = 0x0713;
+
+    pub const SET_FILE_DROP_BINDING: u16 = 0x7000;
+    pub const FILE_DROP_BOUND: u16 = 0x7001;
+    pub const FILE_DROP_OFFER: u16 = 0x7002;
+    pub const ACCEPT_FILE_DROP: u16 = 0x7003;
+    pub const FILE_DROP_ACCEPTED: u16 = 0x7004;
+    pub const CANCEL_FILE_DROP: u16 = 0x7005;
+    pub const FILE_DROP_CANCELLED: u16 = 0x7006;
+    pub const ADVANCE_FILE_TRANSFER: u16 = 0x7007;
+    pub const FILE_TRANSFER_ADVANCED: u16 = 0x7008;
+    pub const QUERY_FILE_DROP: u16 = 0x7009;
+    pub const FILE_DROP_STATUS: u16 = 0x700a;
+    pub const FILE_TRANSFER_OPEN: u16 = 0x7010;
+    pub const FILE_TRANSFER_ACCEPTED: u16 = 0x7011;
+    pub const FILE_DATA: u16 = 0x7012;
+    pub const MAX_FILE_DATA: u16 = 0x7013;
+    pub const FILE_FINISH: u16 = 0x7014;
+    pub const FILE_RESULT: u16 = 0x7015;
+    pub const FILE_TRANSFER_ABORT: u16 = 0x7016;
 
     pub const CHANNEL_OPEN: u16 = 0x8000;
     pub const VIDEO_PACKET: u16 = 0x8001;
@@ -235,7 +256,9 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
         | LIVE_MEDIA
         | OBSERVABILITY
         | WEB_CARRIER
+        | FILE_DROP
         | MULTIPLEXED_SESSION_CARRIER => Some(&[CORE_CONTROL]),
+        FILE_DROP_PATH => Some(&[FILE_DROP]),
         TIMED_MEDIA => Some(&[LIVE_MEDIA]),
         AUDIO_GAIN => Some(&[TIMED_MEDIA]),
         DESKTOP_INPUT => Some(&[DESKTOP_SURFACE, LIVE_MEDIA]),
@@ -275,6 +298,15 @@ mod tests {
         validate_profile_set([DESKTOP_INPUT, DESKTOP_SURFACE, LIVE_MEDIA, CORE_CONTROL]).unwrap();
         assert!(matches!(
             validate_profile_set([DESKTOP_INPUT, CORE_CONTROL]),
+            Err(ProfileError::MissingPrerequisite { .. })
+        ));
+    }
+
+    #[test]
+    fn the_file_drop_path_profile_requires_file_drop() {
+        validate_profile_set([FILE_DROP_PATH, FILE_DROP, CORE_CONTROL]).unwrap();
+        assert!(matches!(
+            validate_profile_set([FILE_DROP_PATH, CORE_CONTROL]),
             Err(ProfileError::MissingPrerequisite { .. })
         ));
     }

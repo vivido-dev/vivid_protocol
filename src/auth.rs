@@ -278,6 +278,46 @@ pub fn channel_tag(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn file_transfer_tag(
+    session_channel_key: &[u8; 32],
+    session_id: u64,
+    context_id: u64,
+    surface_id: u64,
+    producer_epoch: u64,
+    grant_generation: u64,
+    surface_generation: u64,
+    drop_id: u64,
+    transfer_id: u64,
+    transfer_generation: u64,
+    resume_offset: u64,
+    maximum_record_body: u32,
+    maximum_body_bytes: u64,
+    maximum_records: u64,
+    client_nonce: &[u8; 16],
+) -> [u8; 16] {
+    truncate_tag(hmac_parts(
+        session_channel_key,
+        &[
+            b"VIVID-FILE-TRANSFER-1",
+            &session_id.to_be_bytes(),
+            &context_id.to_be_bytes(),
+            &surface_id.to_be_bytes(),
+            &producer_epoch.to_be_bytes(),
+            &grant_generation.to_be_bytes(),
+            &surface_generation.to_be_bytes(),
+            &drop_id.to_be_bytes(),
+            &transfer_id.to_be_bytes(),
+            &transfer_generation.to_be_bytes(),
+            &resume_offset.to_be_bytes(),
+            &maximum_record_body.to_be_bytes(),
+            &maximum_body_bytes.to_be_bytes(),
+            &maximum_records.to_be_bytes(),
+            client_nonce,
+        ],
+    ))
+}
+
 /// Constant-time comparison of a 32-byte transcript proof.
 ///
 /// Security §2: every authentication tag and secret verifier is compared in constant time after an
@@ -342,6 +382,34 @@ mod tests {
         assert!(verify_tag(&first, &first));
         assert!(!verify_tag(&first, &[0; 15]));
         assert_eq!(anchor.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn file_transfer_tag_scopes_every_binding_generation() {
+        let key = [0x5a; 32];
+        let tag = |producer_epoch, grant_generation, surface_generation| {
+            file_transfer_tag(
+                &key,
+                1,
+                2,
+                3,
+                producer_epoch,
+                grant_generation,
+                surface_generation,
+                4,
+                5,
+                1,
+                0,
+                4096,
+                8192,
+                2,
+                &[6; 16],
+            )
+        };
+        let baseline = tag(7, 8, 9);
+        assert_ne!(baseline, tag(10, 8, 9));
+        assert_ne!(baseline, tag(7, 10, 9));
+        assert_ne!(baseline, tag(7, 8, 10));
     }
 
     #[test]

@@ -16,7 +16,8 @@ pub const OP_SCENE: u64 = 1 << 2;
 pub const OP_TERMINAL_ANCHOR: u64 = 1 << 3;
 pub const OP_DESKTOP_INPUT: u64 = 1 << 4;
 pub const OP_DELEGATE: u64 = 1 << 5;
-pub const OP_KNOWN_MASK: u64 = (1 << 6) - 1;
+pub const OP_RECEIVE_FILE_DROP: u64 = 1 << 6;
+pub const OP_KNOWN_MASK: u64 = (1 << 7) - 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextDefinition {

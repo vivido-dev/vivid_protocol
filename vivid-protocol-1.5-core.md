@@ -174,10 +174,13 @@ Host names, wildcard addresses, and IPv6 are not part of that profile.
 
 ### 3.2 SSH binding
 
-SSH maps each remote private Unix socket connection to one local endpoint connection. The remote
-sockets are owner-only. `VIVID_ROOT_SECRET` or a lease activation secret is delivered inside the
-authenticated SSH session through a protected environment request, file descriptor, or standard
-input channel, never a command argument.
+On POSIX, SSH maps each remote private Unix socket connection to one local endpoint connection; the
+remote sockets are owner-only. On Windows, where OpenSSH stream-local forwarding is unavailable,
+the binding MAY instead use an exact IPv4 `127.0.0.1` remote TCP listener. That listener MUST NOT
+bind a wildcard, non-loopback, hostname, or IPv6 address, and every Vivid connection remains
+root-authenticated. `VIVID_ROOT_SECRET` or a lease activation secret is delivered inside the
+authenticated SSH session through a protected environment request, file descriptor, owner-only
+temporary file, or standard-input channel, never a command argument.
 
 An SSH binding MAY use separate lifecycle-bound SSH TCP connections for logical lanes. If several
 lanes share one SSH TCP connection, the binding reports that they share retransmission ordering.
@@ -202,8 +205,9 @@ The producer initiates every Vivid connection and writes one 16-byte preface:
 | 8 | 4 | Initiator transmit-body limit |
 | 12 | 4 | Reserved; zero |
 
-Connection kinds are `CONTROL` (`0`), `LANE` (`1`), and `TRACK` (`2`). The presenter does not send
-a reciprocal preface.
+Connection kinds are `CONTROL` (`0`), `LANE` (`1`), `TRACK` (`2`), and `FILE_TRANSFER` (`3`). The
+presenter does not send a reciprocal preface. `FILE_TRANSFER` is legal only after negotiating
+`file-drop-v1` and accepting one drop.
 
 The transmit-body limit is nonzero and no greater than 67,108,864 bytes. Reserved fields, unknown
 connection kinds, and invalid limits are fatal framing errors.
@@ -212,7 +216,8 @@ The first record is:
 
 - `HELLO` on `CONTROL`;
 - `LANE_OPEN` on `LANE`; or
-- `CHANNEL_OPEN` on `TRACK`.
+- `CHANNEL_OPEN` on `TRACK`; or
+- `FILE_TRANSFER_OPEN` on `FILE_TRANSFER`.
 
 No allocation other than bounded pre-authentication parsing occurs before that first record has
 been validated and authenticated.

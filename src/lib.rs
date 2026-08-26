@@ -10,8 +10,9 @@ pub mod anchor;
 pub mod auth;
 pub mod cbor;
 pub mod context;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 pub mod discovery;
+pub mod file_drop;
 pub mod geometry;
 pub mod grant;
 pub mod hid;
@@ -29,7 +30,7 @@ pub mod scene;
 pub mod surface;
 pub mod target;
 pub mod time;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "native-transport"))]
 pub mod trace;
 pub mod track;
 pub mod web;

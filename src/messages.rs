@@ -1221,6 +1221,17 @@ impl<'a> StrictMap<'a> {
             })
     }
 
+    pub fn optional_text(&self, key: u64) -> Result<Option<&'a str>, MessageError> {
+        self.optional(key)
+            .map(|value| {
+                value.as_text().ok_or(MessageError::WrongType {
+                    schema: self.schema,
+                    key,
+                })
+            })
+            .transpose()
+    }
+
     pub fn required_bytes(&self, key: u64) -> Result<&'a [u8], MessageError> {
         self.required(key)?
             .as_bytes()
