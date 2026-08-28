@@ -5,7 +5,7 @@ use std::fs::{self, File};
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use std::io::{IoSlice, Read, Write};
 #[cfg(any(feature = "native", feature = "native-transport"))]
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
 use std::os::unix::net::UnixStream;
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -348,6 +348,7 @@ impl WriterIo {
 #[cfg(any(feature = "native", feature = "native-transport"))]
 struct WriterState {
     io: WriterIo,
+    closed: bool,
     send_sequence: u64,
     send_body_limit: u32,
     flush_mode: FlushMode,
@@ -428,6 +429,12 @@ impl ConnectionWriter {
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Vivid connection writer is closed",
+            ));
+        }
         if body_length > state.send_body_limit || body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -478,6 +485,12 @@ impl ConnectionWriter {
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Vivid connection writer is closed",
+            ));
+        }
         if mode == FlushMode::Immediate && state.unflushed_records != 0 {
             flush_writer(&mut state.io)?;
             state.unflushed_records = 0;
@@ -491,6 +504,12 @@ impl ConnectionWriter {
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Vivid connection writer is closed",
+            ));
+        }
         flush_writer(&mut state.io)?;
         state.unflushed_records = 0;
         Ok(())
@@ -498,11 +517,50 @@ impl ConnectionWriter {
 
     pub fn set_send_body_limit(&self, maximum: u32) -> io::Result<()> {
         validate_body_limit(maximum)?;
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?
-            .send_body_limit = maximum;
+            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Vivid connection writer is closed",
+            ));
+        }
+        state.send_body_limit = maximum;
         Ok(())
+    }
+
+    /// Close the underlying transport for every clone of this writer.
+    ///
+    /// A Vivid track channel has an independent connection and a reverse-channel reader. Merely
+    /// dropping the producer's write handle leaves that reader blocked and keeps the peer's
+    /// connection slot live. Shutdown is therefore explicit and shared: native sockets are shut
+    /// down in both directions, while stream adapters are dropped so multiplexed transports can
+    /// observe their own channel close.
+    pub fn shutdown(&self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if state.closed {
+            return Ok(());
+        }
+        state.closed = true;
+        state.unflushed_records = 0;
+        let result = match &state.io {
+            WriterIo::Tcp(stream) => stream.shutdown(Shutdown::Both),
+            #[cfg(unix)]
+            WriterIo::Unix(stream) => stream.shutdown(Shutdown::Both),
+            WriterIo::Live(_) | WriterIo::Trace(_) | WriterIo::Sink(_) => Ok(()),
+        };
+        // Dropping a live adapter is its transport-independent close signal. Native socket
+        // shutdown above is still required because their read and write halves are cloned.
+        state.io = WriterIo::Sink(io::sink());
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+            other => other,
+        }
     }
 
     fn write_raw_preface(&self, preface: &[u8; PREFACE_SIZE]) -> io::Result<()> {
@@ -675,6 +733,7 @@ impl Connection {
         let writer = ConnectionWriter {
             state: Arc::new(Mutex::new(WriterState {
                 io,
+                closed: false,
                 send_sequence: 0,
                 send_body_limit: body_limit,
                 flush_mode: FlushMode::Immediate,
@@ -1114,6 +1173,7 @@ mod tests {
         ConnectionWriter {
             state: Arc::new(Mutex::new(WriterState {
                 io: WriterIo::Live(Box::new(writer)),
+                closed: false,
                 send_sequence: 0,
                 send_body_limit: 1024,
                 flush_mode,
@@ -1254,6 +1314,39 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
+    fn writer_shutdown_closes_both_native_tcp_halves() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let writer_stream = stream.try_clone().unwrap();
+        let connection = Connection::new_version(
+            Some(ReaderIo::Tcp(stream)),
+            WriterIo::Tcp(writer_stream),
+            ConnectionKind::Track,
+            VIVID_MAJOR,
+            VIVID_MINOR,
+        )
+        .unwrap();
+        let (_reader, writer) = connection.split().unwrap();
+
+        writer.shutdown().unwrap();
+        writer.shutdown().unwrap();
+        assert_eq!(
+            writer.write_record(1, 0, 0, &[]).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        assert_eq!(
+            received,
+            encode_preface(ConnectionKind::Track, DEFAULT_MAX_RECORD_BODY),
+            "the peer did not observe EOF after the writer half retired"
+        );
+    }
+
+    #[test]
     #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
     fn split_clears_the_unix_establishment_deadlines() {
         let (stream, _peer) = UnixStream::pair().unwrap();
@@ -1326,6 +1419,7 @@ mod tests {
         let writer = ConnectionWriter {
             state: Arc::new(Mutex::new(WriterState {
                 io: WriterIo::Live(Box::new(SharedBytes(bytes.clone()))),
+                closed: false,
                 send_sequence: 0,
                 send_body_limit: 16,
                 flush_mode: FlushMode::Immediate,

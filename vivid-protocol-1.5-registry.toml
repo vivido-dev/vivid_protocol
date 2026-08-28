@@ -126,6 +126,16 @@ value = 3
 name = "FILE_TRANSFER"
 state = "standards-track"
 
+[[channel_advance_reason]]
+value = 1
+name = "TIMELINE_DISCONTINUITY"
+state = "standards-track"
+
+[[channel_advance_reason]]
+value = 3
+name = "RECOVERY"
+state = "standards-track"
+
 [[record]]
 value = 0x0001
 name = "HELLO"

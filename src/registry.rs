@@ -186,6 +186,14 @@ pub mod error {
     pub const INTEGRITY_FAILED: u64 = 30;
 }
 
+/// Standards-track `ADVANCE_CHANNEL` reason values.
+pub mod channel_advance_reason {
+    /// Producer-originated timeline discontinuity, such as a seek.
+    pub const TIMELINE_DISCONTINUITY: u64 = 1;
+    /// Decoder or transport recovery that does not imply a surface-wide timeline change.
+    pub const RECOVERY: u64 = 3;
+}
+
 pub mod limit {
     pub const CONCURRENT_SESSIONS: u64 = 1;
     pub const CONCURRENT_CONNECTIONS: u64 = 2;

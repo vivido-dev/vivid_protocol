@@ -348,6 +348,13 @@ discards decoder state, and returns `CHANNEL_ADVANCED` with the new generation, 
 track revision. Video requires a key unit; raster requires a full frame; image requires the
 complete image; audio starts with a valid independent access unit and its declared initialization.
 
+Reason 1 is `TIMELINE_DISCONTINUITY`; reason 3 is `RECOVERY`. A producer that supplies a causation
+ID on a timeline discontinuity groups that discontinuity across the linked timed tracks on the
+same surface. It MUST advance every participating linked track with that same causation ID before
+sending replacement media on any of them. A terminating gateway MAY wait for the complete group
+before replacing its independent outer decoders. Recovery is track-scoped and MUST NOT be inferred
+to advance linked tracks.
+
 No single-use ticket is minted or transported.
 
 ## 6. Absolute channel-local flow control
