@@ -1470,8 +1470,6 @@ pub struct H264DecoderDescription {
     pub decoder_config: Vec<u8>,
 }
 
-/// Largest decoder configuration accepted from an encoder.
-
 /// Derive the decoder description from an encoder's extradata, in either avcC or Annex-B form.
 pub fn h264_decoder_description(extradata: &[u8]) -> io::Result<H264DecoderDescription> {
     let avcc = if extradata.first() == Some(&1) {
