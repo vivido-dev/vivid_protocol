@@ -552,6 +552,47 @@ mod desktop_parameter_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_surface_ready_body_carries_identity_revisions_policy_and_parameters() {
+        let parameters = vec![(0, Value::Unsigned(9))];
+
+        assert_eq!(
+            surface_ready_payload(
+                1,
+                2,
+                SurfaceRevision::new(3),
+                SurfaceGeneration::new(4),
+                5,
+                parameters.clone(),
+            ),
+            vec![
+                (0, Value::Unsigned(1)),
+                (1, Value::Unsigned(2)),
+                (2, Value::Unsigned(3)),
+                (3, Value::Unsigned(4)),
+                (4, Value::Unsigned(5)),
+                (5, Value::Map(parameters)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_surface_with_no_profile_parameters_still_carries_the_key() {
+        // An absent key and an empty map are different on the wire, and a producer that treats a
+        // missing key 5 as "no parameters" would be reading a different message than one that
+        // rejects it.
+        let payload = surface_ready_payload(
+            1,
+            1,
+            SurfaceRevision::new(1),
+            SurfaceGeneration::new(1),
+            0,
+            Vec::new(),
+        );
+
+        assert_eq!(payload.last(), Some(&(5, Value::Map(Vec::new()))));
+    }
     use super::*;
 
     fn surface(context_id: u64) -> SurfaceDefinition {
@@ -597,4 +638,26 @@ mod tests {
         assert_ne!(first.context_id, second.context_id);
         assert_eq!(first.surface_id, second.surface_id);
     }
+}
+
+/// The body of `SURFACE_READY`: a surface exists and carries this policy and profile parameters.
+///
+/// Every presenter in this tree built this by hand, and identically. It is small enough that three
+/// copies looked harmless, and small enough that one drifting key would be hard to see.
+pub fn surface_ready_payload(
+    context_id: u64,
+    surface_id: u64,
+    revision: SurfaceRevision,
+    generation: SurfaceGeneration,
+    policy: u64,
+    profile_parameters: PayloadMap,
+) -> PayloadMap {
+    vec![
+        (0, Value::Unsigned(context_id)),
+        (1, Value::Unsigned(surface_id)),
+        (2, Value::Unsigned(revision.get())),
+        (3, Value::Unsigned(generation.get())),
+        (4, Value::Unsigned(policy)),
+        (5, Value::Map(profile_parameters)),
+    ]
 }

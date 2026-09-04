@@ -965,6 +965,102 @@ impl SignedValue for Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// The exact keys and order of a `MAX_CHANNEL_DATA` body.
+    ///
+    /// Pinned against a literal rather than against another call to the same function: this is the
+    /// regression the three hand-written copies could not have, because each was its own authority
+    /// on what the map should contain.
+    #[test]
+    fn a_flow_grant_carries_the_owner_tuple_then_the_two_maxima() {
+        let address = TrackAddress {
+            context_id: 1,
+            surface_id: 2,
+            track_id: 3,
+            channel_generation: ChannelGeneration::new(4),
+        };
+
+        assert_eq!(
+            max_channel_data_payload(address, 65_536, 128),
+            vec![
+                (0, Value::Unsigned(1)),
+                (1, Value::Unsigned(2)),
+                (2, Value::Unsigned(3)),
+                (3, Value::Unsigned(4)),
+                (4, Value::Unsigned(65_536)),
+                (5, Value::Unsigned(128)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_keyframe_request_carries_its_minimum_epoch_and_reason() {
+        let address = TrackAddress {
+            context_id: 7,
+            surface_id: 8,
+            track_id: 9,
+            channel_generation: ChannelGeneration::new(2),
+        };
+
+        assert_eq!(
+            need_keyframe_payload(address, 5, 2),
+            vec![
+                (0, Value::Unsigned(7)),
+                (1, Value::Unsigned(8)),
+                (2, Value::Unsigned(9)),
+                (3, Value::Unsigned(2)),
+                (4, Value::Unsigned(5)),
+                (5, Value::Unsigned(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_full_frame_request_takes_its_reason_rather_than_assuming_one() {
+        // One presenter parameterised this reason and another hardcoded 1. Same value, but the
+        // shared encoder has to accept it or the two cannot both use this.
+        let address = TrackAddress {
+            context_id: 1,
+            surface_id: 1,
+            track_id: 1,
+            channel_generation: ChannelGeneration::new(1),
+        };
+
+        assert_eq!(
+            need_full_frame_payload(address, 1).last(),
+            Some(&(4, Value::Unsigned(1)))
+        );
+        assert_eq!(
+            need_full_frame_payload(address, 3).last(),
+            Some(&(4, Value::Unsigned(3)))
+        );
+    }
+
+    #[test]
+    fn every_channel_notification_opens_with_the_same_owner_tuple() {
+        // The property that makes a wrong-track notification impossible to misread: all three
+        // answer "which track" in keys 0 through 3, in one order.
+        let address = TrackAddress {
+            context_id: 11,
+            surface_id: 12,
+            track_id: 13,
+            channel_generation: ChannelGeneration::new(14),
+        };
+        let expected = [
+            (0, Value::Unsigned(11)),
+            (1, Value::Unsigned(12)),
+            (2, Value::Unsigned(13)),
+            (3, Value::Unsigned(14)),
+        ];
+
+        for payload in [
+            max_channel_data_payload(address, 1, 1),
+            need_keyframe_payload(address, 0, 0),
+            need_full_frame_payload(address, 1),
+        ] {
+            assert_eq!(&payload[..4], &expected[..], "payload: {payload:?}");
+        }
+    }
     use super::*;
 
     #[test]
@@ -1123,4 +1219,62 @@ mod tests {
             configuration
         );
     }
+}
+
+/// One track's complete owner tuple, as a presenter names it when notifying its producer.
+///
+/// The three channel notifications below all begin with it, in the same key order, because they all
+/// answer "which track" before they answer anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackAddress {
+    pub context_id: u64,
+    pub surface_id: u64,
+    pub track_id: u64,
+    pub channel_generation: ChannelGeneration,
+}
+
+impl TrackAddress {
+    fn prefix(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (2, Value::Unsigned(self.track_id)),
+            (3, Value::Unsigned(self.channel_generation.get())),
+        ]
+    }
+}
+
+/// The body of `MAX_CHANNEL_DATA`: the absolute cumulative maxima a channel may now reach.
+///
+/// These are the ceilings, not an increment. A presenter that sends a smaller maximum than it sent
+/// before is telling its producer nothing new, and media §6 makes the maxima monotonic for exactly
+/// that reason.
+pub fn max_channel_data_payload(
+    address: TrackAddress,
+    maximum_body_bytes: u64,
+    maximum_media_records: u64,
+) -> PayloadMap {
+    let mut payload = address.prefix();
+    payload.push((4, Value::Unsigned(maximum_body_bytes)));
+    payload.push((5, Value::Unsigned(maximum_media_records)));
+    payload
+}
+
+/// The body of `NEED_KEYFRAME`, media §13.
+///
+/// `minimum_epoch` is the epoch the presenter will accept a keyframe at or after; zero means the
+/// current one. `reason` distinguishes a decoder reset from a transport loss, and only the latter
+/// hands the replacement channel a fresh epoch.
+pub fn need_keyframe_payload(address: TrackAddress, minimum_epoch: u32, reason: u64) -> PayloadMap {
+    let mut payload = address.prefix();
+    payload.push((4, Value::Unsigned(u64::from(minimum_epoch))));
+    payload.push((5, Value::Unsigned(reason)));
+    payload
+}
+
+/// The body of `NEED_FULL_FRAME`, media §13: a raster delta chain that cannot continue.
+pub fn need_full_frame_payload(address: TrackAddress, reason: u64) -> PayloadMap {
+    let mut payload = address.prefix();
+    payload.push((4, Value::Unsigned(reason)));
+    payload
 }
