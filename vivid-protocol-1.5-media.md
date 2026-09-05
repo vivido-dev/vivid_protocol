@@ -3,7 +3,7 @@
 This file is a normative part of the
 [Vivid Protocol 1.5 specification](vivid-protocol-1.5-spec.md).
 
-It defines `live-media-v1` and `timed-media-v1`.
+It defines `live-media-v1`, `timed-media-v1`, and `audio-input-v1`.
 
 ## 1. Track model
 
@@ -18,6 +18,7 @@ Track kinds are video (`1`), audio (`2`), raster (`3`), and encoded image (`4`).
 
 | Value | Slot | Legal kinds |
 |---:|---|---|
+| 0 | No playback slot; uplink audio only | Audio, direction uplink |
 | 1 | `primary-video` | Video |
 | 2 | `audio` | Audio |
 | 3 | `raster` | Raster |
@@ -69,8 +70,10 @@ does not allocate or carry a descriptor/policy; creation uses a nonzero track ID
 | 13 | uint | Target latency in microseconds; live mode |
 | 14 | uint | Maximum latency in microseconds |
 | 15 | uint | Requested retained-pixel charge |
+| 16 | uint | Optional immutable direction: downlink (`0`, default), uplink (`1`) |
 
-This is a strict schema.
+This is a strict schema. Downlink senders SHOULD omit key 16 for compatibility. Uplink requires
+negotiated `audio-input-v1`; see §17. Other direction values are invalid.
 
 Keys 8 through 11 are contractual claims. Zero is invalid for a created streaming track. For a
 still image, key 8 is 1, key 9 covers transfer size over the presenter's minimum accounting
@@ -358,6 +361,9 @@ to advance linked tracks.
 No single-use ticket is minted or transported.
 
 ## 6. Absolute channel-local flow control
+
+This section describes downlink roles. For uplink, §17 reverses the media-sender and flow-authority
+roles without changing cumulative accounting or channel authentication.
 
 Flow-control state is scoped to one channel generation. The producer tracks:
 
@@ -829,3 +835,54 @@ Regression suites cover lost channel acceptance, duplicate opens, half-open old 
 generation advance, zero and duplicate flow updates, maximum counters near overflow, channel loss
 during parsing, two owners reusing every local ID, replacement without input changes, live A/V
 clocking, timed pre-roll, pause, flush, EOS, drain, keyframe recovery, and full-frame recovery.
+
+## 17. Microphone input (`audio-input-v1`)
+
+This optional profile requires `live-media-v1`. Producers MUST NOT probe or create an uplink track
+unless it was accepted in WELCOME. The producer remains the object owner and channel initiator;
+direction changes media ownership, not authentication, identity, or control authority.
+
+An uplink track MUST be audio, live mode, realtime lane, slot zero, with zero retained-pixel charge.
+It MUST NOT be activated into a surface slot, projected as visual content, mixed into presenter
+playback, or used as a surface playback clock. A surface may own it without any scene nodes.
+PLAY, PAUSE, FLUSH, gain, decode-readiness, and presentation/drain semantics do not control local
+capture. Channel acceptance is the applicable readiness milestone.
+
+The interoperable initial configuration is `pcm_s16le` / `pcm-packet-v1`, no extradata or codec
+string, 48,000 Hz, one channel, channel mask 4, 960 samples per 20,000 µs packet. The maximum access
+unit is 1,920 bytes. With the existing 48-byte AUDIO_PACKET header, the maximum media body is 1,968
+bytes. Claims are 50,000 millihertz, 50 records/s, 787,200 encoded body bits/s, 19,680 in-flight body
+bytes, 40,000 µs target latency, and 200,000 µs maximum latency. Implementations MAY reject other
+configurations as unsupported rather than silently converting the wire contract.
+
+After ordinary authenticated CHANNEL_OPEN, the presenter sends CHANNEL_ACCEPTED with **zero**
+cumulative byte and record maxima. The producer is now the flow authority and sends
+MAX_CHANNEL_DATA on that same connection. The presenter sends AUDIO_PACKET only after credit is
+available; neither role sends media in the opposite direction. At most ten packets / 19,680 body
+bytes may be outstanding. Credit is returned only as receiver storage becomes reusable. The
+existing sustained-rate token bucket applies with the roles reversed.
+
+Epoch is 1 within each microphone generation. Packet IDs are nonzero and strictly increasing for
+the track; re-originating gateways allocate independent packet IDs. PTS is nonnegative monotonic
+capture-relative microseconds, DTS equals PTS, duration is 20,000 µs, and both trim counts are zero.
+Successive delivered PTS values differ by at least one packet duration. Dropped capture preserves
+PTS gaps. EOS carries the full tuple/generation, epoch 1 (or 0 if no media was sent), and the exact
+last AUDIO_PACKET **connection sequence**, or zero when none was sent. EOS is not charged to flow.
+
+Capture requires explicit local consent. Creating a track or opening a device remotely is not
+consent. Selection is scoped to a complete authenticated route, never inferred from remote pane
+focus or a title supplied by an application. Mute and revocation stop capture, discard queued
+speech, and terminate the channel (best-effort EOS followed by cancellation). Unlike playback EOS,
+microphone EOS MUST NOT drain buffered speech. A later enable requires a fresh channel generation
+and fresh consent. Transport loss has the same silence/revocation behavior.
+
+Every hop MUST bound PCM queues and write stalls independently of control, terminal input, and
+other tracks. Stale local queue entries older than 200 ms are discarded; starvation emits silence
+at the remote device. Samples already handed to an OS/app capture buffer cannot be retracted.
+No media bytes, secrets, or microphone grants may be carried by a terminal PTY.
+
+A byte-transparent relay preserves the session. A terminating gateway authenticates independent
+inner and outer sessions, maps the complete owner/context/surface/track/generation tuple, and owns
+separate credit, sequence, and EOS state on each hop. Replacing a foreground attachment revokes
+its delivery routes; stale attachment messages MUST NOT reach a new owner or generation. A remote
+virtual device may survive mute/detach, emitting silence, independently of channel lifetime.

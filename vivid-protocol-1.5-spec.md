@@ -6,6 +6,9 @@
 **Architecture:** stable surfaces, replaceable tracks, authenticated channel generations, and
 bounded session leases.
 
+The optional `audio-input-v1` profile in the media specification adds consent-gated microphone
+uplink without changing the Vivid 1.5 preface or downlink defaults.
+
 ## 1. Status and normative language
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **SHOULD**,

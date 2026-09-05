@@ -638,8 +638,34 @@ impl KindConfiguration {
     }
 }
 
+/// Media byte direction, independent of which role creates the track.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u64)]
+pub enum TrackDirection {
+    #[default]
+    Downlink = 0,
+    Uplink = 1,
+}
+
+impl TryFrom<u64> for TrackDirection {
+    type Error = MessageError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Downlink),
+            1 => Ok(Self::Uplink),
+            _ => Err(invalid_value(
+                "track configuration",
+                16,
+                "unknown direction",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackConfiguration {
+    pub direction: TrackDirection,
     pub context_id: u64,
     pub surface_id: u64,
     pub track_id: u64,
@@ -659,6 +685,19 @@ pub struct TrackConfiguration {
 
 impl TrackConfiguration {
     pub fn validate(&self, probe: bool) -> Result<(), MessageError> {
+        if self.direction == TrackDirection::Uplink
+            && (!matches!(self.kind, KindConfiguration::Audio(_))
+                || self.mode != TrackMode::Live
+                || self.lane != LaneClass::Realtime
+                || self.slot != 0
+                || self.retained_pixel_charge != 0)
+        {
+            return Err(invalid_value(
+                "track configuration",
+                16,
+                "uplink requires live realtime audio without a surface slot or retained pixels",
+            ));
+        }
         require_nonzero("track configuration", 0, self.context_id)?;
         require_nonzero("track configuration", 1, self.surface_id)?;
         if probe {
@@ -736,7 +775,7 @@ impl TrackConfiguration {
 
     pub fn payload(&self, probe: bool) -> Result<PayloadMap, MessageError> {
         self.validate(probe)?;
-        Ok(vec![
+        let mut payload = vec![
             (0, Value::Unsigned(self.context_id)),
             (1, Value::Unsigned(self.surface_id)),
             (2, Value::Unsigned(self.track_id)),
@@ -753,7 +792,11 @@ impl TrackConfiguration {
             (13, Value::Unsigned(self.target_latency_us)),
             (14, Value::Unsigned(self.maximum_latency_us)),
             (15, Value::Unsigned(self.retained_pixel_charge)),
-        ])
+        ];
+        if self.direction != TrackDirection::Downlink {
+            payload.push((16, Value::Unsigned(self.direction as u64)));
+        }
+        Ok(payload)
     }
 
     pub fn decode(
@@ -764,12 +807,13 @@ impl TrackConfiguration {
         let map = StrictMap::new(
             "track configuration",
             payload,
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         )?;
         let track_id = map.required_u64(2)?;
         validate_header_object(header_object_id, track_id)?;
         let kind = TrackKind::try_from(map.required_u64(3)?)?;
         let configuration = Self {
+            direction: TrackDirection::try_from(map.optional_u64(16)?.unwrap_or(0))?,
             context_id: map.required_u64(0)?,
             surface_id: map.required_u64(1)?,
             track_id,
@@ -1152,6 +1196,7 @@ mod tests {
     #[test]
     fn strict_raster_track_configuration_round_trips() {
         let configuration = TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 2,
             track_id: 3,
@@ -1188,6 +1233,7 @@ mod tests {
         opus_head.extend_from_slice(&[1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]);
         let maximum_record_body = media::audio_body_len(4_096).unwrap();
         let configuration = TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 2,
             track_id: 3,

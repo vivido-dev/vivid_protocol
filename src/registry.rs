@@ -12,6 +12,7 @@ pub const CANVAS_SURFACE: &str = "canvas-surface-v1";
 pub const LIVE_MEDIA: &str = "live-media-v1";
 pub const TIMED_MEDIA: &str = "timed-media-v1";
 pub const AUDIO_GAIN: &str = "audio-gain-v1";
+pub const AUDIO_INPUT: &str = "audio-input-v1";
 pub const DESKTOP_INPUT: &str = "desktop-input-v1";
 pub const FILE_DROP: &str = "file-drop-v1";
 pub const FILE_DROP_PATH: &str = "file-drop-path-v1";
@@ -267,7 +268,7 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
         | FILE_DROP
         | MULTIPLEXED_SESSION_CARRIER => Some(&[CORE_CONTROL]),
         FILE_DROP_PATH => Some(&[FILE_DROP]),
-        TIMED_MEDIA => Some(&[LIVE_MEDIA]),
+        TIMED_MEDIA | AUDIO_INPUT => Some(&[LIVE_MEDIA]),
         AUDIO_GAIN => Some(&[TIMED_MEDIA]),
         DESKTOP_INPUT => Some(&[DESKTOP_SURFACE, LIVE_MEDIA]),
         _ => None,

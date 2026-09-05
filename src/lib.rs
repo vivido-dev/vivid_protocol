@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod anchor;
+pub mod audio_input;
 pub mod auth;
 pub mod cbor;
 pub mod context;

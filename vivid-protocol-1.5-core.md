@@ -13,6 +13,10 @@ resource contracts, maintains retained scene state, and renders surfaces.
 A **producer** creates surfaces, tracks, and scene nodes and may receive presenter-originated input
 when the negotiated profiles permit it.
 
+With `audio-input-v1`, a producer may also receive presenter-originated microphone media on an
+authenticated realtime track. The media specification defines the reversed flow roles and local
+consent requirements; object ownership and the session roles do not change.
+
 A **controller** holds root authority and may create contexts and session leases. It may also be a
 producer.
 

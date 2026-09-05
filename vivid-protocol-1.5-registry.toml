@@ -90,6 +90,11 @@ name = "multiplexed-session-carrier-v1"
 state = "experimental"
 prerequisites = ["vivid-core-control-v1"]
 
+[[profile]]
+name = "audio-input-v1"
+state = "standards-track"
+prerequisites = ["live-media-v1"]
+
 [[surface_profile]]
 name = "generic-content-v1"
 state = "standards-track"
