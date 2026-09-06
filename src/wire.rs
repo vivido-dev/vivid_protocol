@@ -360,6 +360,39 @@ struct WriterState {
 #[cfg(any(feature = "native", feature = "native-transport"))]
 pub struct ConnectionWriter {
     state: Arc<Mutex<WriterState>>,
+    // Cancellation must not wait for the mutex held by a blocked transport write.
+    native_shutdown: Arc<Mutex<Option<NativeShutdown>>>,
+}
+
+#[cfg(any(feature = "native", feature = "native-transport"))]
+enum NativeShutdown {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+#[cfg(any(feature = "native", feature = "native-transport"))]
+impl NativeShutdown {
+    fn from_writer(writer: &WriterIo) -> io::Result<Option<Self>> {
+        Ok(match writer {
+            WriterIo::Tcp(stream) => Some(Self::Tcp(stream.try_clone()?)),
+            #[cfg(unix)]
+            WriterIo::Unix(stream) => Some(Self::Unix(stream.try_clone()?)),
+            _ => None,
+        })
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        let result = match self {
+            Self::Tcp(stream) => stream.shutdown(Shutdown::Both),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.shutdown(Shutdown::Both),
+        };
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+            other => other,
+        }
+    }
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -539,6 +572,13 @@ impl ConnectionWriter {
     /// down in both directions, while stream adapters are dropped so multiplexed transports can
     /// observe their own channel close.
     pub fn shutdown(&self) -> io::Result<()> {
+        // Wake native readers and writers before waiting for an in-flight record to finish.
+        let result = self
+            .native_shutdown
+            .lock()
+            .map_err(|_| io::Error::other("Vivid shutdown lock is poisoned"))?
+            .take()
+            .map_or(Ok(()), |io| io.shutdown());
         let mut state = self
             .state
             .lock()
@@ -548,19 +588,10 @@ impl ConnectionWriter {
         }
         state.closed = true;
         state.unflushed_records = 0;
-        let result = match &state.io {
-            WriterIo::Tcp(stream) => stream.shutdown(Shutdown::Both),
-            #[cfg(unix)]
-            WriterIo::Unix(stream) => stream.shutdown(Shutdown::Both),
-            WriterIo::Live(_) | WriterIo::Trace(_) | WriterIo::Sink(_) => Ok(()),
-        };
         // Dropping a live adapter is its transport-independent close signal. Native socket
         // shutdown above is still required because their read and write halves are cloned.
         state.io = WriterIo::Sink(io::sink());
-        match result {
-            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
-            other => other,
-        }
+        result
     }
 
     fn write_raw_preface(&self, preface: &[u8; PREFACE_SIZE]) -> io::Result<()> {
@@ -731,6 +762,7 @@ impl Connection {
             DEFAULT_MAX_RECORD_BODY
         };
         let writer = ConnectionWriter {
+            native_shutdown: Arc::new(Mutex::new(NativeShutdown::from_writer(&io)?)),
             state: Arc::new(Mutex::new(WriterState {
                 io,
                 closed: false,
@@ -1171,6 +1203,7 @@ mod tests {
     #[cfg(any(feature = "native", feature = "native-transport"))]
     fn test_writer(writer: impl Write + Send + 'static, flush_mode: FlushMode) -> ConnectionWriter {
         ConnectionWriter {
+            native_shutdown: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(WriterState {
                 io: WriterIo::Live(Box::new(writer)),
                 closed: false,
@@ -1315,6 +1348,82 @@ mod tests {
 
     #[test]
     #[cfg(any(feature = "native", feature = "native-transport"))]
+    fn shutdown_interrupts_a_blocked_write_without_closing_another_connection() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let mut filling = stream.try_clone().unwrap();
+        let connection = Connection::new_version(
+            Some(ReaderIo::Tcp(stream.try_clone().unwrap())),
+            WriterIo::Tcp(stream),
+            ConnectionKind::Track,
+            VIVID_MAJOR,
+            VIVID_MINOR,
+        )
+        .unwrap();
+        let (_reader, writer) = connection.split().unwrap();
+        // Keep a second owner alive through cancellation, reusing object ID 1 below.
+        let neighbor = Connection::open(
+            &Endpoint::Tcp(listener.local_addr().unwrap().to_string()),
+            ConnectionKind::Track,
+        )
+        .unwrap();
+        let (mut neighbor_peer, _) = listener.accept().unwrap();
+        neighbor_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // Fill the socket before starting the record write, without relying on buffer sizes.
+        filling.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(Instant::now() < deadline, "socket did not saturate");
+            match filling.write(&[0; 65536]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill failed: {error}"),
+            }
+        }
+        filling.set_nonblocking(false).unwrap();
+        let sending = writer.clone();
+        let sender = std::thread::spawn(move || {
+            sending.write_record(0x1234, 0, 1, &vec![0; 4 * 1024 * 1024])
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while writer.state.try_lock().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "record write never took the lock"
+            );
+            std::thread::yield_now();
+        }
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closing = writer.clone();
+        let closer = std::thread::spawn(move || closed_tx.send(closing.shutdown()).unwrap());
+        let result = closed_rx.recv_timeout(Duration::from_secs(2));
+        // Always release the worker, including when running this regression against broken code.
+        let _ = peer.shutdown(Shutdown::Both);
+        assert!(sender.join().unwrap().is_err());
+        closer.join().unwrap();
+        result
+            .expect("shutdown waited for the blocked write")
+            .unwrap();
+        writer.shutdown().unwrap();
+        assert_eq!(
+            writer.write_record(0x1234, 0, 1, &[]).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+
+        neighbor.writer().write_record(0x1234, 0, 1, &[7]).unwrap();
+        let mut received = vec![0; PREFACE_SIZE + HEADER_SIZE + 1];
+        neighbor_peer.read_exact(&mut received).unwrap();
+        assert_eq!(received.last(), Some(&7));
+    }
+
+    #[test]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn writer_shutdown_closes_both_native_tcp_halves() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1417,6 +1526,7 @@ mod tests {
     fn cloned_writers_serialize_complete_records_and_sequences() {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writer = ConnectionWriter {
+            native_shutdown: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(WriterState {
                 io: WriterIo::Live(Box::new(SharedBytes(bytes.clone()))),
                 closed: false,

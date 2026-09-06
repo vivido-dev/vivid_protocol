@@ -40,6 +40,7 @@ ruzstd = "0.9"
 [[bench]]
 name = "stage0"
 harness = false
+required-features = ["native"]
 
 # The §7 model checker explores ~10^6 composed states and must stay a practical part of
 # `cargo test`. opt-level 1 keeps debug assertions and cheap incremental builds while bringing
