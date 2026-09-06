@@ -11,6 +11,8 @@ use std::os::unix::net::UnixStream;
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "native", feature = "native-transport"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(feature = "native", feature = "native-transport"))]
 use std::sync::{Arc, Mutex};
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use std::time::Duration;
@@ -362,6 +364,7 @@ pub struct ConnectionWriter {
     state: Arc<Mutex<WriterState>>,
     // Cancellation must not wait for the mutex held by a blocked transport write.
     native_shutdown: Arc<Mutex<Option<NativeShutdown>>>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -445,6 +448,9 @@ impl ConnectionWriter {
         parts: &[&[u8]],
         checkpoint: bool,
     ) -> io::Result<u64> {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
+        }
         if flags & !RECORD_KNOWN_FLAGS != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -462,11 +468,8 @@ impl ConnectionWriter {
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
-        if state.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Vivid connection writer is closed",
-            ));
+        if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
         }
         if body_length > state.send_body_limit || body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
@@ -485,6 +488,9 @@ impl ConnectionWriter {
             sequence: state.send_sequence,
         };
         write_writer_parts(&mut state.io, &header.encode(), parts)?;
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
+        }
 
         state.unflushed_records = state.unflushed_records.saturating_add(1);
         let must_flush = state.flush_mode == FlushMode::Immediate
@@ -518,11 +524,8 @@ impl ConnectionWriter {
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
-        if state.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Vivid connection writer is closed",
-            ));
+        if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
         }
         if mode == FlushMode::Immediate && state.unflushed_records != 0 {
             flush_writer(&mut state.io)?;
@@ -537,11 +540,8 @@ impl ConnectionWriter {
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
-        if state.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Vivid connection writer is closed",
-            ));
+        if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
         }
         flush_writer(&mut state.io)?;
         state.unflushed_records = 0;
@@ -554,11 +554,8 @@ impl ConnectionWriter {
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
-        if state.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Vivid connection writer is closed",
-            ));
+        if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
         }
         state.send_body_limit = maximum;
         Ok(())
@@ -572,6 +569,9 @@ impl ConnectionWriter {
     /// down in both directions, while stream adapters are dropped so multiplexed transports can
     /// observe their own channel close.
     pub fn shutdown(&self) -> io::Result<()> {
+        // Publish cancellation before waking a native syscall. Some platforms may report a
+        // concurrently shut-down write as successful even though its bytes were discarded.
+        self.shutdown_requested.store(true, Ordering::Release);
         // Wake native readers and writers before waiting for an in-flight record to finish.
         let result = self
             .native_shutdown
@@ -763,6 +763,7 @@ impl Connection {
         };
         let writer = ConnectionWriter {
             native_shutdown: Arc::new(Mutex::new(NativeShutdown::from_writer(&io)?)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(WriterState {
                 io,
                 closed: false,
@@ -911,6 +912,14 @@ fn validate_body_limit(maximum: u32) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(any(feature = "native", feature = "native-transport"))]
+fn writer_closed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "Vivid connection writer is closed",
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1204,6 +1213,7 @@ mod tests {
     fn test_writer(writer: impl Write + Send + 'static, flush_mode: FlushMode) -> ConnectionWriter {
         ConnectionWriter {
             native_shutdown: Arc::new(Mutex::new(None)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(WriterState {
                 io: WriterIo::Live(Box::new(writer)),
                 closed: false,
@@ -1527,6 +1537,7 @@ mod tests {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writer = ConnectionWriter {
             native_shutdown: Arc::new(Mutex::new(None)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(WriterState {
                 io: WriterIo::Live(Box::new(SharedBytes(bytes.clone()))),
                 closed: false,
