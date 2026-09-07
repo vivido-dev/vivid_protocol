@@ -106,7 +106,9 @@ pub fn parse_marker(marker: &str) -> Result<AnchorMarker, &'static str> {
     if fields.next().is_some()
         || tag.len() != 22
         || context_id.len() != 16
+        || !context_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         || anchor_id.len() != 16
+        || !anchor_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         || auth.len() != 22
     {
         return Err("invalid anchor marker field length");

@@ -874,7 +874,7 @@ impl FileTransferOpen {
     }
 
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
-        let value = cbor::decode(body)?;
+        let value = zeroize::Zeroizing::new(cbor::decode(body)?);
         let map = StrictMap::new(
             "FILE_TRANSFER_OPEN",
             &value,
@@ -1578,7 +1578,7 @@ fn is_windows_reserved_name(name: &str) -> bool {
 }
 
 fn encode_raw(payload: PayloadMap) -> Result<Vec<u8>, MessageError> {
-    Ok(cbor::encode(&Value::Map(payload))?)
+    Ok(cbor::encode(&zeroize::Zeroizing::new(Value::Map(payload)))?)
 }
 
 fn invalid_io(message: &'static str) -> io::Error {

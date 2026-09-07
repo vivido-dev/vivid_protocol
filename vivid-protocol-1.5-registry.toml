@@ -6,6 +6,8 @@ unlisted_numeric_state = "unassigned"
 # This file is the authoritative numeric-assignment source for Vivid 1.5.
 # Valid states are: reserved, experimental, standards-track, retired.
 # Numeric assignments are append-only within the Vivid 1.5 version.
+# Explicit [[record]] assignments take precedence over enclosing [[record_range]]
+# defaults; unlisted_numeric_state applies only outside all declared ranges.
 
 [[record_range]]
 start = 0x7000

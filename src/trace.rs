@@ -4,7 +4,7 @@
 //! transport metadata to a bounded queue; formatting and file or callback delivery happen on a
 //! separate worker so diagnostics cannot delay the data plane.
 
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -393,7 +393,15 @@ impl TraceGuard {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut writer = BufWriter::new(File::create(path)?);
+        // Never follow or truncate an existing trace path, including a symlink.
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut writer = BufWriter::new(options.open(path)?);
         Self::callback(component, hop, local_session_hint, move |record| {
             let _ = writer.write_all(record.ndjson_line().as_bytes());
         })
@@ -427,6 +435,7 @@ pub fn control_correlation(
 ) -> (Option<u64>, Option<[u8; messages::CAUSATION_ID_BYTES]>) {
     messages::decode_control(body)
         .map(|envelope| {
+            let envelope = zeroize::Zeroizing::new(envelope);
             (
                 (envelope.request_id != 0).then_some(envelope.request_id),
                 envelope.causation_id,

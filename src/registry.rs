@@ -185,6 +185,41 @@ pub mod error {
     pub const LEASE_SUSPENDED: u64 = 28;
     pub const RATE_LIMITED: u64 = 29;
     pub const INTEGRITY_FAILED: u64 = 30;
+    pub const fn is_registered(code: u64) -> bool {
+        matches!(
+            code,
+            AUTH_FAILED
+                | UNSUPPORTED_VERSION
+                | UNSUPPORTED_PROFILE
+                | UNSUPPORTED_CONFIG
+                | BAD_MESSAGE
+                | BAD_STATE
+                | DUPLICATE_ID
+                | NOT_FOUND
+                | LIMIT_EXCEEDED
+                | NO_MEMORY
+                | FLOW_CONTROL
+                | HASH_MISMATCH
+                | NEED_KEYFRAME
+                | STALE_EPOCH
+                | STALE_TARGET_GENERATION
+                | ANCHOR_INVALIDATED
+                | AUTHORITY_REVOKED
+                | DECODER
+                | DEVICE_LOST
+                | TIMEOUT
+                | PRECONDITION_FAILED
+                | ALREADY_APPLIED
+                | NOT_VISIBLE
+                | CANCELLED
+                | UNKNOWN_OUTCOME
+                | CHANNEL_BUSY
+                | STALE_CHANNEL_GENERATION
+                | LEASE_SUSPENDED
+                | RATE_LIMITED
+                | INTEGRITY_FAILED
+        )
+    }
 }
 
 /// Standards-track `ADVANCE_CHANNEL` reason values.

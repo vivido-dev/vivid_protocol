@@ -666,7 +666,8 @@ pub fn parse_full_raster_frame(body: &[u8]) -> io::Result<ParsedRasterFrame<'_>>
     let expected_length =
         rgba8_pixel_len(width, height).map_err(|_| invalid("raster dimensions overflow"))? as usize;
     let compressed = flags & RASTER_FRAME_ZSTD != 0;
-    if (!compressed && data_length != expected_length) || body.len() != header_length + data_length
+    if (!compressed && data_length != expected_length)
+        || header_length.checked_add(data_length) != Some(body.len())
     {
         return Err(invalid("raster RGBA byte length does not match dimensions"));
     }
@@ -920,8 +921,7 @@ fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
         .by_ref()
         .take((expected + 1) as u64)
         .read_to_end(&mut output)?;
-    let cursor = decoder.finish();
-    if output.len() != expected || cursor.get_ref().position() as usize != pixels.len() {
+    if output.len() != expected {
         return Err(invalid(
             "zstd raster has wrong output size or trailing data",
         ));
@@ -1009,6 +1009,8 @@ const AAC_SAMPLE_RATES: [u32; 13] = [
     7_350,
 ];
 
+/// Validate ASC rate and channel metadata, not the codec-specific tools or full decoder support.
+/// Configuration zero requires a complete General Audio program configuration element (PCE).
 pub fn validate_aac_audio_specific_config(
     config: &[u8],
     sample_rate: u32,
@@ -1033,10 +1035,23 @@ pub fn validate_aac_audio_specific_config(
         ));
     }
     let declared = u32::from(channels);
+    // MPEG-4 Audio channelConfiguration, also listed in FFmpeg mpeg4audio.c.
+    // These are layout identifiers, not channel counts.
     let configured = match channel_configuration {
-        0 => declared,
-        7 => 8,
-        other => other,
+        0 => reader
+            .program_configuration_channels(audio_object_type, frequency)
+            .ok_or_else(|| {
+                invalid("AudioSpecificConfig PCE is invalid, truncated, or unsupported")
+            })?,
+        1..=6 => channel_configuration,
+        7 | 12 | 14 => 8,
+        11 => 7,
+        13 => 24,
+        _ => {
+            return Err(invalid(
+                "AudioSpecificConfig channel configuration is reserved",
+            ));
+        }
     };
     if configured != declared {
         return Err(invalid(
@@ -1066,6 +1081,70 @@ impl<'a> AscBitReader<'a> {
             self.position += 1;
         }
         Some(value)
+    }
+
+    // Bounded parsing of the GA header and PCE (ISO/IEC 14496-3 tables 4.1 and 4.2).
+    // Every loop count comes from a field of at most eight bits; no allocation is needed.
+    fn program_configuration_channels(
+        &mut self,
+        mut object_type: u32,
+        frequency: u32,
+    ) -> Option<u32> {
+        if matches!(object_type, 5 | 29) {
+            self.read_sampling_frequency()?; // explicit SBR extension rate
+            object_type = self.read_audio_object_type()?;
+            if object_type == 22 {
+                self.read_bits(4)?; // extensionChannelConfiguration
+            }
+        }
+        if !matches!(object_type, 1..=4 | 6 | 7 | 17 | 19..=23) {
+            return None;
+        }
+        self.read_bits(1)?; // frameLengthFlag
+        if self.read_bits(1)? != 0 {
+            self.read_bits(14)?; // coreCoderDelay
+        }
+        self.read_bits(1)?; // extensionFlag; tools after the PCE are decoder-specific
+        // The PCE precedes layerNr and the remaining object-specific GA fields.
+        self.read_bits(4)?; // element_instance_tag
+        self.read_bits(2)?; // object_type
+        let index = self.read_bits(4)?;
+        if AAC_SAMPLE_RATES.get(index as usize).copied() != Some(frequency) {
+            return None;
+        }
+        let front = self.read_bits(4)?;
+        let side = self.read_bits(4)?;
+        let back = self.read_bits(4)?;
+        let lfe = self.read_bits(2)?;
+        let associated = self.read_bits(3)?;
+        let coupling = self.read_bits(4)?;
+        for bits in [4, 4, 3] {
+            if self.read_bits(1)? != 0 {
+                self.read_bits(bits)?;
+            }
+        }
+        let mut channels = lfe;
+        for count in [front, side, back] {
+            for _ in 0..count {
+                channels = channels.checked_add(1 + self.read_bits(1)?)?;
+                self.read_bits(4)?; // element tag
+            }
+        }
+        for count in [lfe, associated] {
+            for _ in 0..count {
+                self.read_bits(4)?;
+            }
+        }
+        for _ in 0..coupling {
+            self.read_bits(5)?;
+        }
+        let padding = (8 - self.position % 8) % 8;
+        self.read_bits(padding as u32)?;
+        let comment_bytes = self.read_bits(8)?;
+        for _ in 0..comment_bytes {
+            self.read_bits(8)?;
+        }
+        (channels != 0).then_some(channels)
     }
 
     fn read_audio_object_type(&mut self) -> Option<u32> {
@@ -1365,10 +1444,12 @@ fn av1_frame_is_key(data: &[u8]) -> io::Result<bool> {
 }
 
 fn read_leb128(data: &[u8]) -> io::Result<(usize, usize)> {
-    let mut value = 0_usize;
+    let mut value = 0_u64;
     for (index, byte) in data.iter().copied().take(8).enumerate() {
-        value |= usize::from(byte & 0x7f) << (index * 7);
+        value |= u64::from(byte & 0x7f) << (index * 7);
         if byte & 0x80 == 0 {
+            let value =
+                usize::try_from(value).map_err(|_| invalid("AV1 OBU length does not fit usize"))?;
             return Ok((value, index + 1));
         }
     }

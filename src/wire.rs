@@ -1,7 +1,7 @@
 use std::io;
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
-use std::fs::{self, File};
+use crate::trace::{self, TraceComponent, TraceDirection, TraceGuard, TraceHop, TraceOutcome};
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use std::io::{IoSlice, Read, Write};
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -331,7 +331,7 @@ enum WriterIo {
     #[cfg(unix)]
     Unix(UnixStream),
     Live(Box<dyn Write + Send>),
-    Trace(File),
+    Trace(TraceGuard),
     Sink(io::Sink),
 }
 
@@ -734,11 +734,11 @@ impl Connection {
         Self::new(Some(ReaderIo::Other(reader)), WriterIo::Live(writer), kind)
     }
 
+    /// Create a new, private metadata-only NDJSON trace. Existing paths are rejected.
+    /// No preface or record body is persisted. Dropping the last writer drains the bounded queue.
     pub fn trace(path: &Path, kind: ConnectionKind) -> io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        Self::new(None, WriterIo::Trace(File::create(path)?), kind)
+        let guard = TraceGuard::file(path, TraceComponent::Protocol, TraceHop::Local, [0; 16])?;
+        Self::new(None, WriterIo::Trace(guard), kind)
     }
 
     pub fn sink(kind: ConnectionKind) -> io::Result<Self> {
@@ -942,13 +942,30 @@ fn write_writer(io: &mut WriterIo, bytes: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         WriterIo::Unix(stream) => stream.write_all(bytes),
         WriterIo::Live(stream) => stream.write_all(bytes),
-        WriterIo::Trace(file) => file.write_all(bytes),
+        WriterIo::Trace(_) => Ok(()),
         WriterIo::Sink(sink) => sink.write_all(bytes),
     }
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
 fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
+    if let WriterIo::Trace(guard) = io {
+        let header = RecordHeader::decode(header.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid trace record header")
+        })?);
+        guard.emitter().emit(
+            TraceDirection::Send,
+            header.record_type,
+            u64::from(header.body_length),
+            header.sequence,
+            trace::object_kind(header.record_type, header.object_id),
+            Some(header.object_id),
+            None,
+            None,
+            TraceOutcome::Ok,
+        );
+        return Ok(());
+    }
     let mut part_index = 0_usize;
     let mut part_offset = 0_usize;
     while part_index <= parts.len() {
@@ -987,7 +1004,7 @@ fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::
                 #[cfg(unix)]
                 WriterIo::Unix(stream) => stream.write_vectored(&slices[..slice_count]),
                 WriterIo::Live(stream) => stream.write_vectored(&slices[..slice_count]),
-                WriterIo::Trace(file) => file.write_vectored(&slices[..slice_count]),
+                WriterIo::Trace(_) => unreachable!("trace handled before transport writes"),
                 WriterIo::Sink(sink) => sink.write_vectored(&slices[..slice_count]),
             };
             match result {
@@ -995,6 +1012,10 @@ fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::
                 result => break result?,
             }
         };
+        let offered: usize = slices[..slice_count].iter().map(|slice| slice.len()).sum();
+        if written > offered {
+            return Err(io::Error::other("writer reported more bytes than offered"));
+        }
         if written == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -1078,7 +1099,7 @@ fn flush_writer(io: &mut WriterIo) -> io::Result<()> {
         #[cfg(unix)]
         WriterIo::Unix(stream) => stream.flush(),
         WriterIo::Live(stream) => stream.flush(),
-        WriterIo::Trace(file) => file.flush(),
+        WriterIo::Trace(_) => Ok(()),
         WriterIo::Sink(sink) => sink.flush(),
     }
 }

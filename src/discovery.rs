@@ -1,6 +1,7 @@
 //! Native Vivid 1.5 endpoint and root-secret discovery.
 
 use std::{env, fmt, io};
+use zeroize::Zeroizing;
 
 use crate::{
     auth::{AuthError, Secret32},
@@ -47,11 +48,9 @@ impl NativeDiscovery {
         let interactive = optional_endpoint(ENDPOINT_INTERACTIVE)?;
         let realtime = optional_endpoint(ENDPOINT_REALTIME)?;
         let bulk = optional_endpoint(ENDPOINT_BULK)?;
-        let root_secret = env::var(ROOT_SECRET)
-            .map_err(|_| missing(ROOT_SECRET))
-            .and_then(|value| {
-                Secret32::from_hex(&value).map_err(|error| secret_error(ROOT_SECRET, error))
-            })?;
+        let value = Zeroizing::new(env::var(ROOT_SECRET).map_err(|_| missing(ROOT_SECRET))?);
+        let root_secret =
+            Secret32::from_hex(&value).map_err(|error| secret_error(ROOT_SECRET, error))?;
         Ok(Self {
             control,
             interactive,

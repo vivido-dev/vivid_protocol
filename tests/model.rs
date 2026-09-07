@@ -74,6 +74,8 @@ enum T {
     ControlLostUnclean,
     ResumeValid,
     ResumeStale,
+    ResumeRetryExact,
+    ResumeRetryDifferent,
     GraceExpiry,
     LeaseRevoke,
     ParentRevoke,
@@ -128,6 +130,8 @@ const ALL_TRANSITIONS: &[T] = &[
     T::ControlLostUnclean,
     T::ResumeValid,
     T::ResumeStale,
+    T::ResumeRetryExact,
+    T::ResumeRetryDifferent,
     T::GraceExpiry,
     T::LeaseRevoke,
     T::ParentRevoke,
@@ -296,6 +300,7 @@ struct Key {
     lease_state: u8,
     resume_generation: u64,
     post_hello_admitted: bool,
+    control_lost: bool,
     charged: bool,
     lane: Option<Lane>,
     channel: Channel,
@@ -346,6 +351,7 @@ struct Model {
     pending_renewal: Option<Renewal>,
     // Lease bookkeeping.
     post_hello_admitted: bool,
+    control_lost: bool,
     charged: bool,
     // The largest grant generation either side has reported on this path.
     max_generation_seen: u64,
@@ -373,6 +379,7 @@ impl Model {
             renewed: false,
             pending_renewal: None,
             post_hello_admitted: false,
+            control_lost: false,
             // A lease reservation is charged from the moment the lease is issued.
             charged: true,
             max_generation_seen: 0,
@@ -419,6 +426,7 @@ impl Model {
                 .get()
                 .min(MAX_RESUME_GENERATION),
             post_hello_admitted: self.post_hello_admitted,
+            control_lost: self.control_lost,
             charged: self.charged,
             lane: self.lane,
             channel: self.channel,
@@ -550,9 +558,8 @@ impl Model {
         self.flow = ChannelFlow::default();
     }
 
-    fn attempt(&self) -> Result<AttemptDecision, vivid_protocol::lease::LeaseTransitionError> {
-        let mut lease = self.lease.clone();
-        lease.begin_activation(
+    fn attempt(&mut self) -> Result<AttemptDecision, vivid_protocol::lease::LeaseTransitionError> {
+        self.lease.begin_activation(
             ATTEMPT,
             CLIENT_NONCE,
             HELLO_BODY,
@@ -589,6 +596,9 @@ impl Model {
                     }
                 }
                 T::ActivateRetryExact => {
+                    if self.lease.resume_generation().get() != 0 {
+                        return None;
+                    }
                     if !matches!(
                         self.lease.state(),
                         LeaseState::Reserved | LeaseState::Active
@@ -601,6 +611,7 @@ impl Model {
                         }
                         // The retried attempt is fresh: admission must recur on it.
                         next.post_hello_admitted = false;
+                        next.control_lost = false;
                     }
                     Some(())
                 }
@@ -689,6 +700,7 @@ impl Model {
                     }
                     next.presenter_revoke(grant_reason::SUSPENSION, kind, &mut violations);
                     let outcome = next.lease.confirm_transport_lost(false);
+                    next.control_lost = true;
                     match (self.lease.state(), self.post_hello_admitted) {
                         (LeaseState::Reserved, _) | (LeaseState::Active, false) => {
                             // The loss is retryable: the machine stays put for an exact retry.
@@ -730,8 +742,53 @@ impl Model {
                         Ok(AttemptDecision::Fresh { .. }) => {
                             // The resumed attempt is fresh: admission must recur on it.
                             next.post_hello_admitted = false;
+                            next.control_lost = false;
                         }
                         other => violations.push(format!("a valid resume was refused: {other:?}")),
+                    }
+                    Some(())
+                }
+                T::ResumeRetryExact | T::ResumeRetryDifferent => {
+                    if self.lease.resume_generation().get() == 0
+                        || !matches!(
+                            self.lease.state(),
+                            LeaseState::Reserved | LeaseState::Active
+                        )
+                    {
+                        return None;
+                    }
+                    let generation = self.lease.resume_generation();
+                    let should_replay = kind == T::ResumeRetryExact
+                        && !self.post_hello_admitted
+                        && (self.lease.state() == LeaseState::Reserved || self.control_lost);
+                    let result = next.lease.begin_resume(
+                        vivid_protocol::revision::ResumeGeneration::new(generation.get() - 1),
+                        if kind == T::ResumeRetryExact {
+                            ATTEMPT
+                        } else {
+                            ATTEMPT_OTHER
+                        },
+                        CLIENT_NONCE,
+                        HELLO_BODY,
+                        FINGERPRINT,
+                        SESSION,
+                        SERVER_NONCE,
+                        WELCOME_BODY.to_vec(),
+                    );
+                    if should_replay {
+                        if !matches!(result, Ok(AttemptDecision::ExactReplay { session_id: SESSION, server_nonce: SERVER_NONCE, ref welcome }) if welcome == WELCOME_BODY)
+                        {
+                            violations
+                                .push(format!("lost resume WELCOME was not replayed: {result:?}"));
+                        }
+                        next.control_lost = false;
+                    } else if result.is_ok() {
+                        violations.push(
+                            "live, competing, or post-HELLO resume retry was accepted".into(),
+                        );
+                    }
+                    if next.lease.resume_generation() != generation {
+                        violations.push("resume retry advanced its generation".into());
                     }
                     Some(())
                 }

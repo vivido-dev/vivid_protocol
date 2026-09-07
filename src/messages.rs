@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeSet, fmt, io};
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR,
@@ -132,7 +132,7 @@ impl From<cbor::DecodeError> for MessageError {
 
 pub type PayloadMap = Vec<(u64, Value)>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub struct Envelope {
     pub request_id: u64,
     pub transaction_id: Option<u64>,
@@ -166,7 +166,7 @@ impl Envelope {
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
         validate_sorted_map("payload", &self.payload)?;
         validate_sorted_map("preconditions", &self.preconditions)?;
-        let mut map = vec![(0, Value::Unsigned(self.request_id))];
+        let mut map = Zeroizing::new(vec![(0, Value::Unsigned(self.request_id))]);
         if let Some(transaction_id) = self.transaction_id {
             map.push((1, Value::Unsigned(transaction_id)));
         }
@@ -183,7 +183,8 @@ impl Envelope {
         if let Some(id) = self.causation_id {
             map.push((6, Value::Bytes(id.to_vec())));
         }
-        Ok(cbor::encode(&Value::Map(map))?)
+        let value = Zeroizing::new(Value::Map(std::mem::take(&mut *map)));
+        Ok(cbor::encode(&value)?)
     }
 
     pub fn validate_request(&self) -> Result<(), MessageError> {
@@ -203,14 +204,15 @@ impl Envelope {
     }
 }
 
+/// Decode an owned envelope. The caller owns the returned payload and the borrowed input;
+/// sensitive users should wrap the envelope in `zeroize::Zeroizing` until ownership transfers.
 pub fn decode_control(body: &[u8]) -> Result<Envelope, MessageError> {
-    let value = cbor::decode(body)?;
+    let mut value = Zeroizing::new(cbor::decode(body)?);
     let map = StrictMap::new("envelope", &value, &[0, 1, 2, 3, 4, 5, 6])?;
-    let payload = map.required_map(3)?.to_vec();
-    validate_sorted_map("payload", &payload)?;
-    let preconditions = map.optional_map(4)?.unwrap_or_default().to_vec();
-    validate_sorted_map("preconditions", &preconditions)?;
-    for (key, _) in &preconditions {
+    validate_sorted_map("payload", map.required_map(3)?)?;
+    let preconditions = map.optional_map(4)?.unwrap_or_default();
+    validate_sorted_map("preconditions", preconditions)?;
+    for (key, _) in preconditions {
         if *key > 9 {
             return Err(MessageError::UnknownKey {
                 schema: "preconditions",
@@ -218,19 +220,33 @@ pub fn decode_control(body: &[u8]) -> Result<Envelope, MessageError> {
             });
         }
     }
-    Ok(Envelope {
+    // Finish every fallible step while the entire decoded tree is still guarded. Move the
+    // validated maps into the result rather than cloning secret-bearing subtrees.
+    let mut envelope = Envelope {
         request_id: map.required_u64(0)?,
         transaction_id: map.optional_u64(1)?,
         expected_target_generation: map.optional_u64(2)?,
-        payload,
-        preconditions,
         idempotency_key: map.optional_fixed_bytes(5)?,
         causation_id: map.optional_fixed_bytes(6)?,
-    })
+        payload: Vec::new(),
+        preconditions: Vec::new(),
+    };
+    if let Value::Map(fields) = &mut *value {
+        for (key, value) in fields {
+            if let Value::Map(entries) = value {
+                match key {
+                    3 => envelope.payload = std::mem::take(entries),
+                    4 => envelope.preconditions = std::mem::take(entries),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(envelope)
 }
 
 pub fn encode_payload(request_id: u64, payload: PayloadMap) -> Result<Vec<u8>, MessageError> {
-    Envelope::new(request_id, payload).encode()
+    Zeroizing::new(Envelope::new(request_id, payload)).encode()
 }
 
 pub fn empty(request_id: u64) -> Vec<u8> {
@@ -590,20 +606,23 @@ impl Hello {
     }
 
     pub fn authless_payload(&self) -> Result<Vec<u8>, MessageError> {
-        Ok(cbor::encode(&self.authless_payload_value()?)?)
+        let value = Zeroizing::new(self.authless_payload_value()?);
+        Ok(cbor::encode(&value)?)
     }
 
     pub fn encode(&self, request_id: u64) -> Result<Vec<u8>, MessageError> {
         let Value::Map(payload) = self.payload_value()? else {
             unreachable!()
         };
-        Envelope::correlated(request_id, payload)?.encode()
+        let envelope = Zeroizing::new(Envelope::new(request_id, payload));
+        envelope.validate_request()?;
+        envelope.encode()
     }
 
     pub fn decode(body: &[u8]) -> Result<(u64, Self), MessageError> {
-        let envelope = decode_control(body)?;
+        let mut envelope = Zeroizing::new(decode_control(body)?);
         envelope.validate_request()?;
-        let mut value = Value::Map(envelope.payload);
+        let value = Zeroizing::new(Value::Map(std::mem::take(&mut envelope.payload)));
         let hello = {
             let map = StrictMap::preserving("HELLO", &value, 7)?;
             Self {
@@ -618,7 +637,6 @@ impl Hello {
                 extensions: map.extensions_after(7),
             }
         };
-        scrub_authentication_value(&mut value);
         hello.validate()?;
         Ok((envelope.request_id, hello))
     }
@@ -651,6 +669,33 @@ impl Drop for WelcomeAuthentication {
 }
 
 impl WelcomeAuthentication {
+    pub fn validate(&self) -> Result<(), MessageError> {
+        if self.kind > AUTHENTICATION_RESUME {
+            return Err(invalid(
+                "WELCOME authentication",
+                0,
+                "is not a registered authentication kind",
+            ));
+        }
+        if self.activation_attempt_status > 1 {
+            return Err(invalid(
+                "WELCOME authentication",
+                3,
+                "is not fresh or replayed",
+            ));
+        }
+        if (self.kind == AUTHENTICATION_ROOT && self.lease_state != 0)
+            || (self.kind != AUTHENTICATION_ROOT && !(1..=7).contains(&self.lease_state))
+        {
+            return Err(invalid(
+                "WELCOME authentication",
+                2,
+                "is not a valid lease state for this authentication kind",
+            ));
+        }
+        Ok(())
+    }
+
     fn to_value(&self, omit_confirmation: bool) -> Value {
         let mut fields = vec![(0, Value::Unsigned(self.kind))];
         if !omit_confirmation {
@@ -663,28 +708,14 @@ impl WelcomeAuthentication {
 
     fn from_value(value: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("WELCOME authentication", value, &[0, 1, 2, 3])?;
-        let kind = map.required_u64(0)?;
-        if kind > AUTHENTICATION_RESUME {
-            return Err(invalid(
-                "WELCOME authentication",
-                0,
-                "is not a registered authentication kind",
-            ));
-        }
-        let activation_attempt_status = map.required_u64(3)?;
-        if activation_attempt_status > 1 {
-            return Err(invalid(
-                "WELCOME authentication",
-                3,
-                "is not fresh or replayed",
-            ));
-        }
-        Ok(Self {
-            kind,
+        let authentication = Self {
+            kind: map.required_u64(0)?,
             confirmation: map.required_fixed_bytes(1)?,
             lease_state: map.required_u64(2)?,
-            activation_attempt_status,
-        })
+            activation_attempt_status: map.required_u64(3)?,
+        };
+        authentication.validate()?;
+        Ok(authentication)
     }
 }
 
@@ -716,6 +747,7 @@ impl Welcome {
     }
 
     pub fn validate(&self) -> Result<(), MessageError> {
+        self.authentication.validate()?;
         nonzero("WELCOME", 0, self.session_id)?;
         nonzero("WELCOME", 2, self.root_context_id)?;
         nonzero("WELCOME", 3, self.target_generation)?;
@@ -785,20 +817,23 @@ impl Welcome {
     }
 
     pub fn unconfirmed_payload(&self) -> Result<Vec<u8>, MessageError> {
-        Ok(cbor::encode(&self.payload_value_inner(true)?)?)
+        let value = Zeroizing::new(self.payload_value_inner(true)?);
+        Ok(cbor::encode(&value)?)
     }
 
     pub fn encode(&self, request_id: u64) -> Result<Vec<u8>, MessageError> {
         let Value::Map(payload) = self.payload_value_inner(false)? else {
             unreachable!()
         };
-        Envelope::correlated(request_id, payload)?.encode()
+        let envelope = Zeroizing::new(Envelope::new(request_id, payload));
+        envelope.validate_request()?;
+        envelope.encode()
     }
 
     pub fn decode(body: &[u8]) -> Result<(u64, Self), MessageError> {
-        let envelope = decode_control(body)?;
+        let mut envelope = Zeroizing::new(decode_control(body)?);
         envelope.validate_request()?;
-        let mut value = Value::Map(envelope.payload);
+        let value = Zeroizing::new(Value::Map(std::mem::take(&mut envelope.payload)));
         let welcome = {
             let map = StrictMap::preserving("WELCOME", &value, 14)?;
             let contract = ResourceContract::from_value(map.required(12)?)
@@ -822,7 +857,6 @@ impl Welcome {
                 extensions: map.extensions_after(14),
             }
         };
-        scrub_welcome_authentication_value(&mut value);
         welcome.validate()?;
         Ok((envelope.request_id, welcome))
     }
@@ -835,18 +869,41 @@ pub struct ErrorDetail {
 
 impl ErrorDetail {
     pub fn new(fields: PayloadMap) -> Result<Self, MessageError> {
-        validate_sorted_map("ERROR detail", &fields)?;
+        let detail = Self { fields };
+        detail.validate()?;
+        Ok(detail)
+    }
+
+    pub fn validate(&self) -> Result<(), MessageError> {
+        let fields = &self.fields;
+        validate_sorted_map("ERROR detail", fields)?;
         if let Some((key, _)) = fields.iter().find(|(key, _)| *key > 18) {
             return Err(MessageError::UnknownKey {
                 schema: "ERROR detail",
                 key: *key,
             });
         }
+        for (key, value) in fields {
+            if (*key == 10 && value.as_bool().is_none()) || (*key != 10 && value.as_u64().is_none())
+            {
+                return Err(MessageError::WrongType {
+                    schema: "ERROR detail",
+                    key: *key,
+                });
+            }
+            if *key == 12 && value.as_u64().is_some_and(|value| value > 2) {
+                return Err(invalid(
+                    "ERROR detail",
+                    12,
+                    "is not a registered idempotent result",
+                ));
+            }
+        }
         let encoded = cbor::encode(&Value::Map(fields.clone()))?;
         if encoded.len() > 4096 {
             return Err(invalid("ERROR detail", 0, "exceeds 4096 encoded bytes"));
         }
-        Ok(Self { fields })
+        Ok(())
     }
 
     pub fn supported_version() -> Self {
@@ -877,9 +934,10 @@ pub struct ErrorReply {
 
 impl ErrorReply {
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
-        if self.code == 0 || self.code > ERROR_INTEGRITY_FAILED {
+        if !registry::error::is_registered(self.code) {
             return Err(invalid("ERROR", 0, "is not a registered error code"));
         }
+        self.detail.validate()?;
         bounded_text("ERROR", 4, &self.diagnostic, 4096)?;
         encode_payload(
             self.request_id,
@@ -898,6 +956,10 @@ pub fn parse_error_reply(body: &[u8]) -> Result<ErrorReply, MessageError> {
     let envelope = decode_control(body)?;
     let value = Value::Map(envelope.payload);
     let map = StrictMap::new("ERROR", &value, &[0, 1, 2, 3, 4])?;
+    let code = map.required_u64(0)?;
+    if !registry::error::is_registered(code) {
+        return Err(invalid("ERROR", 0, "is not a registered error code"));
+    }
     let failed_request_id = map.required_u64(1)?;
     if failed_request_id != envelope.request_id {
         return Err(invalid(
@@ -910,7 +972,7 @@ pub fn parse_error_reply(body: &[u8]) -> Result<ErrorReply, MessageError> {
     let diagnostic = map.required_text(4)?.to_owned();
     bounded_text("ERROR", 4, &diagnostic, 4096)?;
     Ok(ErrorReply {
-        code: map.required_u64(0)?,
+        code,
         request_id: failed_request_id,
         detail,
         fatal: map.required_bool(3)?,
@@ -991,9 +1053,9 @@ impl LaneOpen {
     }
 
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
-        let envelope = decode_control(body)?;
+        let mut envelope = Zeroizing::new(decode_control(body)?);
         envelope.validate_request()?;
-        let value = Value::Map(envelope.payload);
+        let value = Zeroizing::new(Value::Map(std::mem::take(&mut envelope.payload)));
         let map = StrictMap::new("LANE_OPEN", &value, &[0, 1, 2, 3, 4])?;
         let lane = LaneClass::try_from(map.required_u64(1)?)?;
         if lane != LaneClass::Interactive {
@@ -1083,9 +1145,9 @@ impl ChannelOpen {
     }
 
     pub fn decode(header_object_id: u64, body: &[u8]) -> Result<Self, MessageError> {
-        let envelope = decode_control(body)?;
+        let mut envelope = Zeroizing::new(decode_control(body)?);
         envelope.validate_request()?;
-        let value = Value::Map(envelope.payload);
+        let value = Zeroizing::new(Value::Map(std::mem::take(&mut envelope.payload)));
         let map = StrictMap::new("CHANNEL_OPEN", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8])?;
         let track_id = nonzero("CHANNEL_OPEN", 3, map.required_u64(3)?)?;
         validate_header_object(header_object_id, track_id)?;
@@ -1328,43 +1390,6 @@ impl<'a> StrictMap<'a> {
 
 fn text_array(values: &[String]) -> Value {
     Value::Array(values.iter().cloned().map(Value::Text).collect())
-}
-
-fn scrub_authentication_value(value: &mut Value) {
-    let Value::Map(envelope) = value else {
-        return;
-    };
-    let Some(Value::Map(authentication)) = envelope
-        .iter_mut()
-        .find_map(|(key, value)| (*key == 6).then_some(value))
-    else {
-        return;
-    };
-    for (key, value) in authentication {
-        if matches!(*key, 1 | 3 | 5 | 6) {
-            if let Value::Bytes(bytes) = value {
-                bytes.zeroize();
-            }
-        }
-    }
-}
-
-fn scrub_welcome_authentication_value(value: &mut Value) {
-    let Value::Map(envelope) = value else {
-        return;
-    };
-    let Some(Value::Map(authentication)) = envelope
-        .iter_mut()
-        .find_map(|(key, value)| (*key == 9).then_some(value))
-    else {
-        return;
-    };
-    if let Some(Value::Bytes(bytes)) = authentication
-        .iter_mut()
-        .find_map(|(key, value)| (*key == 1).then_some(value))
-    {
-        bytes.zeroize();
-    }
 }
 
 fn validate_profiles(
