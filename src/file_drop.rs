@@ -1392,7 +1392,6 @@ impl FileDropGate {
                 };
             }
         }
-        self.latest = Some(binding.clone());
         if binding.disabled() {
             let result = FileDropGrant {
                 producer_epoch: binding.producer_epoch,
@@ -1410,11 +1409,12 @@ impl FileDropGate {
                 idle_timeout_us: 0,
                 reason: 0,
             };
+            self.latest = Some(binding);
             self.current = None;
             self.last_result = Some(result);
             return Ok(FileDropBindingOutcome::Disabled);
         }
-        self.generation = self
+        let generation = self
             .generation
             .advance()
             .map_err(|_| invalid_value("FILE_DROP_BOUND", 1, "grant generation exhausted"))?;
@@ -1425,7 +1425,7 @@ impl FileDropGate {
         };
         let grant = FileDropGrant {
             producer_epoch: binding.producer_epoch,
-            grant_generation: self.generation,
+            grant_generation: generation,
             context_id: binding.context_id,
             surface_id: binding.surface_id,
             surface_generation: binding.surface_generation,
@@ -1439,6 +1439,8 @@ impl FileDropGate {
             idle_timeout_us: binding.idle_timeout_us,
             reason: 0,
         };
+        self.latest = Some(binding);
+        self.generation = generation;
         self.current = allow.then_some(grant);
         self.last_result = Some(grant);
         Ok(if allow {
@@ -1603,6 +1605,34 @@ mod tests {
             acceptance_timeout_us: DEFAULT_FILE_DROP_ACCEPTANCE_US,
             idle_timeout_us: DEFAULT_FILE_TRANSFER_IDLE_US,
         }
+    }
+
+    #[test]
+    fn exhausted_binding_preserves_result_and_other_owner() {
+        let mut gate = FileDropGate::default();
+        gate.apply(binding(1), true).unwrap();
+        // Seed the reachable terminal counter without iterating through u64::MAX grants.
+        gate.generation = FileDropGrantGeneration::new(u64::MAX);
+        let before = gate.clone();
+        let mut other = FileDropGate::default();
+        let mut other_binding = binding(1);
+        other_binding.context_id = 9;
+        other.apply(other_binding, true).unwrap();
+        let other_before = other.current();
+        for allow in [true, false] {
+            for _ in 0..2 {
+                assert!(gate.apply(binding(2), allow).is_err());
+                assert_eq!(gate.latest, before.latest);
+                assert_eq!(gate.generation, before.generation);
+                assert_eq!(gate.current, before.current);
+                assert_eq!(gate.last_result, before.last_result);
+                assert_eq!(other.current(), other_before);
+            }
+        }
+        assert_eq!(
+            gate.apply(binding(1), true).unwrap(),
+            FileDropBindingOutcome::ExactRetry(before.last_result.unwrap())
+        );
     }
 
     #[test]
