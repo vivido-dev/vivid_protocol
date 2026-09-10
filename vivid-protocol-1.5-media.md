@@ -540,7 +540,7 @@ accounting (`5`), and recovery (`6`).
 
 ## 9. Video packet format
 
-A `VIDEO_PACKET` body is unchanged from the portable 1.1 body:
+A `VIDEO_PACKET` body has the following portable layout:
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -578,7 +578,7 @@ Canonical packetizations:
 
 ## 10. Audio packet format
 
-An `AUDIO_PACKET` body is unchanged from the portable 1.1 body:
+An `AUDIO_PACKET` body has the following portable layout:
 
 | Offset | Size | Field |
 |---:|---:|---|

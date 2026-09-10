@@ -97,15 +97,12 @@ placement is useful; they are absent from terminal-free root-scene deployments.
 
 For record layouts, state machines, profile negotiation, security requirements, and
 interoperability rules, read the normative multipart
-**[Vivid Protocol 1.5 specification](vivid-protocol-1.5-spec.md)**. Implementers migrating from
-the retired source/ticket/credit model should also read the
-**[1.1 to 1.5 migration guide](vivid-protocol-1.1-to-1.5-migration.md)**.
+**[Vivid Protocol 1.5 specification](vivid-protocol-1.5-spec.md)**.
 
 ## Compatibility
 
-This crate implements Vivid Protocol 1.5 and requires Rust 1.87 or newer. Vivid 1.5 is not
-wire-compatible with Vivid 1.1. Protocol support is negotiated by coherent named profiles; the
-preface selects the exact wire version.
+This crate implements Vivid Protocol 1.5 and requires Rust 1.87 or newer. Protocol support is
+negotiated by coherent named profiles; the preface selects the exact wire version.
 
 ## Contributing
 

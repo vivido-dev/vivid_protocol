@@ -448,7 +448,7 @@ longer a surface, track, scene node, or queryable session object and follows the
 post-disconnect rules. This exception never applies after unclean root-session loss.
 
 Either endpoint may send `PING`; the peer promptly returns `PONG` with the same request ID.
-Optional timestamp keys follow the Vivid 1.1 four-timestamp pattern:
+Optional timestamp keys follow a four-timestamp pattern:
 
 | Message | Key | Meaning |
 |---|---:|---|

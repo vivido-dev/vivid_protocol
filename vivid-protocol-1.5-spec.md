@@ -2,7 +2,6 @@
 
 **Status:** normative design specification for the Vivid 1.5 implementation cutover.
 **Vivid version:** 1.5.
-**Compatibility:** Vivid 1.5 is not wire-compatible with Vivid 1.1.
 **Architecture:** stable surfaces, replaceable tracks, authenticated channel generations, and
 bounded session leases.
 
@@ -45,15 +44,15 @@ assignment status. A prose table and the registry disagreeing is a specification
 corrected, the machine-readable registry controls numeric identity and the prose controls
 semantics.
 
-The [Vivid 1.1 to 1.5 migration guide](vivid-protocol-1.1-to-1.5-migration.md) and
-[vvdesk SDK orchestration guide](vivid-protocol-1.5-vvdesk-sdk-orchestration.md) are informative.
+The [vvdesk SDK orchestration guide](vivid-protocol-1.5-vvdesk-sdk-orchestration.md) is
+informative.
 
 ## 2. Architectural contract
 
 Vivid 1.5 is a presentation and media protocol. A terminal is one presentation target profile,
 not a core protocol assumption.
 
-The protocol separates identities that Vivid 1.1 combined:
+The protocol separates the following identities:
 
 ```text
 authenticated session
@@ -161,14 +160,14 @@ standards-track Vivid 1.5 endpoint and MUST NOT reuse standards-track record ass
 Every Vivid 1.5 connection writes the exact version-1.5 preface defined by the core specification.
 `HELLO` contains no minimum or maximum Vivid version. The preface is the version selection.
 
-A 1.5 endpoint MAY coexist with a 1.1 endpoint on separate listeners or may inspect only the
-complete preface before dispatching to isolated parsers. It MUST NOT:
+A 1.5 endpoint MAY coexist with an endpoint of another Vivid version on separate listeners or may
+inspect only the complete preface before dispatching to isolated parsers. It MUST NOT:
 
-- negotiate 1.5 from a 1.1 preface;
-- emit a 1.1 preface with 1.5 semantics;
-- carry both versions in one logical session;
-- reuse a 1.1 token, media ticket, delegated capability, source object, revision, or attachment
-  generation as 1.5 authority or identity; or
+- negotiate 1.5 from another version's preface;
+- emit another version's preface with 1.5 semantics;
+- carry more than one version in one logical session;
+- reuse another version's token, media ticket, delegated capability, source object, revision, or
+  attachment generation as 1.5 authority or identity; or
 - downgrade an established session.
 
 A version rejection is diagnostic only. A retry, if explicitly enabled, uses a fresh connection
