@@ -44,9 +44,6 @@ assignment status. A prose table and the registry disagreeing is a specification
 corrected, the machine-readable registry controls numeric identity and the prose controls
 semantics.
 
-The [vvdesk SDK orchestration guide](vivid-protocol-1.5-vvdesk-sdk-orchestration.md) is
-informative.
-
 ## 2. Architectural contract
 
 Vivid 1.5 is a presentation and media protocol. A terminal is one presentation target profile,
@@ -173,28 +170,7 @@ inspect only the complete preface before dispatching to isolated parsers. It MUS
 A version rejection is diagnostic only. A retry, if explicitly enabled, uses a fresh connection
 and a fully independent implementation of the reported version.
 
-## 6. Design decisions incorporated from the vvdesk review
-
-Vivid 1.5 adopts the stable-surfaces/ephemeral-tracks design and replaces the four narrow
-additions proposed for vvdesk:
-
-| Earlier proposal | Vivid 1.5 decision |
-|---|---|
-| Scoped one-use delegated capability | Controller-secret session lease with retry-safe activation |
-| Input state ordered only by one writer | Desired/effective input binding with per-event generations and watchdog |
-| Gateway zero-token substitution | End-to-end authentication or a fully terminating gateway |
-| `VIVID_ENDPOINT_AUDIO` | Generic control, interactive, realtime, and bulk lanes |
-| Single-use media ticket | Authenticated idempotent channel open and positive acceptance |
-| Incremental `CREDIT` | Absolute cumulative channel-local flow limits |
-| Source as logical desktop and codec | Stable surface plus replaceable track |
-| Teardown on every EOF | Immediate input revocation plus bounded suspended lease state |
-| Many independent feature flags | Coherent profiles with declared prerequisites |
-
-Portable H.264, HEVC, VP9, AV1, MP3, AAC, ALAC, Opus, Vorbis, FLAC, PCM, RGBA8 raster, PNG, and
-JPEG media payload formats are retained where the media specification says they are retained.
-Their surrounding object, attachment, flow, and lifecycle semantics are 1.5 semantics.
-
-## 7. Conformance and proof obligations
+## 6. Conformance and proof obligations
 
 An implementation conforms only to the profiles it advertises. All implementations conforming to
 Vivid 1.5 MUST implement `vivid-core-control-v1`.
@@ -217,7 +193,7 @@ Scenario tests alone are insufficient for the composed authority state machine. 
 allocation status is controlled by the registry; experimental designs remain in experimental
 ranges until their state models and parser fuzzing satisfy the same obligations.
 
-## 8. Deliberately excluded from the initial baseline
+## 7. Deliberately excluded from the initial baseline
 
 The following are not standards-track Vivid 1.5 behavior:
 
