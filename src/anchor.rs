@@ -9,6 +9,8 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
+pub mod conpty;
+
 const AUTH_LABEL: &[u8] = b"VIVID-ANCHOR-3";
 pub const MAX_MARKER_BYTES: usize = 192;
 
