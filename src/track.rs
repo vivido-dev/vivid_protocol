@@ -534,7 +534,11 @@ pub struct ImageConfiguration {
 }
 
 impl ImageConfiguration {
-    fn validate(&self) -> Result<(), MessageError> {
+    /// Check the encoding, dimensions, and declared length against the media specification.
+    ///
+    /// Public so a producer can reject a container before it becomes a track configuration,
+    /// instead of each SDK binding reimplementing these bounds.
+    pub fn validate(&self) -> Result<(), MessageError> {
         if !(1..=2).contains(&self.encoding) {
             return Err(invalid_value(
                 "image configuration",

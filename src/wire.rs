@@ -230,6 +230,20 @@ impl ReaderIo {
             Self::Other(_) => Ok(()),
         }
     }
+
+    fn set_read_deadline(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_read_timeout(timeout),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_read_timeout(timeout),
+            // The stream type is erased, so there is no portable way to bound a read of it.
+            // Report that instead of silently ignoring the deadline a caller believes it has.
+            Self::Other(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this connection's transport cannot bound a read",
+            )),
+        }
+    }
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -627,6 +641,16 @@ pub struct BorrowedRecord<'a> {
 impl ConnectionReader {
     fn clear_establishment_read_deadline(&mut self) -> io::Result<()> {
         self.io.clear_establishment_read_deadline()
+    }
+
+    /// Bound every subsequent [`ConnectionReader::read_record`] to a socket-level timeout.
+    ///
+    /// `None` restores unbounded reads. This is what lets a caller wait for one record without
+    /// committing to wait forever, which a language binding driving a transfer or lane from a
+    /// worker thread needs. Only native socket transports can honour it; anything else reports
+    /// [`io::ErrorKind::Unsupported`] rather than pretending the deadline exists.
+    pub fn set_read_deadline(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io.set_read_deadline(timeout)
     }
 
     pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
