@@ -38,6 +38,9 @@ normative:
    copying from a presenter into a producer-selected directory, and the `file-drop-path-v1`
    sub-profile that discloses the committed destination path.
 
+9. [Vivid 1.5 pane overlays](vivid-protocol-1.5-overlays.md) defines optional viewport windows,
+   portable vector scenes, and pane-local interaction.
+
 The machine-readable
 [Vivid 1.5 registry](vivid-protocol-1.5-registry.toml) is normative for numeric assignments and
 assignment status. A prose table and the registry disagreeing is a specification defect; until

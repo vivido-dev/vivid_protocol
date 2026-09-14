@@ -752,6 +752,22 @@ impl Welcome {
         nonzero("WELCOME", 2, self.root_context_id)?;
         nonzero("WELCOME", 3, self.target_generation)?;
         validate_profiles("WELCOME", 6, &self.accepted_profiles)?;
+        if self
+            .accepted_profiles
+            .iter()
+            .any(|profile| profile == registry::VECTOR_SCENE)
+        {
+            let limits = self
+                .extensions
+                .iter()
+                .find(|(key, _)| *key == 15)
+                .ok_or_else(|| {
+                    invalid("WELCOME", 15, "vector-scene-v1 requires negotiated limits")
+                })?;
+            crate::vector::Limits::from_value(&limits.1)
+                .map_err(|_| invalid("WELCOME", 15, "invalid vector limits"))?;
+        }
+
         if !self
             .accepted_profiles
             .iter()
@@ -1077,6 +1093,7 @@ pub enum TrackKind {
     Audio = 2,
     Raster = 3,
     EncodedImage = 4,
+    VectorScene = 5,
 }
 
 impl TryFrom<u64> for TrackKind {
@@ -1088,6 +1105,7 @@ impl TryFrom<u64> for TrackKind {
             2 => Ok(Self::Audio),
             3 => Ok(Self::Raster),
             4 => Ok(Self::EncodedImage),
+            5 => Ok(Self::VectorScene),
             _ => Err(invalid("track", 5, "has an unknown kind")),
         }
     }

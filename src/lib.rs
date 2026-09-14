@@ -24,6 +24,7 @@ pub mod lease;
 pub mod media;
 pub mod messages;
 pub mod observation;
+pub mod overlay;
 pub mod registry;
 pub mod resource;
 pub mod revision;
@@ -34,6 +35,7 @@ pub mod time;
 #[cfg(any(feature = "native", feature = "native-transport"))]
 pub mod trace;
 pub mod track;
+pub mod vector;
 pub mod web;
 pub mod wire;
 
