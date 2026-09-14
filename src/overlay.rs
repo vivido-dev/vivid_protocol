@@ -137,6 +137,7 @@ pub struct Windows {
     swallowed_escape: bool,
     capture: Option<Capture>,
     events: BTreeMap<SessionIdentity, VecDeque<WindowEvent>>,
+    overflowed: BTreeSet<SessionIdentity>,
 }
 
 impl Windows {
@@ -145,6 +146,23 @@ impl Windows {
     }
     pub fn focus(&self) -> Option<SurfaceIdentity> {
         self.focus
+    }
+    pub fn has_pointer_capture(&self) -> bool {
+        self.capture.is_some()
+    }
+    /// Native pane focus loss cancels gestures and held input without destroying window state.
+    /// Focus restoration follows the same modal eligibility rules as closing a child window.
+    pub fn set_pane_focus(&mut self, focused: bool) {
+        if focused {
+            self.restore_focus();
+        } else {
+            if let Some(capture) = self.capture.take() {
+                self.emit(capture.window, Event::Cancel);
+            }
+            self.change_focus(None);
+            self.swallowed_buttons.clear();
+            self.swallowed_escape = false;
+        }
     }
     pub fn visible(&self) -> impl Iterator<Item = &Window> {
         self.stack
@@ -167,7 +185,12 @@ impl Windows {
         if self.windows.contains_key(&id) {
             return Err(InvalidScene("window already exists"));
         }
-        if !self.events.contains_key(&id.context.session) && self.events.len() >= MAX_OWNERS {
+        if self.overflowed.contains(&id.context.session) {
+            return Err(InvalidScene("overlay owner input was revoked"));
+        }
+        if !self.events.contains_key(&id.context.session)
+            && self.events.len() + self.overflowed.len() >= MAX_OWNERS
+        {
             return Err(InvalidScene("overlay owner limit exceeded"));
         }
         if self.windows.len() >= MAX_WINDOWS
@@ -508,6 +531,7 @@ impl Windows {
         self.focus_history.retain(|key| *key != id);
     }
     pub fn revoke_owner(&mut self, owner: SessionIdentity) {
+        self.overflowed.remove(&owner);
         let ids: Vec<_> = self
             .stack
             .iter()
@@ -535,6 +559,7 @@ impl Windows {
     fn emit(&mut self, id: SurfaceIdentity, event: Event) {
         if !valid_event(&event) {
             self.revoke_owner(id.context.session);
+            self.overflowed.insert(id.context.session);
             return;
         }
         let Some(w) = self.windows.get(&id) else {
@@ -577,9 +602,14 @@ impl Windows {
                 > MAX_EVENT_QUEUE_BYTES
         {
             self.revoke_owner(id.context.session);
+            self.overflowed.insert(id.context.session);
             return;
         }
         queue.push_back(e);
+    }
+    /// Report a fail-closed input overflow so the host also retires the authenticated lane.
+    pub fn take_overflow(&mut self, owner: SessionIdentity) -> bool {
+        self.overflowed.remove(&owner)
     }
     pub fn take_event(&mut self, owner: SessionIdentity) -> Option<WindowEvent> {
         let queue = self.events.get_mut(&owner)?;
@@ -880,6 +910,32 @@ fn valid_event(event: &Event) -> bool {
 mod tests {
     use super::*;
     use crate::identity::PresenterInstanceId;
+    #[test]
+    fn pane_focus_loss_cancels_capture_and_overflow_is_observable_once() {
+        let mut windows = Windows::default();
+        let id = key(1, 1);
+        let neighbor = key(2, 1);
+        windows
+            .create(id, 1, options(WindowMode::Floating))
+            .unwrap();
+        windows
+            .create(neighbor, 1, options(WindowMode::Floating))
+            .unwrap();
+        windows.request_focus(id).unwrap();
+        windows
+            .capture_pointer(id, Point::new(1., 1.).unwrap())
+            .unwrap();
+        windows.set_pane_focus(false);
+        assert!(windows.capture.is_none());
+        assert_eq!(windows.focus(), None);
+        windows.set_pane_focus(true);
+        assert_eq!(windows.focus(), Some(id));
+        windows.keyboard(Event::Text("x".repeat(MAX_EVENT_TEXT_BYTES + 1)), false);
+        assert!(windows.get(id).is_none());
+        assert!(windows.get(neighbor).is_some());
+        assert!(windows.take_overflow(id.context.session));
+        assert!(!windows.take_overflow(id.context.session));
+    }
     fn key(owner: u64, id: u64) -> SurfaceIdentity {
         SessionIdentity::new(PresenterInstanceId([1; 16]), owner)
             .unwrap()

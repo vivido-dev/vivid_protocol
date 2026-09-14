@@ -64,6 +64,11 @@ monotonic media-ID rules. The scene replaces the previous scene atomically. Draw
 testing and the revision used by input events MUST become visible together. Decoding or
 compilation failure MUST NOT publish a prefix of the list.
 
+An overlay window's published scene revision also advances across track replacement and channel
+generation changes. A replacement track MUST be primed with a revision greater than the window's
+current published revision (available through `QUERY_OVERLAY`). Activation MUST reject a stale
+replacement before changing any slot binding. Re-activating the current binding is idempotent.
+
 `VECTOR_ASSET` (0x800e) contains a big-endian nonzero u64 asset ID, u32 width, u32 height,
 then exactly `width * height * 4` straight-alpha sRGB RGBA8 bytes. Dimensions and multiplication
 are checked before allocating. An asset ID is immutable and cannot be redefined within a
@@ -129,6 +134,11 @@ releases input state. Stacking requests cannot bypass an active modal. `QUERY_OV
 fields plus viewport logical extent (9), positive scale numerator/denominator (10), focus
 (11), and last published scene revision (12). Target changes notify producers of authoritative
 logical extent and scale; old target generations cannot authorize new placement mutations.
+
+Successful `OVERLAY_ACTION` requests reply with an empty correlated `OK` using the addressed
+surface object ID. Producers obtain the resulting window revision with `QUERY_OVERLAY` before
+issuing another conditional mutation. Closing a window does not by itself destroy its semantic
+surface; explicit surface destruction or owner cleanup releases the remaining surface resources.
 
 The extent is `[width, height]` in Q32.32; scale is `[numerator, denominator]`, both nonzero
 u32 integers. A successful READY has keys 0–8 with key 3 set to the resulting nonzero window
