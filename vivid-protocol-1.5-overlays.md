@@ -66,16 +66,28 @@ compilation failure MUST NOT publish a prefix of the list.
 
 An overlay window's published scene revision also advances across track replacement and channel
 generation changes. A replacement track MUST be primed with a revision greater than the window's
-current published revision (available through `QUERY_OVERLAY`). Activation MUST reject a stale
+highest accepted revision (available through `QUERY_OVERLAY`). Accepted revisions advance across
+all tracks belonging to a window, including tracks being primed. Activation MUST reject a stale
 replacement before changing any slot binding. Re-activating the current binding is idempotent.
 
 `VECTOR_ASSET` (0x800e) contains a big-endian nonzero u64 asset ID, u32 width, u32 height,
 then exactly `width * height * 4` straight-alpha sRGB RGBA8 bytes. Dimensions and multiplication
 are checked before allocating. An asset ID is immutable and cannot be redefined within a
-channel generation. Images may be referenced by multiple scenes without retransmission.
+channel generation. Upload IDs MUST strictly increase within a channel generation, including
+after release; receivers need not retain an unbounded set of retired IDs. Images may be
+referenced by multiple scenes without retransmission.
 Destroying or losing the channel releases its asset namespace. A scene retains references
 to the images it uses. Transport processing returns credit when it releases record storage;
 retained image storage remains charged separately and cannot be evaded by accumulating credit.
+
+`VECTOR_ASSET_RELEASE` (0x800f) contains exactly one big-endian nonzero u64 asset ID. It uses
+the same authenticated bulk channel, object ID, ordered record sequence, cumulative credit,
+and EOS ordering as uploads and frames. It removes the asset from future scene lookup without
+advancing scene revisions or readiness. Unknown/already released IDs are invalid. Complete
+pending, in-flight and displayed scenes retain their references; releasing the namespace or
+retiring the track MUST NOT free their storage or stop charging their decoded resource budget.
+The charge ends when the last reference is released. A later scene referencing a released ID
+is rejected atomically, even if that display list was built before release.
 
 The display list is an array of command arrays. A point is `[x, y]`; a rectangle is
 `[point, width, height]`; a transform is `[a, b, c, d, e, f]` using the usual affine mapping.
@@ -132,22 +144,57 @@ immutable. Successful mutations advance a checked window revision and reply with
 releases input state. Stacking requests cannot bypass an active modal. `QUERY_OVERLAY`
 (0x7023) carries context (0) and surface (1); `OVERLAY_STATUS` (0x7024) returns the window
 fields plus viewport logical extent (9), positive scale numerator/denominator (10), focus
-(11), and last published scene revision (12). Target changes notify producers of authoritative
+(11), last presented scene revision (12), optional active binding
+`[track_id, channel_generation, epoch, scene_revision]` (13), nonzero viewport revision (14),
+and highest accepted scene revision (15). All identities/revisions are full-width unsigned
+integers (epoch is u32); the binding inherits the reply's owner/context/surface/generation.
+Absent binding means no active vector track. Accepted/active state does not imply presentation.
+Target changes notify producers of authoritative
 logical extent and scale; old target generations cannot authorize new placement mutations.
 
 Successful `OVERLAY_ACTION` requests reply with an empty correlated `OK` using the addressed
 surface object ID. Producers obtain the resulting window revision with `QUERY_OVERLAY` before
 issuing another conditional mutation. Closing a window does not by itself destroy its semantic
 surface; explicit surface destruction or owner cleanup releases the remaining surface resources.
+A dismissed/closed overlay cannot be reopened on that surface; create a new surface/window to
+avoid reusing its submission identities. Dismissal resolves unpresented submissions without
+waiting for explicit surface destruction.
 
 The extent is `[width, height]` in Q32.32; scale is `[numerator, denominator]`, both nonzero
 u32 integers. A successful READY has keys 0–8 with key 3 set to the resulting nonzero window
-revision. STATUS has keys 0–12 (parent key 7 remains optional). Requests and replies reject
+revision. STATUS has keys 0–15 (parent key 7 and active binding key 13 are optional). Requests and replies reject
 duplicate or unknown keys, invalid enum values, zero object identities/generations, and geometry
 outside the scalar limits. A parent is resolved in the authenticated session, never a
 producer-specified session. Self-parenting and cross-owner parenting are invalid.
 
 ## Input and lifecycle
+
+`OVERLAY_SUBMISSION_OUTCOME` (0x7033) is an unsolicited interactive-lane envelope (request ID
+zero, surface object ID). Keys are context (0), surface (1), surface generation (2), track (3),
+channel generation (4), epoch (5), scene revision (6), and outcome (7: presented=0,
+superseded=1). All identities, generations, epoch and revision are nonzero. A valid accepted
+submission receives exactly one terminal outcome while the lane remains live. Presented means
+the exact scene was included in a successfully composed host output frame, not that pixels
+were scanned out by physical hardware. It atomically publishes matching hit state. A pending
+scene replaced or closed before composition resolves as superseded; compilation/admission
+errors use existing channel failure paths, and lane loss terminates unresolved receipt waits
+with connection loss rather than inventing an outcome.
+
+The host may hold one composition snapshot and one newer replacement for a window. A snapshot
+reserved by an in-progress render MUST NOT be superseded until that render completes or is
+abandoned. Failed/abandoned renders MUST NOT acknowledge presentation. A displayed scene and
+its input state remain available while its replacement track is primed. Queues of pending
+outcomes plus unresolved submissions are bounded to 256 per owner; overflow revokes the affected
+owner's overlay lane and input state. An outcome does not retire previously queued input events.
+
+`OVERLAY_VIEWPORT_CHANGED` (0x7034) is an unsolicited interactive-lane envelope with request and
+object ID zero. Keys are nonzero viewport revision (0), logical `[width,height]` Q32.32 extent
+(1), and positive u32 `[scale_numerator,scale_denominator]` (2). The host sends an initial
+snapshot after lane authentication and another when authoritative extent or DPI changes.
+Revisions strictly increase on changes; unchanged geometry does not advance them. Receivers
+may coalesce queued viewport snapshots, but MUST preserve key/button transitions. Window
+queries return the same authoritative viewport and revision. These records require the complete
+overlay profile bundle and never pass through the terminal PTY.
 
 Input uses an independently authenticated interactive lane. It MUST remain responsive when
 bulk decoding or rendering is saturated. `OVERLAY_INPUT_EVENT` (0x7030) contains context (0),

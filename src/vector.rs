@@ -132,6 +132,30 @@ pub struct ImageAsset {
     pub height: u32,
     pub rgba: Vec<u8>,
 }
+
+/// Ordered removal from a channel's asset namespace; existing scenes keep their references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetRelease {
+    pub id: u64,
+}
+impl AssetRelease {
+    pub fn encode(self) -> Result<[u8; 8]> {
+        if self.id == 0 {
+            return Err(InvalidScene("asset ID must be nonzero"));
+        }
+        Ok(self.id.to_be_bytes())
+    }
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        let bytes: [u8; 8] = body
+            .try_into()
+            .map_err(|_| InvalidScene("asset release must contain exactly one u64"))?;
+        let value = Self {
+            id: u64::from_be_bytes(bytes),
+        };
+        value.encode()?;
+        Ok(value)
+    }
+}
 impl ImageAsset {
     pub fn validate(&self) -> Result<()> {
         let bytes = u64::from(self.width)

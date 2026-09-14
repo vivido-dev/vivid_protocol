@@ -13,7 +13,7 @@ use super::{DismissReason, Event, WindowMode, WindowOptions, valid_event};
 
 const SCHEMA: &str = "overlay";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowAddress {
     pub context_id: u64,
     pub surface_id: u64,
@@ -241,9 +241,26 @@ pub struct Status {
     pub viewport: Viewport,
     pub focused: bool,
     pub scene_revision: u64,
+    pub active: Option<Submission>,
+    pub viewport_revision: u64,
+    pub accepted_revision: u64,
 }
 impl Status {
+    fn validate_progress(&self) -> Result<(), MessageError> {
+        if self.scene_revision > self.accepted_revision
+            || self
+                .active
+                .is_some_and(|s| s.revision > self.accepted_revision)
+        {
+            return Err(bad(
+                15,
+                "accepted revision precedes active or presented content",
+            ));
+        }
+        Ok(())
+    }
     pub fn payload(&self, owner: SessionIdentity) -> Result<PayloadMap, MessageError> {
+        self.validate_progress()?;
         nonzero(self.window.expected_revision, 3)?;
         self.viewport.validate()?;
         let mut fields = self.window.payload(owner)?;
@@ -265,6 +282,25 @@ impl Status {
             (11, Value::Bool(self.focused)),
             (12, u(self.scene_revision)),
         ]);
+        if let Some(active) = self.active {
+            active.validate()?;
+            if active.address != self.window.address {
+                return Err(bad(13, "active binding belongs to another window"));
+            }
+            fields.push((
+                13,
+                Value::Array(vec![
+                    u(active.track_id),
+                    u(active.channel_generation),
+                    u(u64::from(active.epoch)),
+                    u(active.revision),
+                ]),
+            ));
+        }
+        fields.extend([
+            (14, u(nonzero(self.viewport_revision, 14)?)),
+            (15, u(self.accepted_revision)),
+        ]);
         Ok(fields)
     }
     pub fn decode(
@@ -272,7 +308,10 @@ impl Status {
         object: u64,
         value: &Value,
     ) -> Result<Self, MessageError> {
-        let map = strict(value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])?;
+        let map = strict(
+            value,
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        )?;
         let window = SetWindow::from_map(owner, object, &map)?;
         nonzero(window.expected_revision, 3)?;
         let extent = array::<2>(map.required(9)?, 9)?;
@@ -284,11 +323,146 @@ impl Status {
             scale_denominator: small(&scale[1], 10)?,
         };
         viewport.validate()?;
-        Ok(Self {
+        let active = map
+            .optional(13)
+            .map(|value| {
+                let fields = array::<4>(value, 13)?;
+                let submission = Submission {
+                    address: window.address,
+                    track_id: unsigned(&fields[0], 13)?,
+                    channel_generation: unsigned(&fields[1], 13)?,
+                    epoch: small(&fields[2], 13)?,
+                    revision: unsigned(&fields[3], 13)?,
+                };
+                submission.validate()?;
+                Ok::<_, MessageError>(submission)
+            })
+            .transpose()?;
+        let status = Self {
             window,
             viewport,
             focused: map.required_bool(11)?,
             scene_revision: map.required_u64(12)?,
+            active,
+            viewport_revision: nonzero(map.required_u64(14)?, 14)?,
+            accepted_revision: map.required_u64(15)?,
+        };
+        status.validate_progress()?;
+        Ok(status)
+    }
+}
+
+/// Full authenticated-channel submission identity; owner is supplied by the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Submission {
+    pub address: WindowAddress,
+    pub track_id: u64,
+    pub channel_generation: u64,
+    pub epoch: u32,
+    pub revision: u64,
+}
+impl Submission {
+    pub fn validate(self) -> Result<(), MessageError> {
+        self.address.validate(self.address.surface_id)?;
+        nonzero(self.track_id, 3)?;
+        nonzero(self.channel_generation, 4)?;
+        nonzero(u64::from(self.epoch), 5)?;
+        nonzero(self.revision, 6)?;
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationOutcome {
+    Presented,
+    Superseded,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmissionOutcome {
+    pub submission: Submission,
+    pub outcome: PresentationOutcome,
+}
+impl SubmissionOutcome {
+    pub fn payload(self) -> Result<PayloadMap, MessageError> {
+        let s = self.submission;
+        s.validate()?;
+        let mut values = s.address.payload();
+        values.extend([
+            (3, u(s.track_id)),
+            (4, u(s.channel_generation)),
+            (5, u(u64::from(s.epoch))),
+            (6, u(s.revision)),
+            (
+                7,
+                u(match self.outcome {
+                    PresentationOutcome::Presented => 0,
+                    PresentationOutcome::Superseded => 1,
+                }),
+            ),
+        ]);
+        Ok(values)
+    }
+    pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
+        let map = strict(value, &[0, 1, 2, 3, 4, 5, 6, 7])?;
+        let submission = Submission {
+            address: WindowAddress::decode(object, &map)?,
+            track_id: map.required_u64(3)?,
+            channel_generation: map.required_u64(4)?,
+            epoch: small(map.required(5)?, 5)?,
+            revision: map.required_u64(6)?,
+        };
+        submission.validate()?;
+        Ok(Self {
+            submission,
+            outcome: match map.required_u64(7)? {
+                0 => PresentationOutcome::Presented,
+                1 => PresentationOutcome::Superseded,
+                _ => return Err(bad(7, "unknown submission outcome")),
+            },
+        })
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewportChanged {
+    pub revision: u64,
+    pub viewport: Viewport,
+}
+impl ViewportChanged {
+    pub fn payload(self) -> Result<PayloadMap, MessageError> {
+        self.viewport.validate()?;
+        nonzero(self.revision, 0)?;
+        Ok(vec![
+            (0, u(self.revision)),
+            (
+                1,
+                Value::Array(vec![
+                    scalar(self.viewport.width),
+                    scalar(self.viewport.height),
+                ]),
+            ),
+            (
+                2,
+                Value::Array(vec![
+                    u(u64::from(self.viewport.scale_numerator)),
+                    u(u64::from(self.viewport.scale_denominator)),
+                ]),
+            ),
+        ])
+    }
+    pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
+        validate_header_object(object, 0)?;
+        let map = strict(value, &[0, 1, 2])?;
+        let extent = array::<2>(map.required(1)?, 1)?;
+        let scale = array::<2>(map.required(2)?, 2)?;
+        let viewport = Viewport {
+            width: decode_scalar(&extent[0], 1)?,
+            height: decode_scalar(&extent[1], 1)?,
+            scale_numerator: small(&scale[0], 2)?,
+            scale_denominator: small(&scale[1], 2)?,
+        };
+        viewport.validate()?;
+        Ok(Self {
+            revision: nonzero(map.required_u64(0)?, 0)?,
+            viewport,
         })
     }
 }
@@ -727,11 +901,60 @@ mod tests {
             },
             focused: true,
             scene_revision: u64::MAX,
+            active: Some(Submission {
+                address: address(),
+                track_id: u64::MAX,
+                channel_generation: u64::MAX,
+                epoch: u32::MAX,
+                revision: u64::MAX,
+            }),
+            viewport_revision: 1,
+            accepted_revision: u64::MAX,
         };
         assert_eq!(
             Status::decode(owner(1), 2, &encoded(status.payload(owner(1)).unwrap())).unwrap(),
             status
         );
+        let submission = status.active.unwrap();
+        for outcome in [
+            PresentationOutcome::Presented,
+            PresentationOutcome::Superseded,
+        ] {
+            let record = SubmissionOutcome {
+                submission,
+                outcome,
+            };
+            let value = encoded(record.payload().unwrap());
+            assert_eq!(SubmissionOutcome::decode(2, &value).unwrap(), record);
+            assert!(SubmissionOutcome::decode(3, &value).is_err());
+            let mut malformed = record.payload().unwrap();
+            malformed.iter_mut().find(|(k, _)| *k == 7).unwrap().1 = u(2);
+            assert!(SubmissionOutcome::decode(2, &Value::Map(malformed)).is_err());
+        }
+        let update = ViewportChanged {
+            revision: u64::MAX,
+            viewport: status.viewport,
+        };
+        assert_eq!(
+            ViewportChanged::decode(0, &encoded(update.payload().unwrap())).unwrap(),
+            update
+        );
+        assert!(ViewportChanged::decode(2, &encoded(update.payload().unwrap())).is_err());
+        assert!(
+            ViewportChanged {
+                revision: 0,
+                ..update
+            }
+            .payload()
+            .is_err()
+        );
+        let release = crate::vector::AssetRelease { id: u64::MAX };
+        assert_eq!(
+            crate::vector::AssetRelease::decode(&release.encode().unwrap()).unwrap(),
+            release
+        );
+        assert!(crate::vector::AssetRelease::decode(&[0; 8]).is_err());
+        assert!(crate::vector::AssetRelease::decode(&[1; 9]).is_err());
         for action in [
             WindowAction::Close,
             WindowAction::Focus,

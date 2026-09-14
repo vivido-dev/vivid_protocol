@@ -1055,3 +1055,18 @@ value = 15
 name = "vector-limits"
 profile = "vector-scene-v1"
 state = "standards-track"
+
+[[record]]
+value = 0x800f
+name = "VECTOR_ASSET_RELEASE"
+state = "standards-track"
+
+[[record]]
+value = 0x7033
+name = "OVERLAY_SUBMISSION_OUTCOME"
+state = "standards-track"
+
+[[record]]
+value = 0x7034
+name = "OVERLAY_VIEWPORT_CHANGED"
+state = "standards-track"

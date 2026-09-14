@@ -40,6 +40,9 @@ pub mod record {
     pub const OVERLAY_INPUT_RENEW: u16 = 0x7032;
     pub const VECTOR_FRAME: u16 = 0x800d;
     pub const VECTOR_ASSET: u16 = 0x800e;
+    pub const VECTOR_ASSET_RELEASE: u16 = 0x800f;
+    pub const OVERLAY_SUBMISSION_OUTCOME: u16 = 0x7033;
+    pub const OVERLAY_VIEWPORT_CHANGED: u16 = 0x7034;
     pub const HELLO: u16 = 0x0001;
     pub const WELCOME: u16 = 0x0002;
     pub const OK: u16 = 0x0003;
