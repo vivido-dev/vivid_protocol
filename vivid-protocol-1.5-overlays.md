@@ -366,3 +366,48 @@ still referenced by scenes. Pending batch work is separately bounded by the work
 limits. Closing a window, context revocation, input-lane loss, and producer loss remove only that
 owner's namespaces; charges remain until the last in-flight scene reference is released. A host
 MUST NOT reclaim released-layout capacity early or evict live layouts to admit another owner.
+
+## Ellipsis and typographic controls
+
+`overlay-typography-v1` requires `overlay-text-layout-v1`. It extends the existing styled
+paragraph format without changing the 1.5 preface or record assignments. Default paragraphs
+MUST retain their existing five-element encoding. A paragraph with nondefault typography appends
+a sixth element: `[overflow,letter_spacing,word_spacing,line_height,ligatures,kerning]`.
+Nondefault controls MUST be rejected unless this profile was negotiated; SDKs MUST NOT silently
+substitute clipping or omit spacing/features when a presenter lacks the profile.
+
+Overflow is clip=0 or end-ellipsis=1. Letter and word spacing are additional nonnegative Q32.32
+logical pixels, each bounded to 1024; defaults are zero. Optional absolute line height is null
+for host metrics, otherwise positive Q32.32 logical pixels bounded to 4096. Ligatures and kerning
+are booleans defaulting to true. False ligatures disables `liga`, `clig`, `dlig`, and `calt`;
+required script features such as `rlig` remain available. False kerning disables `kern`.
+Enabled controls use host font defaults. These controls apply to the whole paragraph, including
+an inserted ellipsis. Existing per-run fonts, colors, sizes and decorations still apply.
+
+Ellipsis requires a finite max_width. Its effective maximum line count is max_lines, or one
+when omitted. If the complete text fits, no marker or truncation metadata is added. Otherwise
+the host fits a logical prefix followed by U+2026 to the line and width constraints. Cut points
+MUST be extended grapheme boundaries in the original concatenated text, preserving combining
+sequences, emoji ZWJ sequences and regional-indicator pairs across style boundaries. The marker
+inherits the last kept run's style, or the first run's style when nothing fits before it.
+Original paragraph direction MUST be preserved, placing an RTL end marker at its visual end.
+Host-inserted direction marks are implementation details and MUST NOT appear in returned ranges.
+
+Prefix fitting MUST have bounded work. Vivido performs at most a logarithmic number of prefix
+probes over the at-most-4096-byte input, retains only completely fitting results, and shapes the
+final glyph scene once for both measurement and painting. This does not promise the longest
+possible prefix under fonts with non-monotonic contextual metrics. If the marker itself cannot
+fit, the host displays no text and reports a zero cutoff. It MUST NOT paint a clipped fragment
+of the marker. Existing clipping bounds still apply to glyph overhang and decorations.
+
+The batch measurement payload optionally adds key 6, `truncated_at`, an original UTF-8 byte
+offset. It is absent when no ellipsis truncation occurred. All returned line/cluster ranges stay
+within that prefix; each synthetic marker cluster has the empty range `[truncated_at,truncated_at]`
+and its actual geometry. Hidden source text has no returned cluster geometry. Consumers MUST
+not treat the marker as inserted application text. Bindings translate the cutoff and ranges to
+Python character indexes or JavaScript UTF-16 indexes, as with existing measurements.
+The standalone legacy single-text service never emits this field.
+
+Shaping, fit probes, and retained glyph-scene compilation remain on bounded host workers. Batch
+atomicity, negotiated reply limits, retained-layout accounting, owner isolation, and release
+semantics are unchanged. Unsupported terminating presenters/gateways decline the profile.

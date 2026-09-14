@@ -30,6 +30,7 @@ pub const VECTOR_SCENE: &str = "vector-scene-v1";
 pub const OVERLAY_INPUT: &str = "overlay-input-v1";
 pub const OVERLAY_TEXT: &str = "overlay-text-v1";
 pub const OVERLAY_TEXT_LAYOUT: &str = "overlay-text-layout-v1";
+pub const OVERLAY_TYPOGRAPHY: &str = "overlay-typography-v1";
 
 pub mod record {
     pub const SET_OVERLAY_WINDOW: u16 = 0x7020;
@@ -324,6 +325,7 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
         OVERLAY_INPUT => Some(&[TERMINAL_OVERLAY]),
         OVERLAY_TEXT => Some(&[OVERLAY_INPUT]),
         OVERLAY_TEXT_LAYOUT => Some(&[OVERLAY_TEXT]),
+        OVERLAY_TYPOGRAPHY => Some(&[OVERLAY_TEXT_LAYOUT]),
         TERMINAL_SURFACE
         | DESKTOP_SURFACE
         | CANVAS_SURFACE

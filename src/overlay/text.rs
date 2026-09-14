@@ -109,6 +109,8 @@ impl TextGeometry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextMeasurement {
+    /// Original UTF-8 cutoff for an ellipsized layout; synthetic marker ranges are empty here.
+    pub truncated_at: Option<u32>,
     pub width: Scalar,
     pub height: Scalar,
     pub lines: Vec<TextGeometry>,
@@ -135,11 +137,14 @@ impl TextMeasurement {
                 Value::Array(self.clusters.iter().map(TextGeometry::value).collect()),
             ),
         ]);
+        if let Some(cut) = self.truncated_at {
+            values.push((6, u(cut.into())));
+        }
         Self::decode(address, &Value::Map(values.clone()))?;
         Ok(values)
     }
     pub fn decode(address: WindowAddress, value: &Value) -> Result<Self, MessageError> {
-        let map = strict(value, &[0, 1, 2, 3, 4, 5])?;
+        let map = strict(value, &[0, 1, 2, 3, 4, 5, 6])?;
         if WindowAddress::decode(address.surface_id, &map)? != address {
             return Err(bad(0, "measurement belongs to another window"));
         }
@@ -160,6 +165,18 @@ impl TextMeasurement {
             values.iter().map(TextGeometry::decode).collect()
         };
         Ok(Self {
+            truncated_at: map
+                .optional(6)
+                .map(|v| small(v, 6))
+                .transpose()?
+                .map(|cut| {
+                    if cut as usize > MAX_MEASURE_TEXT_BYTES {
+                        Err(bad(6, "invalid truncation offset"))
+                    } else {
+                        Ok(cut)
+                    }
+                })
+                .transpose()?,
             width,
             height,
             lines: geometry(4)?,
@@ -167,6 +184,12 @@ impl TextMeasurement {
         })
     }
     pub fn validate_text(&self, text: &str) -> Result<(), MessageError> {
+        if self.truncated_at.is_some_and(|cut| {
+            !text.is_char_boundary(cut as usize)
+                || self.lines.iter().chain(&self.clusters).any(|g| g.end > cut)
+        }) {
+            return Err(bad(6, "invalid truncation geometry"));
+        }
         if self.lines.iter().chain(&self.clusters).any(|g| {
             !text.is_char_boundary(g.start as usize) || !text.is_char_boundary(g.end as usize)
         }) {
@@ -279,6 +302,7 @@ mod tests {
             rtl: false,
         };
         let mut measured = TextMeasurement {
+            truncated_at: None,
             width: Scalar::ONE,
             height: Scalar::ONE,
             lines: vec![],

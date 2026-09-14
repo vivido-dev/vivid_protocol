@@ -1110,3 +1110,8 @@ state = "standards-track"
 value = 0x702a
 name = "RELEASE_OVERLAY_TEXT_LAYOUTS"
 state = "standards-track"
+
+[[profile]]
+name = "overlay-typography-v1"
+state = "standards-track"
+prerequisites = ["overlay-text-layout-v1"]

@@ -7,6 +7,83 @@ pub const MAX_TEXT_RUNS: usize = 64;
 pub const MAX_RETAINED_LAYOUTS: usize = 128;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TextOverflow {
+    #[default]
+    Clip,
+    Ellipsis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Typography {
+    pub overflow: TextOverflow,
+    pub letter_spacing: Scalar,
+    pub word_spacing: Scalar,
+    pub line_height: Option<Scalar>,
+    pub ligatures: bool,
+    pub kerning: bool,
+}
+impl Default for Typography {
+    fn default() -> Self {
+        Self {
+            overflow: TextOverflow::Clip,
+            letter_spacing: Scalar::ZERO,
+            word_spacing: Scalar::ZERO,
+            line_height: None,
+            ligatures: true,
+            kerning: true,
+        }
+    }
+}
+impl Typography {
+    pub fn validate(&self) -> Result<(), MessageError> {
+        if [self.letter_spacing, self.word_spacing]
+            .iter()
+            .any(|s| s.get() < 0. || s.get() > 1024.)
+            || self
+                .line_height
+                .is_some_and(|h| h.get() <= 0. || h.get() > 4096.)
+        {
+            return Err(bad(3, "invalid typographic spacing or line height"));
+        }
+        Ok(())
+    }
+    fn value(&self) -> Value {
+        Value::Array(vec![
+            u(if self.overflow == TextOverflow::Clip {
+                0
+            } else {
+                1
+            }),
+            scalar(self.letter_spacing),
+            scalar(self.word_spacing),
+            self.line_height.map(scalar).unwrap_or(Value::Null),
+            Value::Bool(self.ligatures),
+            Value::Bool(self.kerning),
+        ])
+    }
+    fn decode(value: &Value) -> Result<Self, MessageError> {
+        let v = array::<6>(value, 3)?;
+        let result = Self {
+            overflow: match v[0].as_u64() {
+                Some(0) => TextOverflow::Clip,
+                Some(1) => TextOverflow::Ellipsis,
+                _ => return Err(bad(3, "invalid text overflow")),
+            },
+            letter_spacing: decode_scalar(&v[1], 3)?,
+            word_spacing: decode_scalar(&v[2], 3)?,
+            line_height: match &v[3] {
+                Value::Null => None,
+                v => Some(decode_scalar(v, 3)?),
+            },
+            ligatures: boolean(&v[4], 3)?,
+            kerning: boolean(&v[5], 3)?,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TextAlignment {
     #[default]
     Start,
@@ -46,6 +123,7 @@ pub struct TextRun {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyledText {
+    pub typography: Typography,
     pub runs: Vec<TextRun>,
     pub max_width: Option<Scalar>,
     pub alignment: TextAlignment,
@@ -56,6 +134,7 @@ pub struct StyledText {
 impl StyledText {
     pub fn new(text: impl Into<String>, style: TextStyle) -> Self {
         Self {
+            typography: Typography::default(),
             runs: vec![TextRun {
                 text: text.into(),
                 style,
@@ -70,6 +149,10 @@ impl StyledText {
         self.runs.iter().map(|run| run.text.as_str()).collect()
     }
     pub fn validate(&self) -> Result<(), MessageError> {
+        self.typography.validate()?;
+        if self.typography.overflow == TextOverflow::Ellipsis && self.max_width.is_none() {
+            return Err(bad(3, "ellipsis requires a maximum width"));
+        }
         if self.runs.is_empty()
             || self.runs.len() > MAX_TEXT_RUNS
             || self.max_width.is_some_and(|w| w <= Scalar::ZERO)
@@ -112,7 +195,7 @@ impl StyledText {
                 ])
             })
             .collect();
-        Ok(Value::Array(vec![
+        let mut values = vec![
             Value::Array(runs),
             self.max_width.map(scalar).unwrap_or(Value::Null),
             u(match self.alignment {
@@ -123,10 +206,17 @@ impl StyledText {
             }),
             Value::Bool(self.wrap),
             self.max_lines.map(|n| u(n.into())).unwrap_or(Value::Null),
-        ]))
+        ];
+        if self.typography != Typography::default() {
+            values.push(self.typography.value());
+        }
+        Ok(Value::Array(values))
     }
     pub fn decode(value: &Value) -> Result<Self, MessageError> {
-        let v = array::<5>(value, 3)?;
+        let v = value
+            .as_array()
+            .filter(|v| v.len() == 5 || v.len() == 6)
+            .ok_or(bad(3, "invalid paragraph shape"))?;
         let runs = v[0].as_array().ok_or(bad(3, "expected text runs"))?;
         if runs.is_empty() || runs.len() > MAX_TEXT_RUNS {
             return Err(bad(3, "text run limit"));
@@ -164,6 +254,11 @@ impl StyledText {
             })
             .collect::<Result<Vec<_>, MessageError>>()?;
         let result = Self {
+            typography: v
+                .get(5)
+                .map(Typography::decode)
+                .transpose()?
+                .unwrap_or_default(),
             runs,
             max_width: match &v[1] {
                 Value::Null => None,
@@ -344,6 +439,29 @@ impl ReleaseLayouts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typography_is_optional_bounded_and_roundtrips_without_changing_legacy_paragraphs() {
+        let mut text = StyledText::new("hello", TextStyle::default());
+        assert_eq!(text.value().unwrap().as_array().unwrap().len(), 5);
+        text.max_width = Some(Scalar::new(100.).unwrap());
+        text.typography = Typography {
+            overflow: TextOverflow::Ellipsis,
+            letter_spacing: Scalar::ONE,
+            word_spacing: Scalar::new(3.).unwrap(),
+            line_height: Some(Scalar::new(24.).unwrap()),
+            ligatures: false,
+            kerning: false,
+        };
+        assert_eq!(StyledText::decode(&text.value().unwrap()).unwrap(), text);
+        text.max_width = None;
+        assert!(text.value().is_err());
+        text.max_width = Some(Scalar::ONE);
+        text.typography.letter_spacing = Scalar::new(-1.).unwrap();
+        assert!(text.value().is_err());
+        text.typography.letter_spacing = Scalar::ZERO;
+        text.typography.line_height = Some(Scalar::ZERO);
+        assert!(text.value().is_err());
+    }
     #[test]
     fn batches_roundtrip_and_enforce_aggregate_limits() {
         let address = WindowAddress {
