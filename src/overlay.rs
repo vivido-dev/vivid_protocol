@@ -7,6 +7,8 @@ use crate::identity::{SessionIdentity, SurfaceIdentity};
 use crate::vector::{HitRole, InvalidScene, Point, Rect, Scalar};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+pub mod wire;
+
 pub const MAX_WINDOWS: usize = 256;
 pub const MAX_WINDOWS_PER_OWNER: usize = 32;
 pub const MAX_PENDING_EVENTS: usize = 256;
@@ -102,6 +104,8 @@ pub struct WindowEvent {
     pub window: SurfaceIdentity,
     pub generation: u64,
     pub revision: u64,
+    /// Published drawing/hit-test revision, independent of the geometry revision.
+    pub scene_revision: u64,
     pub event: Event,
 }
 
@@ -110,6 +114,7 @@ pub struct Window {
     pub identity: SurfaceIdentity,
     pub generation: u64,
     pub revision: u64,
+    pub scene_revision: u64,
     pub options: WindowOptions,
 }
 
@@ -203,6 +208,7 @@ impl Windows {
                 identity: id,
                 generation,
                 revision: 1,
+                scene_revision: 0,
                 options,
             },
         );
@@ -212,6 +218,129 @@ impl Windows {
             self.request_focus(id)?;
         }
         Ok(())
+    }
+    /// Commit the revision only when the presenter has atomically installed drawing and hits.
+    pub fn publish_scene(
+        &mut self,
+        id: SurfaceIdentity,
+        generation: u64,
+        scene_revision: u64,
+    ) -> Result<(), InvalidScene> {
+        let window = self
+            .windows
+            .get_mut(&id)
+            .ok_or(InvalidScene("window does not exist"))?;
+        if window.generation != generation
+            || scene_revision == 0
+            || scene_revision <= window.scene_revision
+        {
+            return Err(InvalidScene("stale scene generation or revision"));
+        }
+        window.scene_revision = scene_revision;
+        Ok(())
+    }
+    /// Apply a conditional window action. Close returns no surviving window revision.
+    pub fn apply_action(
+        &mut self,
+        owner: SessionIdentity,
+        action: wire::Action,
+        viewport: wire::Viewport,
+    ) -> Result<Option<u64>, InvalidScene> {
+        action
+            .payload()
+            .map_err(|_| InvalidScene("invalid window action"))?;
+        let id = action
+            .address
+            .identity(owner)
+            .map_err(|_| InvalidScene("invalid window identity"))?;
+        let old = self
+            .windows
+            .get(&id)
+            .ok_or(InvalidScene("window does not exist"))?;
+        if old.generation != action.address.generation || old.revision != action.expected_revision {
+            return Err(InvalidScene("stale window generation or revision"));
+        }
+        if action.action == wire::WindowAction::Close {
+            self.close(id, DismissReason::Closed);
+            return Ok(None);
+        }
+        let next = old
+            .revision
+            .checked_add(1)
+            .ok_or(InvalidScene("window revision exhausted"))?;
+        let centered = if action.action == wire::WindowAction::Center {
+            viewport
+                .validate()
+                .map_err(|_| InvalidScene("invalid viewport"))?;
+            Some(Rect::new(
+                ((viewport.width.get() - old.options.bounds.width.get()) / 2.).max(0.),
+                ((viewport.height.get() - old.options.bounds.height.get()) / 2.).max(0.),
+                old.options.bounds.width.get(),
+                old.options.bounds.height.get(),
+            )?)
+        } else {
+            None
+        };
+        match action.action {
+            wire::WindowAction::Focus => self.request_focus(id)?,
+            wire::WindowAction::Raise => {
+                if !self.eligible(id) {
+                    return Err(InvalidScene("window is hidden or blocked by a modal"));
+                }
+                self.raise_group(id);
+            }
+            wire::WindowAction::Lower => {
+                if !self.eligible(id) || self.top_modal().is_some() {
+                    return Err(InvalidScene(
+                        "lowering is blocked by visibility or an active modal",
+                    ));
+                }
+                let group: Vec<_> = self
+                    .stack
+                    .iter()
+                    .copied()
+                    .filter(|child| self.descendant(*child, id))
+                    .collect();
+                self.stack.retain(|key| !group.contains(key));
+                let index = self
+                    .windows
+                    .get(&id)
+                    .and_then(|w| w.options.parent)
+                    .and_then(|p| self.stack.iter().position(|key| *key == p))
+                    .map_or(0, |index| index + 1);
+                self.stack.splice(index..index, group);
+            }
+            wire::WindowAction::Center => {}
+            wire::WindowAction::Close => unreachable!("close handled before advancing revision"),
+        }
+        let window = self
+            .windows
+            .get_mut(&id)
+            .ok_or(InvalidScene("window lost during action"))?;
+        window.revision = next;
+        if let Some(bounds) = centered {
+            window.options.bounds = bounds;
+            self.emit(
+                id,
+                Event::Geometry {
+                    bounds,
+                    settled: true,
+                },
+            );
+        }
+        Ok(Some(next))
+    }
+
+    fn raise_group(&mut self, id: SurfaceIdentity) {
+        // A parent cannot paint over its own popups when it is raised or focused.
+        let group: Vec<_> = self
+            .stack
+            .iter()
+            .copied()
+            .filter(|child| self.descendant(*child, id))
+            .collect();
+        self.stack.retain(|key| !group.contains(key));
+        self.stack.extend(group);
     }
     pub fn update(
         &mut self,
@@ -325,8 +454,7 @@ impl Windows {
         if !self.eligible(id) {
             return Err(InvalidScene("window is hidden or blocked by a modal"));
         }
-        self.stack.retain(|key| *key != id);
-        self.stack.push(id);
+        self.raise_group(id);
         self.focus_history.retain(|key| *key != id);
         self.focus_history.push(id);
         self.change_focus(Some(id));
@@ -416,6 +544,7 @@ impl Windows {
             window: id,
             generation: w.generation,
             revision: w.revision,
+            scene_revision: w.scene_revision,
             event,
         };
         let Some(queue) = self.events.get_mut(&id.context.session) else {
@@ -424,6 +553,7 @@ impl Windows {
         // Only replace adjacent motion/geometry updates; never drop key/button transitions.
         let coalesces = queue.back().is_some_and(|last| {
             last.window == id
+                && last.scene_revision == e.scene_revision
                 && matches!(
                     (&last.event, &e.event),
                     (
@@ -522,6 +652,45 @@ impl Windows {
         }
         self.emit(id, event);
         true
+    }
+    /// Wheel input follows hit geometry and modal eligibility without changing keyboard focus.
+    pub fn wheel(
+        &mut self,
+        position: Point,
+        dx: Scalar,
+        dy: Scalar,
+        modifiers: u32,
+        hit: impl Fn(SurfaceIdentity, Point) -> Option<(u64, HitRole)>,
+    ) -> bool {
+        let target = self
+            .stack
+            .iter()
+            .rev()
+            .copied()
+            .filter(|id| self.eligible(*id))
+            .find_map(|id| {
+                let window = self.windows.get(&id)?;
+                if !window.options.bounds.contains(position) {
+                    return None;
+                }
+                let local = self.local(id, position)?;
+                let (_, role) = hit(id, local)?;
+                (role != HitRole::Transparent).then_some((id, local))
+            });
+        if let Some((id, position)) = target {
+            self.emit(
+                id,
+                Event::Wheel {
+                    position,
+                    dx,
+                    dy,
+                    modifiers,
+                },
+            );
+            true
+        } else {
+            self.top_modal().is_some()
+        }
     }
     /// Hit-test callback uses the same compiled paths, transforms and clips as the draw scene.
     /// None is input-transparent; a default rectangular hit is the compiler's responsibility.
@@ -692,6 +861,7 @@ fn event_bytes(event: &Event) -> usize {
 }
 fn valid_event(event: &Event) -> bool {
     match event {
+        Event::Geometry { bounds, .. } => bounds.validate().is_ok(),
         Event::Text(text) => text.len() <= MAX_EVENT_TEXT_BYTES,
         Event::Ime { preedit, selection } => {
             preedit.len() <= MAX_EVENT_TEXT_BYTES
@@ -720,6 +890,151 @@ mod tests {
     }
     fn options(mode: WindowMode) -> WindowOptions {
         WindowOptions::new(Rect::new(10.0, 10.0, 100.0, 80.0).unwrap(), mode)
+    }
+    #[test]
+    fn window_actions_check_owner_revision_and_keep_popups_above_their_parent() {
+        let a = key(1, 1);
+        let popup = key(1, 2);
+        let b = key(2, 1);
+        let mut state = Windows::default();
+        state.create(a, 1, options(WindowMode::Floating)).unwrap();
+        state.create(b, 1, options(WindowMode::Floating)).unwrap();
+        let mut child = options(WindowMode::Popup);
+        child.parent = Some(a);
+        state.create(popup, 1, child).unwrap();
+        let viewport = wire::Viewport {
+            width: Scalar::new(800.).unwrap(),
+            height: Scalar::new(600.).unwrap(),
+            scale_numerator: 3,
+            scale_denominator: 2,
+        };
+        let action = wire::Action {
+            address: wire::WindowAddress {
+                context_id: 1,
+                surface_id: 1,
+                generation: 1,
+            },
+            expected_revision: 1,
+            action: wire::WindowAction::Raise,
+        };
+        assert_eq!(
+            state
+                .apply_action(a.context.session, action, viewport)
+                .unwrap(),
+            Some(2)
+        );
+        let order: Vec<_> = state.visible().map(|w| w.identity).collect();
+        assert_eq!(order, [b, a, popup]);
+        assert_eq!(state.get(b).unwrap().revision, 1);
+        assert!(
+            state
+                .apply_action(a.context.session, action, viewport)
+                .is_err()
+        );
+        assert_eq!(
+            state.visible().map(|w| w.identity).collect::<Vec<_>>(),
+            order
+        );
+        state
+            .apply_action(
+                a.context.session,
+                wire::Action {
+                    expected_revision: 2,
+                    action: wire::WindowAction::Center,
+                    ..action
+                },
+                viewport,
+            )
+            .unwrap();
+        assert_eq!(
+            state.get(a).unwrap().options.bounds.origin,
+            Point::new(350., 260.).unwrap()
+        );
+        state
+            .apply_action(
+                a.context.session,
+                wire::Action {
+                    expected_revision: 3,
+                    action: wire::WindowAction::Close,
+                    ..action
+                },
+                viewport,
+            )
+            .unwrap();
+        assert!(state.get(a).is_none());
+        assert!(state.get(popup).is_none());
+        assert!(state.get(b).is_some());
+    }
+    #[test]
+    fn published_scene_revision_survives_geometry_changes_and_prevents_cross_revision_coalescing() {
+        let a = key(1, 1);
+        let b = key(2, 1);
+        let mut state = Windows::default();
+        for id in [a, b] {
+            state.create(id, 1, options(WindowMode::Floating)).unwrap();
+        }
+        state.publish_scene(a, 1, 10).unwrap();
+        state.publish_scene(b, 1, 30).unwrap();
+        let p = Point::new(20., 20.).unwrap();
+        let hits = |id, _| (id == a).then_some((1, HitRole::Input));
+        state.pointer(p, None, 0, hits);
+        state.publish_scene(a, 1, 11).unwrap();
+        state.pointer(p, None, 0, hits);
+        assert_eq!(
+            state.take_event(a.context.session).unwrap().scene_revision,
+            10
+        );
+        assert_eq!(
+            state.take_event(a.context.session).unwrap().scene_revision,
+            11
+        );
+        assert!(state.publish_scene(a, 1, 10).is_err());
+        assert!(state.publish_scene(a, 2, 12).is_err());
+        state
+            .update(a, 1, 1, options(WindowMode::Floating))
+            .unwrap();
+        assert_eq!(state.get(a).unwrap().scene_revision, 11);
+        assert_eq!(state.get(a).unwrap().revision, 2);
+        state.revoke_owner(a.context.session);
+        assert_eq!(state.get(b).unwrap().scene_revision, 30);
+    }
+
+    #[test]
+    fn wheel_respects_transparency_and_modal_owner_without_stealing_focus() {
+        let a = key(1, 1);
+        let b = key(2, 1);
+        let mut state = Windows::default();
+        state.create(a, 1, options(WindowMode::Floating)).unwrap();
+        state.create(b, 1, options(WindowMode::Floating)).unwrap();
+        state.request_focus(b).unwrap();
+        let p = Point::new(20., 20.).unwrap();
+        assert!(!state.wheel(p, Scalar::ZERO, Scalar::ONE, 0, |_, _| None));
+        assert!(state.wheel(p, Scalar::ZERO, Scalar::ONE, 0, |id, _| {
+            (id == a).then_some((9, HitRole::Input))
+        }));
+        assert_eq!(state.focus(), Some(b));
+        let event = state.take_event(a.context.session).unwrap();
+        assert!(
+            matches!(event.event, Event::Wheel { position, .. } if position == Point::new(10., 10.).unwrap())
+        );
+        state.close(a, DismissReason::Closed);
+        state.create(a, 1, options(WindowMode::Modal)).unwrap();
+        assert!(state.wheel(
+            Point::new(900., 900.).unwrap(),
+            Scalar::ZERO,
+            Scalar::ONE,
+            0,
+            |_, _| None
+        ));
+        state.revoke_owner(a.context.session);
+        assert!(!state.wheel(
+            Point::new(900., 900.).unwrap(),
+            Scalar::ZERO,
+            Scalar::ONE,
+            0,
+            |_, _| None
+        ));
+        assert_eq!(state.focus(), Some(b));
     }
     #[test]
     fn modal_focus_and_owner_cleanup_are_isolated() {

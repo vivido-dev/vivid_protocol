@@ -130,6 +130,13 @@ fields plus viewport logical extent (9), positive scale numerator/denominator (1
 (11), and last published scene revision (12). Target changes notify producers of authoritative
 logical extent and scale; old target generations cannot authorize new placement mutations.
 
+The extent is `[width, height]` in Q32.32; scale is `[numerator, denominator]`, both nonzero
+u32 integers. A successful READY has keys 0–8 with key 3 set to the resulting nonzero window
+revision. STATUS has keys 0–12 (parent key 7 remains optional). Requests and replies reject
+duplicate or unknown keys, invalid enum values, zero object identities/generations, and geometry
+outside the scalar limits. A parent is resolved in the authenticated session, never a
+producer-specified session. Self-parenting and cross-owner parenting are invalid.
+
 ## Input and lifecycle
 
 Input uses an independently authenticated interactive lane. It MUST remain responsive when
@@ -140,9 +147,43 @@ wheel, physical keys, committed text, IME preedit/selection, focus, geometry (in
 settled geometry), dismissal, and cancellation. Connection loss is additionally reported by
 the producer binding when its transport closes.
 
+Key 3 identifies the **published scene revision**, independently of the window geometry revision.
+Revision zero is permitted for lifecycle notifications before the first scene is published.
+Pointer targeting MUST use the atomically published drawing/hit state. Coalescing MUST NOT cross
+a scene-revision boundary; dispatch for older queued events remains associated with its old scene.
+
+| Event type | Key 5 payload |
+| --- | --- |
+| 0 focus | boolean |
+| 1 pointer | `[point, region_id, button_or_null, modifiers]` |
+| 2 wheel | `[point, delta_x, delta_y, modifiers]` |
+| 3 key | `[physical_key, down, repeat, modifiers]` |
+| 4 committed text | UTF-8 text |
+| 5 IME | `[preedit_text, selection_or_null]` |
+| 6 geometry | `[rectangle, settled_boolean]` |
+| 7 dismissed | reason: Escape=0, outside press=1, explicit close=2, owner loss=3, parent close=4 |
+| 8 cancel | null |
+
+Points, rectangles, and wheel deltas use the drawing codec's Q32.32 geometry. A pointer button is
+`[u16_button, down_boolean]` or null for motion. Region IDs are u64 (zero denotes the default
+rectangular hit region); physical keys and modifier masks are u32. An IME selection is
+`[start_byte, end_byte]` with ordered u32 UTF-8 byte offsets at character boundaries inside the
+preedit string, or null. Language/platform adapters convert their native offset conventions.
+Committed text and preedit text are limited to 4096 UTF-8 bytes each. Unknown event types, extra
+array fields, invalid booleans, and narrowing overflow MUST be rejected before dispatch.
+
 `OVERLAY_INPUT_CAPTURE` (0x7031) requests or releases capture for a currently eligible focused
 window. `OVERLAY_INPUT_RENEW` (0x7032) renews the bounded input-lane lease. Host shortcuts are
 handled before application input. No overlay can intercept another pane's input.
+
+CAPTURE uses context (0), surface (1), surface generation (2), nonzero scene revision (3), and
+capture boolean (4). The header object ID is the surface. False releases capture; true requires
+the currently eligible focused window and its current scene revision. The presenter uses its
+last observed pointer position, not a producer-supplied position, to establish capture.
+RENEW uses lane generation (0) and watchdog duration in microseconds (1), with header object zero.
+The generation MUST match the authenticated lane and the watchdog MUST be in 250,000–5,000,000
+microseconds. CAPTURE and RENEW are correlated requests replied to with OK or ERROR. Lease expiry
+uses presenter monotonic time; delayed renewals cannot reactivate a revoked lane generation.
 
 Floating windows receive input in their hit regions and keys while focused. An outside press
 dismisses the foremost popup and consumes both the press and matching release. Escape dismisses
