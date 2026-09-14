@@ -13,6 +13,9 @@ use super::{DismissReason, Event, WindowMode, WindowOptions, valid_event};
 
 const SCHEMA: &str = "overlay";
 
+#[path = "text.rs"]
+pub mod text;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowAddress {
     pub context_id: u64,

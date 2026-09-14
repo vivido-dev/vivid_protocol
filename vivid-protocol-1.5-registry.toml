@@ -1070,3 +1070,23 @@ state = "standards-track"
 value = 0x7034
 name = "OVERLAY_VIEWPORT_CHANGED"
 state = "standards-track"
+
+[[profile]]
+name = "overlay-text-v1"
+state = "standards-track"
+prerequisites = ["overlay-input-v1"]
+
+[[record]]
+value = 0x7025
+name = "MEASURE_OVERLAY_TEXT"
+state = "standards-track"
+
+[[record]]
+value = 0x7026
+name = "OVERLAY_TEXT_MEASURED"
+state = "standards-track"
+
+[[record]]
+value = 0x7027
+name = "SET_OVERLAY_EDITOR"
+state = "standards-track"

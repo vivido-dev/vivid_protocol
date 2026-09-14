@@ -262,3 +262,45 @@ glyphs/cursor/selection, layer-2 media and viewport overlays, then trusted host 
 application overlay is clipped to its pane. Overlay animation MUST NOT require reshaping
 unchanged terminal text or uploading unchanged assets. Compilation and text shaping happen
 off the UI event loop; moving a cached scene changes its placement transform.
+
+## Host text and editor geometry
+
+The optional `overlay-text-v1` profile requires `overlay-input-v1`. Presenters MUST omit it
+unless host measurement and platform editor positioning are both implemented. Unsupported
+terminating presenters/gateways MUST reject it when required. These records use authenticated
+control envelopes with the window surface object ID; keys 0, 1, and 2 are context, surface,
+and surface generation. Authority requires the context's surface/track/media operation and a
+live overlay input lane. Replies retain request correlation and object identity.
+
+`MEASURE_OVERLAY_TEXT` (0x7025) adds key 3 containing a one-element array holding precisely the
+tag-7 text specification defined above. Other drawing commands are forbidden. Origin and color
+have no effect on measurement; geometry is relative to the layout origin. Text is at most 4096
+UTF-8 bytes; the existing font/style and control-body limits also apply. The host uses the same
+font selection, fallback, shaping and wrapping as painting. Measurement MUST run independently
+of the UI, control and interactive-lane loops. At most one measurement per authenticated owner
+and 16 total may be processing; excess requests fail with LIMIT_EXCEEDED. Disconnect/revocation
+MUST NOT remove a worker's budget charge before its work finishes.
+
+`OVERLAY_TEXT_MEASURED` (0x7026) echoes keys 0-2. Key 3 is `[width,height]` in Q32.32. Keys 4 and 5
+are line and visual-order cluster arrays, respectively, each bounded to 1024 entries. An entry is
+`[utf8_start,utf8_end,x,y,width,height,baseline,rtl_boolean]`; end is exclusive. Ranges MUST lie on
+UTF-8 boundaries in the requested string. Dimensions are nonnegative; combining clusters may
+have zero advance. Baseline is layout-relative for lines and zero for clusters. A line's rtl flag
+is false; direction is reported per cluster. Empty text has zero width and its host line height.
+If the complete reply exceeds negotiated control limits, the request fails atomically. This is
+a measurement snapshot, not a retained layout handle; callers must remeasure when font/style
+inputs change. Custom fonts, styled runs and retained text-layout references are separate work.
+
+`SET_OVERLAY_EDITOR` (0x7027) adds key 3, a nonzero presented scene revision, and key 4, a
+window-local logical rectangle `[x,y,width,height]` or null to clear it. It replies with correlated
+OK. Only the currently focused eligible window may set/clear its editor geometry, and its surface
+generation and published scene revision MUST match. Accepted but unpresented revisions are not
+sufficient. The rectangle already includes any application canvas transforms. The host clips it
+to the owning window and pane, adds window placement, then applies current DPI for platform IME
+caret/exclusion APIs. Geometry follows window movement and DPI updates without producer polling.
+It does not take focus, alter the scene, or permit another producer to move the active editor.
+
+The host MUST clear editor geometry on focus loss, hide, close, lane loss, revocation, disconnect,
+or publication of a different scene revision. A new focused scene must publish new geometry.
+When no eligible editor geometry remains, platform IME placement returns to the terminal cursor.
+Native IME queries MUST use locally cached geometry rather than synchronously querying a producer.
