@@ -520,6 +520,11 @@ pub enum Command {
     Clip(Path),
     Opacity(u16),
     Text(Text),
+    /// A host-shaped layout in this window's retained namespace (overlay-text-layout-v1).
+    TextLayout {
+        layout: u64,
+        origin: Point,
+    },
     Image {
         asset: u64,
         rect: Rect,
@@ -691,6 +696,12 @@ impl Canvas {
                     }
                     None
                 }
+                Command::TextLayout { layout, .. } => {
+                    if *layout == 0 {
+                        return Err(InvalidScene("text layout ID must be nonzero"));
+                    }
+                    None
+                }
                 Command::Image { asset, rect, .. } => {
                     if *asset == 0 {
                         return Err(InvalidScene("image asset ID must be nonzero"));
@@ -817,6 +828,11 @@ fn brush(b: &Brush) -> Value {
 }
 fn command_value(c: &Command) -> Value {
     Value::Array(match c {
+        Command::TextLayout { layout, origin } => vec![
+            Value::Unsigned(10),
+            Value::Unsigned(*layout),
+            point(*origin),
+        ],
         Command::Fill(p, b) => vec![Value::Unsigned(0), path(p), brush(b)],
         Command::Stroke(p, b, w) => vec![Value::Unsigned(1), path(p), brush(b), integer(w.raw())],
         Command::Save => vec![Value::Unsigned(2)],
@@ -1020,6 +1036,10 @@ fn parse_command(v: &Value) -> Result<Command> {
                 Some(scalar(m)?)
             },
         })),
+        [Value::Unsigned(10), id, p] => Ok(Command::TextLayout {
+            layout: uint(id)?,
+            origin: parse_point(p)?,
+        }),
         [Value::Unsigned(8), id, r, o] => Ok(Command::Image {
             asset: uint(id)?,
             rect: parse_rect(r)?,

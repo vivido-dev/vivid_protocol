@@ -2,6 +2,9 @@
 use super::*;
 use crate::vector::{Canvas, Command, Text};
 
+#[path = "styled.rs"]
+pub mod styled;
+
 pub const MAX_MEASURE_TEXT_BYTES: usize = 4096;
 pub const MAX_TEXT_GEOMETRY: usize = 1024;
 

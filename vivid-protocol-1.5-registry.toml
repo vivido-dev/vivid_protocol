@@ -1090,3 +1090,23 @@ state = "standards-track"
 value = 0x7027
 name = "SET_OVERLAY_EDITOR"
 state = "standards-track"
+
+[[profile]]
+name = "overlay-text-layout-v1"
+state = "standards-track"
+prerequisites = ["overlay-text-v1"]
+
+[[record]]
+value = 0x7028
+name = "MEASURE_OVERLAY_TEXT_BATCH"
+state = "standards-track"
+
+[[record]]
+value = 0x7029
+name = "OVERLAY_TEXT_BATCH_MEASURED"
+state = "standards-track"
+
+[[record]]
+value = 0x702a
+name = "RELEASE_OVERLAY_TEXT_LAYOUTS"
+state = "standards-track"

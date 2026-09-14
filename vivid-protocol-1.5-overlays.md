@@ -304,3 +304,65 @@ The host MUST clear editor geometry on focus loss, hide, close, lane loss, revoc
 or publication of a different scene revision. A new focused scene must publish new geometry.
 When no eligible editor geometry remains, platform IME placement returns to the terminal cursor.
 Native IME queries MUST use locally cached geometry rather than synchronously querying a producer.
+
+## Batched styled text and retained layouts
+
+`overlay-text-layout-v1` requires `overlay-text-v1`. It adds the following authenticated control
+records and vector command tag 10; hosts MUST NOT accept them without this negotiated profile.
+Terminating presenters without these services MUST decline the profile. The protocol preface is
+unchanged. Window addressing, context authority, generation, and live input-lane checks are the
+same as for single text measurement.
+
+`MEASURE_OVERLAY_TEXT_BATCH` (0x7028) has address keys 0–2, key 3 an array of styled paragraphs,
+and key 4 a boolean indicating whether to retain their measured glyph scenes. A paragraph is
+`[runs,max_width,alignment,wrap,max_lines]`. Each run is
+`[text,size,family,weight,italic,color,underline,strikethrough]`. Text/family are UTF-8 strings;
+size and optional max_width are positive Q32.32 logical pixels, color is straight-alpha sRGB
+0xRRGGBBAA, weight is 1–1000, and flags are booleans. Alignment is start=0, center=1, end=2,
+justify=3, with start/end following paragraph direction. A null max_width is unconstrained.
+The optional max_lines is null or 1–1024. `wrap=false` disables soft wrapping, preserving explicit
+line breaks. Content exceeding max_width is clipped; max_lines truncates after complete lines,
+without inserting an ellipsis. Glyphs and decorations are clipped to the resulting box.
+When max_width is supplied, the measured width is that paragraph box width.
+
+Runs concatenate into one shaping input; style boundaries MUST NOT restart script shaping or
+font fallback. Geometry indexes refer to UTF-8 bytes in that concatenated input. Empty text
+retains the first run's line height. Measurements include only the retained lines; clusters may
+extend beyond the horizontal clip, allowing producers to reason about clipped editing content.
+Host fonts and fallback are authoritative. Underline and strikethrough use the shaped font's
+metrics. No custom fonts, host URL fetching, or implementation-specific font/layout data travel
+over the wire.
+
+Batches contain 1–32 paragraphs, each with 1–64 runs, and at most 64 runs and 4096 text bytes
+in total. Font family strings are each at most 256 bytes. Existing control-body limits apply.
+The single-measurement and batch services share one outstanding job per owner and 16 globally.
+Shaping and glyph-scene compilation MUST run outside the UI/control/input loops.
+
+`OVERLAY_TEXT_BATCH_MEASURED` (0x7029) echoes address keys 0–2. Key 3 is an ordered array of
+`[layout_id,measurement]` pairs with one result per input paragraph. `measurement` is the complete
+`OVERLAY_TEXT_MEASURED` payload map, including its repeated window address. Across the batch,
+line plus cluster geometry is bounded to 1024 entries. IDs are zero for non-retaining requests;
+otherwise they are nonzero u64 identities unique within the window generation and MUST NOT be
+reused there, including after release. Results MUST preserve request order and be committed
+atomically: any invalid input, shaping failure, resource limit, or oversized reply rejects the
+whole batch without publishing any retained layout.
+
+Vector command `[10,layout_id,[x,y]]` paints the retained glyph scene at a window-local logical
+origin using the Canvas transform, clipping, and opacity. It MUST use the measured glyph positions,
+fonts, colors, and decorations without reshaping. Font configuration changes do not alter an
+existing layout. These resources belong to the complete authenticated owner/context/surface/
+generation, and survive replacement of the vector track within that window. A track/channel may
+reference only its own window's layout namespace; no numeric-ID lookup may cross ownership.
+
+`RELEASE_OVERLAY_TEXT_LAYOUTS` (0x702a) has address keys 0–2 and key 3 an array of 1–32 distinct,
+nonzero layout IDs. The host validates all IDs before removing any and replies with correlated OK.
+Release removes future lookup entries; it MUST preserve scenes that already resolved their
+references, including scenes compiling or awaiting composition. Because release uses control and
+submission uses bulk transport, producers wanting guaranteed preservation wait for presented
+before release. Later submissions referring to a released ID fail atomically.
+
+At most 128 layouts per owner and 2048 globally may remain charged, including released layouts
+still referenced by scenes. Pending batch work is separately bounded by the worker and batch
+limits. Closing a window, context revocation, input-lane loss, and producer loss remove only that
+owner's namespaces; charges remain until the last in-flight scene reference is released. A host
+MUST NOT reclaim released-layout capacity early or evict live layouts to admit another owner.
