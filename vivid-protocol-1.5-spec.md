@@ -212,7 +212,8 @@ The following are not standards-track Vivid 1.5 behavior:
 - generic file transfer, filesystem browsing, clipboard, secure-attention sequence, credential
   transport, or login approval; `file-drop-v1` is only the bounded user-gesture copy defined by
   its normative part, and `file-drop-path-v1` adds only the committed destination path on a
-  successful result; and
+  successful result; `overlay-clipboard-v1` is only the bounded, focused, gesture-correlated
+  write defined by its normative part and cannot read a clipboard back; and
 - treating capture-policy bits as operating-system content protection.
 
 The experimental multiplexed carrier may be developed after the baseline object, authority, and

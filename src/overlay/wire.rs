@@ -747,6 +747,40 @@ impl InputEvent {
     }
 }
 
+/// A request to place text on the user's clipboard (`overlay-clipboard-v1`).
+///
+/// Write-only by construction: there is no record that reads the clipboard back, so an overlay
+/// can never observe what the user copied elsewhere. Paste still arrives as ordinary committed
+/// text through the host's own paste policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clipboard {
+    pub address: WindowAddress,
+    pub text: String,
+}
+impl Clipboard {
+    pub fn payload(&self) -> Result<PayloadMap, MessageError> {
+        self.address.validate(self.address.surface_id)?;
+        if self.text.is_empty() || self.text.len() > super::MAX_CLIPBOARD_BYTES {
+            return Err(bad(3, "clipboard text is empty or oversized"));
+        }
+        let mut fields = self.address.payload();
+        fields.push((3, Value::Text(self.text.clone())));
+        Ok(fields)
+    }
+    pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
+        let map = strict(value, &[0, 1, 2, 3])?;
+        let address = WindowAddress::decode(object, &map)?;
+        let text = match map.required(3)? {
+            Value::Text(text) => text.clone(),
+            _ => return Err(bad(3, "clipboard text must be text")),
+        };
+        if text.is_empty() || text.len() > super::MAX_CLIPBOARD_BYTES {
+            return Err(bad(3, "clipboard text is empty or oversized"));
+        }
+        Ok(Self { address, text })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capture {
     pub address: WindowAddress,
@@ -1063,6 +1097,27 @@ mod tests {
             .is_err()
         );
         assert!(Renew::decode(2, &encoded(renew.payload().unwrap())).is_err());
+    }
+
+    #[test]
+    fn clipboard_writes_round_trip_and_refuse_empty_or_oversized_text() {
+        let request = Clipboard {
+            address: address(),
+            text: "copied from an overlay".to_owned(),
+        };
+        let encoded = encoded(request.payload().unwrap());
+        assert_eq!(Clipboard::decode(2, &encoded).unwrap(), request);
+
+        for text in [
+            String::new(),
+            "x".repeat(super::super::MAX_CLIPBOARD_BYTES + 1),
+        ] {
+            let request = Clipboard {
+                address: address(),
+                text,
+            };
+            assert!(request.payload().is_err());
+        }
     }
 
     #[test]

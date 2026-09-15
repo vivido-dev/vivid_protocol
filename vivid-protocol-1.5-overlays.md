@@ -515,3 +515,37 @@ leave for a region whose window is being destroyed precedes that window's dismis
 Hover is a single slot per host: one pointer means at most one hovered region at a time. A drag
 or resize gesture deliberately does not re-evaluate hover as it passes over other regions; the
 release does.
+
+## Clipboard writes
+
+The `overlay-clipboard-v1` profile lets an overlay place text on the user's clipboard. Its
+prerequisite is `overlay-input-v1`. It is deliberately narrow, because a clipboard is shared with
+every other application on the machine and is frequently where a password or a command line
+briefly lives.
+
+`SET_OVERLAY_CLIPBOARD` (0x7035) carries the window address in keys 0-2 and the text in key 3. It
+is **write-only**: no record in this specification reads a clipboard, so an overlay can never
+observe what the user copied in another application. Paste already reaches a focused overlay as
+ordinary committed text through the host's own paste policy, so nothing here is needed to receive
+one. The text is UTF-8, non-empty, and at most 65536 bytes. Empty text is refused rather than
+treated as a clear, because clearing a clipboard the user did not ask to clear is the whole of
+the interference this profile exists to prevent.
+
+A host MUST refuse a write unless all of the following hold, and MUST report the refusal as a
+correlated error rather than silently dropping it:
+
+- the window exists and is the one the pane's eligible focus currently holds;
+- a key press or pointer press was delivered to that window no more than
+  `MAX_CLIPBOARD_GESTURE_AGE` (2 seconds) before the request; and
+- the text is non-empty and within the byte ceiling above.
+
+The gesture requirement is what ties a write to something the user did. Without it an overlay
+could replace the clipboard at an arbitrary moment, which is the setup for a paste-hijack: the
+user copies a command, an overlay replaces it, and the user pastes something they did not copy.
+The host MUST NOT accept a gesture that was delivered to a different window, and MUST NOT accept
+one older than the ceiling, so a producer cannot bank a gesture and spend it later.
+
+The write completes within the correlated request, so no more than one is ever outstanding per
+producer. A host performs the write through its normal clipboard path, which on a shared display
+server may publish the text to other applications immediately; a producer MUST NOT treat a
+successful reply as evidence that nothing else observed the text.

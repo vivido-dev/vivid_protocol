@@ -33,6 +33,7 @@ pub const OVERLAY_TEXT_LAYOUT: &str = "overlay-text-layout-v1";
 pub const OVERLAY_TYPOGRAPHY: &str = "overlay-typography-v1";
 pub const OVERLAY_PAINT: &str = "overlay-paint-v1";
 pub const OVERLAY_POINTER: &str = "overlay-pointer-v1";
+pub const OVERLAY_CLIPBOARD: &str = "overlay-clipboard-v1";
 
 pub mod record {
     pub const SET_OVERLAY_WINDOW: u16 = 0x7020;
@@ -54,6 +55,7 @@ pub mod record {
     pub const VECTOR_ASSET_RELEASE: u16 = 0x800f;
     pub const OVERLAY_SUBMISSION_OUTCOME: u16 = 0x7033;
     pub const OVERLAY_VIEWPORT_CHANGED: u16 = 0x7034;
+    pub const SET_OVERLAY_CLIPBOARD: u16 = 0x7035;
     pub const HELLO: u16 = 0x0001;
     pub const WELCOME: u16 = 0x0002;
     pub const OK: u16 = 0x0003;
@@ -330,6 +332,7 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
         OVERLAY_TYPOGRAPHY => Some(&[OVERLAY_TEXT_LAYOUT]),
         OVERLAY_PAINT => Some(&[TERMINAL_OVERLAY]),
         OVERLAY_POINTER => Some(&[TERMINAL_OVERLAY]),
+        OVERLAY_CLIPBOARD => Some(&[OVERLAY_INPUT]),
         TERMINAL_SURFACE
         | DESKTOP_SURFACE
         | CANVAS_SURFACE
@@ -387,6 +390,29 @@ mod tests {
         validate_profile_set([FILE_DROP_PATH, FILE_DROP, CORE_CONTROL]).unwrap();
         assert!(matches!(
             validate_profile_set([FILE_DROP_PATH, CORE_CONTROL]),
+            Err(ProfileError::MissingPrerequisite { .. })
+        ));
+    }
+
+    #[test]
+    fn the_overlay_clipboard_profile_requires_overlay_input() {
+        // Reading a clipboard is a 1.5 non-goal with one narrow carve-out; the carve-out still
+        // depends on the input lane, so a set that omits it cannot be negotiated.
+        // The set must be sorted and unique, exactly as a negotiated list would be.
+        let mut profiles = vec![
+            OVERLAY_CLIPBOARD,
+            OVERLAY_INPUT,
+            TERMINAL_OVERLAY,
+            TERMINAL_SURFACE,
+            VECTOR_SCENE,
+            LIVE_MEDIA,
+            CORE_CONTROL,
+        ];
+        profiles.sort_unstable();
+        profiles.dedup();
+        validate_profile_set(profiles).unwrap();
+        assert!(matches!(
+            validate_profile_set([OVERLAY_CLIPBOARD, TERMINAL_OVERLAY]),
             Err(ProfileError::MissingPrerequisite { .. })
         ));
     }

@@ -6,6 +6,7 @@
 use crate::identity::{SessionIdentity, SurfaceIdentity};
 use crate::vector::{CursorShape, HitRegion, HitRole, InvalidScene, Point, Rect, Scalar};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
 
 pub mod wire;
 
@@ -14,6 +15,11 @@ pub const MAX_WINDOWS_PER_OWNER: usize = 32;
 pub const MAX_PENDING_EVENTS: usize = 256;
 /// A press sequence longer than this restarts at one, exactly as a fourth terminal click does.
 pub const MAX_CLICKS: u8 = 3;
+/// The most UTF-8 an overlay may copy out in one gesture.
+pub const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
+/// A host MUST NOT accept a clipboard write more than this long after the gesture that caused
+/// it. The exact interval is the host's, but a producer cannot ask for an unbounded one.
+pub const MAX_CLIPBOARD_GESTURE_AGE: Duration = Duration::from_secs(2);
 pub const MAX_EVENT_TEXT_BYTES: usize = 4096;
 pub const MAX_EVENT_QUEUE_BYTES: usize = 128 * 1024;
 pub const MAX_OWNERS: usize = 16;
@@ -1014,6 +1020,11 @@ impl Windows {
                 },
             );
         }
+    }
+
+    /// The window the pointer currently sits in, if any.
+    pub fn hovered_window(&self) -> Option<SurfaceIdentity> {
+        self.hover.map(|hover| hover.window)
     }
 
     /// The cursor the pointer calls for: a captured region keeps the shape it started with.
