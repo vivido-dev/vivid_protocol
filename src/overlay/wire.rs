@@ -525,17 +525,25 @@ impl InputEvent {
                 region,
                 button,
                 modifiers,
-            } => (
-                1,
-                Value::Array(vec![
+                clicks,
+                pressure,
+            } => {
+                let mut payload = vec![
                     point(*position),
                     u(*region),
                     button.map_or(Value::Null, |(b, down)| {
                         Value::Array(vec![u(u64::from(b)), Value::Bool(down)])
                     }),
                     u(u64::from(*modifiers)),
-                ]),
-            ),
+                ];
+                // A plain motion or release stays four elements, so a host that has not adopted
+                // the profile and a producer that has still agree on the common case.
+                if *clicks != 0 || pressure.is_some() {
+                    payload.push(u(u64::from(*clicks)));
+                    payload.push(pressure.map_or(Value::Null, scalar));
+                }
+                (1, Value::Array(payload))
+            }
             Event::Wheel {
                 position,
                 dx,
@@ -599,6 +607,9 @@ impl InputEvent {
                 }),
             ),
             Event::Cancel => (8, Value::Null),
+            Event::Hover { region, entered } => {
+                (9, Value::Array(vec![u(*region), Value::Bool(*entered)]))
+            }
         };
         let mut fields = self.address.payload();
         fields.extend([(3, u(self.scene_revision)), (4, u(kind)), (5, payload)]);
@@ -611,7 +622,12 @@ impl InputEvent {
         let event = match map.required_u64(4)? {
             0 => Event::Focus(boolean(payload, 5)?),
             1 => {
-                let a = array::<4>(payload, 5)?;
+                // Four elements is plain motion or a release; six adds the click count and
+                // pressure. Five is deliberately not a valid arity.
+                let a: &[Value] = match payload.as_array() {
+                    Some(a @ [_, _, _, _]) | Some(a @ [_, _, _, _, _, _]) => a,
+                    _ => return Err(bad(5, "pointer payload has an unexpected arity")),
+                };
                 let button = if a[2] == Value::Null {
                     None
                 } else {
@@ -622,11 +638,25 @@ impl InputEvent {
                         boolean(&b[1], 5)?,
                     ))
                 };
+                let (clicks, pressure) = match a {
+                    [_, _, _, _, clicks, pressure] => (
+                        u8::try_from(unsigned(clicks, 5)?)
+                            .map_err(|_| bad(5, "click count exceeds u8"))?,
+                        if *pressure == Value::Null {
+                            None
+                        } else {
+                            Some(decode_scalar(pressure, 5)?)
+                        },
+                    ),
+                    _ => (0, None),
+                };
                 Event::Pointer {
                     position: decode_point(&a[0], 5)?,
                     region: unsigned(&a[1], 5)?,
                     button,
                     modifiers: small(&a[3], 5)?,
+                    clicks,
+                    pressure,
                 }
             }
             2 => {
@@ -695,6 +725,13 @@ impl InputEvent {
                 _ => return Err(bad(5, "unknown dismissal reason")),
             }),
             8 if *payload == Value::Null => Event::Cancel,
+            9 => {
+                let a = array::<2>(payload, 5)?;
+                Event::Hover {
+                    region: unsigned(&a[0], 5)?,
+                    entered: boolean(&a[1], 5)?,
+                }
+            }
             _ => return Err(bad(4, "unknown input event or invalid payload")),
         };
         // A receiver must not dispatch a reserved modifier bit, an unbounded button, or a key
@@ -857,7 +894,7 @@ fn text(value: &Value) -> Result<&str, MessageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overlay::{buttons, keys, modifiers};
+    use crate::overlay::{MAX_CLICKS, buttons, keys, modifiers};
     use crate::{cbor, identity::PresenterInstanceId};
 
     fn owner(id: u64) -> SessionIdentity {
@@ -1038,12 +1075,34 @@ mod tests {
                 region: u64::MAX,
                 button: Some((buttons::MAXIMUM, true)),
                 modifiers: modifiers::KNOWN_MASK,
+                clicks: MAX_CLICKS,
+                pressure: Some(Scalar::ONE),
             },
+            // Plain motion keeps the four-element form, so a host and producer agree on the
+            // common case without either of them carrying the profile's extra fields.
             Event::Pointer {
                 position,
                 region: 0,
                 button: None,
                 modifiers: 0,
+                clicks: 0,
+                pressure: None,
+            },
+            Event::Pointer {
+                position,
+                region: 7,
+                button: Some((buttons::PRIMARY, true)),
+                modifiers: 0,
+                clicks: 1,
+                pressure: None,
+            },
+            Event::Hover {
+                region: 7,
+                entered: true,
+            },
+            Event::Hover {
+                region: 0,
+                entered: false,
             },
             Event::Wheel {
                 position,
@@ -1116,12 +1175,32 @@ mod tests {
                 region: 0,
                 button: None,
                 modifiers: modifiers::KNOWN_MASK | (1 << 6),
+                clicks: 0,
+                pressure: None,
             },
             Event::Pointer {
                 position: Point::new(1., 1.).unwrap(),
                 region: 0,
                 button: Some((buttons::MAXIMUM + 1, true)),
                 modifiers: 0,
+                clicks: 0,
+                pressure: None,
+            },
+            Event::Pointer {
+                position: Point::new(1., 1.).unwrap(),
+                region: 0,
+                button: None,
+                modifiers: 0,
+                clicks: MAX_CLICKS + 1,
+                pressure: None,
+            },
+            Event::Pointer {
+                position: Point::new(1., 1.).unwrap(),
+                region: 0,
+                button: None,
+                modifiers: 0,
+                clicks: 0,
+                pressure: Some(Scalar::new(1.5).unwrap()),
             },
             Event::Wheel {
                 position: Point::new(1., 1.).unwrap(),

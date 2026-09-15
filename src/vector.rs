@@ -84,6 +84,17 @@ impl Limits {
 }
 
 impl Command {
+    /// Whether this command is available only under `overlay-pointer-v1`.
+    pub fn requires_pointer(&self) -> bool {
+        matches!(
+            self,
+            Command::Hit {
+                cursor: Some(_),
+                ..
+            }
+        )
+    }
+
     /// Whether this command is available only under `overlay-paint-v1`. A producer gates its
     /// submissions and a presenter gates compilation on exactly this predicate, so the two
     /// cannot drift apart.
@@ -718,6 +729,77 @@ pub enum HitRole {
     Resize(u8),
     Transparent,
 }
+
+/// The pointer shape a host shows while a region is hovered (`overlay-pointer-v1`).
+///
+/// A closed set rather than a platform cursor name: a host maps these onto whatever its
+/// platform offers, and an unknown shape must fail rather than silently become an arrow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CursorShape {
+    #[default]
+    Default,
+    Pointer,
+    Text,
+    Move,
+    Crosshair,
+    NotAllowed,
+    Grab,
+    Grabbing,
+    Wait,
+    Progress,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    ResizeUpLeft,
+    ResizeUpRight,
+    ResizeDownLeft,
+    ResizeDownRight,
+    ResizeLeftRight,
+    ResizeUpDown,
+}
+impl CursorShape {
+    /// The wire index, which is the declaration order above.
+    pub fn index(self) -> u64 {
+        self as u64
+    }
+    pub fn from_index(index: u64) -> Option<Self> {
+        const ALL: [CursorShape; 20] = [
+            CursorShape::Default,
+            CursorShape::Pointer,
+            CursorShape::Text,
+            CursorShape::Move,
+            CursorShape::Crosshair,
+            CursorShape::NotAllowed,
+            CursorShape::Grab,
+            CursorShape::Grabbing,
+            CursorShape::Wait,
+            CursorShape::Progress,
+            CursorShape::ResizeLeft,
+            CursorShape::ResizeRight,
+            CursorShape::ResizeUp,
+            CursorShape::ResizeDown,
+            CursorShape::ResizeUpLeft,
+            CursorShape::ResizeUpRight,
+            CursorShape::ResizeDownLeft,
+            CursorShape::ResizeDownRight,
+            CursorShape::ResizeLeftRight,
+            CursorShape::ResizeUpDown,
+        ];
+        ALL.get(usize::try_from(index).ok()?).copied()
+    }
+}
+
+/// One hit-test result: the application region, its role, and the cursor it asks for.
+///
+/// A hit test and the cursor it implies are decided from the same compiled scene, so they
+/// travel together rather than being looked up separately and risking a stale pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HitRegion {
+    pub id: u64,
+    pub role: HitRole,
+    pub cursor: Option<CursorShape>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Fill(Path, Brush),
@@ -742,6 +824,8 @@ pub enum Command {
         id: u64,
         path: Path,
         role: HitRole,
+        /// Cursor shown while this region is hovered (overlay-pointer-v1).
+        cursor: Option<CursorShape>,
     },
     /// A blurred rounded rectangle (overlay-paint-v1).
     Shadow(Shadow),
@@ -880,7 +964,7 @@ impl Canvas {
                     }
                     Some(path)
                 }
-                Command::Hit { id, path, role } => {
+                Command::Hit { id, path, role, .. } => {
                     if *id == 0 || !hits.insert(*id) {
                         return Err(InvalidScene("hit region IDs must be nonzero and unique"));
                     }
@@ -1137,17 +1221,29 @@ fn command_value(c: &Command) -> Value {
             rect(*r),
             Value::Unsigned(u64::from(*opacity)),
         ],
-        Command::Hit { id, path: p, role } => vec![
-            Value::Unsigned(9),
-            Value::Unsigned(*id),
-            path(p),
-            Value::Unsigned(match role {
-                HitRole::Input => 0,
-                HitRole::Drag => 1,
-                HitRole::Transparent => 2,
-                HitRole::Resize(e) => 16 + u64::from(*e),
-            }),
-        ],
+        Command::Hit {
+            id,
+            path: p,
+            role,
+            cursor,
+        } => {
+            let mut v = vec![
+                Value::Unsigned(9),
+                Value::Unsigned(*id),
+                path(p),
+                Value::Unsigned(match role {
+                    HitRole::Input => 0,
+                    HitRole::Drag => 1,
+                    HitRole::Transparent => 2,
+                    HitRole::Resize(e) => 16 + u64::from(*e),
+                }),
+            ];
+            // A default cursor is omitted, so a region that asks for nothing encodes as before.
+            if let Some(shape) = cursor {
+                v.push(Value::Unsigned(shape.index()));
+            }
+            v
+        }
         Command::Shadow(shadow) => vec![
             Value::Unsigned(11),
             rect(shadow.rect),
@@ -1269,6 +1365,15 @@ fn parse_path(v: &Value) -> Result<Path> {
     Ok(Path {
         segments,
         even_odd: boolean(rule)?,
+    })
+}
+fn hit_role(v: &Value) -> Result<HitRole> {
+    Ok(match uint(v)? {
+        0 => HitRole::Input,
+        1 => HitRole::Drag,
+        2 => HitRole::Transparent,
+        e @ 17..=31 => HitRole::Resize((e - 16) as u8),
+        _ => return Err(InvalidScene("invalid hit role")),
     })
 }
 fn parse_stops(v: &Value) -> Result<Vec<GradientStop>> {
@@ -1395,13 +1500,17 @@ fn parse_command(v: &Value) -> Result<Command> {
         [Value::Unsigned(9), id, p, role] => Ok(Command::Hit {
             id: uint(id)?,
             path: parse_path(p)?,
-            role: match uint(role)? {
-                0 => HitRole::Input,
-                1 => HitRole::Drag,
-                2 => HitRole::Transparent,
-                e @ 17..=31 => HitRole::Resize((e - 16) as u8),
-                _ => return Err(InvalidScene("invalid hit role")),
-            },
+            role: hit_role(role)?,
+            cursor: None,
+        }),
+        [Value::Unsigned(9), id, p, role, cursor] => Ok(Command::Hit {
+            id: uint(id)?,
+            path: parse_path(p)?,
+            role: hit_role(role)?,
+            cursor: Some(
+                CursorShape::from_index(uint(cursor)?)
+                    .ok_or(InvalidScene("unknown cursor shape"))?,
+            ),
         }),
         [
             Value::Unsigned(11),
@@ -1795,6 +1904,7 @@ mod tests {
             id: u64::MAX,
             path: p,
             role: HitRole::Drag,
+            cursor: None,
         })
         .unwrap();
         assert_eq!(Canvas::decode(&c.encode().unwrap()).unwrap(), c);

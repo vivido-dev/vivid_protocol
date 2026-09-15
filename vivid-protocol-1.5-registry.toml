@@ -1120,3 +1120,8 @@ prerequisites = ["overlay-text-layout-v1"]
 name = "overlay-paint-v1"
 state = "standards-track"
 prerequisites = ["terminal-overlay-v1"]
+
+[[profile]]
+name = "overlay-pointer-v1"
+state = "standards-track"
+prerequisites = ["terminal-overlay-v1"]

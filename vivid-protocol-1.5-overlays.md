@@ -117,7 +117,7 @@ and non-sRGB gradient spaces require `overlay-paint-v1`.
 | 6 | opacity: set drawing opacity |
 | 7 | text, origin, size, family, weight, italic, color, optional maximum width |
 | 8 | asset ID, rectangle, opacity |
-| 9 | nonzero unique application region ID, path, role |
+| 9 | nonzero unique application region ID, path, role, optional cursor shape |
 | 11 | rectangle, four corner radii, color, offset, blur, spread, inset: shadow |
 | 12 | path, brush, positive width, cap, join, miter limit, dash array or null, dash offset |
 
@@ -218,7 +218,7 @@ a scene-revision boundary; dispatch for older queued events remains associated w
 | Event type | Key 5 payload |
 | --- | --- |
 | 0 focus | boolean |
-| 1 pointer | `[point, region_id, button_or_null, modifiers]` |
+| 1 pointer | `[point, region_id, button_or_null, modifiers]` or `[point, region_id, button_or_null, modifiers, clicks, pressure_or_null]` |
 | 2 wheel | `[point, delta_x, delta_y, modifiers, precise_boolean, phase]` |
 | 3 key | `[physical_key, down, repeat, modifiers]` |
 | 4 committed text | UTF-8 text |
@@ -226,6 +226,7 @@ a scene-revision boundary; dispatch for older queued events remains associated w
 | 6 geometry | `[rectangle, settled_boolean]` |
 | 7 dismissed | reason: Escape=0, outside press=1, explicit close=2, owner loss=3, parent close=4 |
 | 8 cancel | null |
+| 9 hover | `[region_id, entered_boolean]` |
 
 Points, rectangles, and wheel deltas use the drawing codec's Q32.32 geometry. Region IDs are u64
 (zero denotes the default rectangular hit region). An IME selection is `[start_byte, end_byte]`
@@ -475,3 +476,42 @@ remain unreleased when the scene is decoded; a missing asset fails the whole lis
 Shadow commands are charged against the negotiated command budget like any other; they carry no
 path segments. Dash entries and paint extents are bounded by profile ceilings rather than
 negotiated limits, so the twelve-field vector-limits extension is unchanged.
+
+## Pointer commands and events
+
+The `overlay-pointer-v1` profile adds the cursor a region asks for, hover transitions, click
+counting, and pressure. Its prerequisite is `terminal-overlay-v1`. A presenter that did not
+accept the profile MUST NOT emit the events below and MUST reject a display list carrying a
+cursor; a producer that did not negotiate it MUST NOT send one.
+
+A hit region may carry one trailing element selecting the cursor a host shows while the pointer
+is inside it: 0 default, 1 pointer, 2 text, 3 move, 4 crosshair, 5 not-allowed, 6 grab, 7
+grabbing, 8 wait, 9 progress, 10-13 resize left, right, up, down, 14-17 resize up-left, up-right,
+down-left, down-right, 18 resize left-right, and 19 resize up-down. A region that asks for
+nothing omits the element and encodes exactly as before, and an unknown index MUST be refused
+rather than quietly becoming a default arrow. The cursor travels with the region because the two
+are decided from the same compiled scene; looking one up separately could pair a stale cursor
+with a new region. While a region holds pointer capture, its cursor remains in effect even when
+the pointer leaves it, so a gesture does not flicker mid-drag.
+
+The pointer event gains two trailing elements when either is meaningful: the click count, and
+the pressure. A payload of four elements remains valid and means motion or a release with no
+pressure; six elements carry both. Five elements is deliberately invalid, so an encoder cannot
+emit a payload whose fields are ambiguous.
+
+- The **click count** is 1 to 3 for a press and 0 otherwise. A host counts clicks from its own
+  double-click policy, so a producer never has to reproduce platform timing. A fourth press in
+  one sequence restarts at one.
+- The **pressure** is a Q32.32 value from 0 to 1, or null when the device reports none. A host
+  MUST NOT invent a value for hardware with no such sensor: null and zero are different claims.
+
+Event type 9 reports a hover transition: `[region_id, entered_boolean]`. A host emits one leave
+and one enter each time the hovered region changes, including when the pointer leaves every
+window, when it crosses between windows, and when a newly published scene removes or replaces
+the region under a stationary pointer. A producer driving hover styling therefore never has to
+diff pointer events, and never misses a transition that happened while it was not looking. A
+leave for a region whose window is being destroyed precedes that window's dismissal.
+
+Hover is a single slot per host: one pointer means at most one hovered region at a time. A drag
+or resize gesture deliberately does not re-evaluate hover as it passes over other regions; the
+release does.

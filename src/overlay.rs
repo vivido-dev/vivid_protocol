@@ -4,7 +4,7 @@
 //! performs OS input injection and never treats a surface ID without its owner as an identity.
 
 use crate::identity::{SessionIdentity, SurfaceIdentity};
-use crate::vector::{HitRole, InvalidScene, Point, Rect, Scalar};
+use crate::vector::{CursorShape, HitRegion, HitRole, InvalidScene, Point, Rect, Scalar};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub mod wire;
@@ -12,6 +12,8 @@ pub mod wire;
 pub const MAX_WINDOWS: usize = 256;
 pub const MAX_WINDOWS_PER_OWNER: usize = 32;
 pub const MAX_PENDING_EVENTS: usize = 256;
+/// A press sequence longer than this restarts at one, exactly as a fourth terminal click does.
+pub const MAX_CLICKS: u8 = 3;
 pub const MAX_EVENT_TEXT_BYTES: usize = 4096;
 pub const MAX_EVENT_QUEUE_BYTES: usize = 128 * 1024;
 pub const MAX_OWNERS: usize = 16;
@@ -131,6 +133,22 @@ pub enum Event {
         region: u64,
         button: Option<(u16, bool)>,
         modifiers: u32,
+        /// 1-3 for a press, 0 for motion or a release (overlay-pointer-v1). A host counts clicks
+        /// from its own double-click policy; a producer never has to reproduce that timing.
+        clicks: u8,
+        /// Normalized 0-1 from a device that reports pressure, absent when it reported none.
+        /// A host MUST NOT invent a value for hardware that has no such sensor.
+        pressure: Option<Scalar>,
+    },
+    /// The pointer entered or left one region (overlay-pointer-v1).
+    ///
+    /// Emitted whenever the hovered region changes, including when a new scene removes the
+    /// region under the pointer, so a producer can drive hover styling without diffing pointer
+    /// events and without missing a transition it never saw.
+    Hover {
+        /// The region being entered or left. Zero is the default window rectangle.
+        region: u64,
+        entered: bool,
     },
     Wheel {
         position: Point,
@@ -179,6 +197,18 @@ pub struct Window {
     pub options: WindowOptions,
 }
 
+/// One pointer report: where it is, what changed, and what the device measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerReport {
+    pub position: Point,
+    pub button: Option<(u16, bool)>,
+    pub modifiers: u32,
+    /// 1-3 for a press, 0 for motion or a release.
+    pub clicks: u8,
+    /// Absent when the device reported no pressure rather than reporting zero.
+    pub pressure: Option<Scalar>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Capture {
     window: SurfaceIdentity,
@@ -186,6 +216,17 @@ struct Capture {
     start: Point,
     bounds: Rect,
     region: u64,
+    /// The captured region's cursor, so a drag keeps the shape it started with.
+    cursor: Option<CursorShape>,
+}
+
+/// The region the pointer currently sits in. One pointer means one hover at a time, even with
+/// several windows open.
+#[derive(Debug, Clone, Copy)]
+struct Hover {
+    window: SurfaceIdentity,
+    region: u64,
+    cursor: Option<CursorShape>,
 }
 
 #[derive(Debug, Default)]
@@ -193,6 +234,7 @@ pub struct Windows {
     windows: BTreeMap<SurfaceIdentity, Window>,
     stack: Vec<SurfaceIdentity>,
     focus: Option<SurfaceIdentity>,
+    hover: Option<Hover>,
     focus_history: Vec<SurfaceIdentity>,
     swallowed_buttons: BTreeSet<u16>,
     swallowed_escape: bool,
@@ -583,6 +625,10 @@ impl Windows {
     }
     fn remove_one(&mut self, id: SurfaceIdentity, reason: DismissReason) {
         self.cancel_capture(id);
+        if self.hover.is_some_and(|hover| hover.window == id) {
+            // The region is going away, so the leave is emitted while its window still exists.
+            self.set_hover(None);
+        }
         if self.focus == Some(id) {
             self.change_focus(None);
         }
@@ -698,6 +744,10 @@ impl Windows {
             start: position,
             bounds: w.options.bounds,
             region: 0,
+            cursor: self
+                .hover
+                .filter(|hover| hover.window == id)
+                .and_then(|hover| hover.cursor),
         });
         Ok(())
     }
@@ -788,11 +838,16 @@ impl Windows {
     /// None is input-transparent; a default rectangular hit is the compiler's responsibility.
     pub fn pointer(
         &mut self,
-        position: Point,
-        button: Option<(u16, bool)>,
-        modifiers: u32,
-        hit: impl Fn(SurfaceIdentity, Point) -> Option<(u64, HitRole)>,
+        report: PointerReport,
+        hit: impl Fn(SurfaceIdentity, Point) -> Option<HitRegion>,
     ) -> bool {
+        let PointerReport {
+            position,
+            button,
+            modifiers,
+            clicks,
+            pressure,
+        } = report;
         if let Some((button_id, down)) = button {
             if self.swallowed_buttons.contains(&button_id) {
                 if !down {
@@ -816,11 +871,16 @@ impl Windows {
                         region: capture.region,
                         button,
                         modifiers,
+                        clicks,
+                        pressure,
                     },
                 );
             }
             if button.is_some_and(|(_, down)| !down) {
                 self.capture = None;
+                // A drag deliberately does not retrigger hover as it passes over regions, so
+                // the release is where the pointer's hover is finally re-evaluated.
+                self.refresh_hover(position, &hit);
             }
             return true;
         }
@@ -839,8 +899,57 @@ impl Windows {
                 return true;
             }
         }
-        let target = self
-            .stack
+        let Some((id, local, target)) = self.target_at(position, &hit) else {
+            // Leaving every window is a hover transition like any other.
+            self.set_hover(None);
+            let blocked = self.top_modal().is_some();
+            if !blocked && button.is_some_and(|(_, down)| down) {
+                self.change_focus(None);
+                self.focus_history.clear();
+            }
+            return blocked;
+        };
+        if button.is_some_and(|(_, down)| down) {
+            let _ = self.request_focus(id);
+            if matches!(target.role, HitRole::Drag | HitRole::Resize(_))
+                && let Some(w) = self.windows.get(&id)
+            {
+                self.capture = Some(Capture {
+                    window: id,
+                    role: target.role,
+                    start: position,
+                    bounds: w.options.bounds,
+                    region: target.id,
+                    cursor: target.cursor,
+                });
+            }
+        }
+        self.set_hover(Some(Hover {
+            window: id,
+            region: target.id,
+            cursor: target.cursor,
+        }));
+        self.emit(
+            id,
+            Event::Pointer {
+                position: local,
+                region: target.id,
+                button,
+                modifiers,
+                clicks,
+                pressure,
+            },
+        );
+        true
+    }
+
+    /// The window, window-local point and region under a viewport point.
+    fn target_at(
+        &self,
+        position: Point,
+        hit: &impl Fn(SurfaceIdentity, Point) -> Option<HitRegion>,
+    ) -> Option<(SurfaceIdentity, Point, HitRegion)> {
+        self.stack
             .iter()
             .rev()
             .copied()
@@ -851,45 +960,69 @@ impl Windows {
                     return None;
                 }
                 let local = self.local(id, position)?;
-                let (region, role) = hit(id, local)?;
-                if role == HitRole::Transparent {
-                    return None;
-                }
-                Some((id, local, region, role))
-            });
-        let Some((id, local, region, role)) = target else {
-            let blocked = self.top_modal().is_some();
-            if !blocked && button.is_some_and(|(_, down)| down) {
-                self.change_focus(None);
-                self.focus_history.clear();
-            }
-            return blocked;
-        };
-        if button.is_some_and(|(_, down)| down) {
-            let _ = self.request_focus(id);
-            if matches!(role, HitRole::Drag | HitRole::Resize(_))
-                && let Some(w) = self.windows.get(&id)
-            {
-                self.capture = Some(Capture {
-                    window: id,
-                    role,
-                    start: position,
-                    bounds: w.options.bounds,
-                    region,
-                });
-            }
-        }
-        self.emit(
-            id,
-            Event::Pointer {
-                position: local,
-                region,
-                button,
-                modifiers,
-            },
-        );
-        true
+                let target = hit(id, local)?;
+                (target.role != HitRole::Transparent).then_some((id, local, target))
+            })
     }
+
+    /// Re-evaluate hover after the scene under the pointer changed.
+    ///
+    /// A new scene can add, remove, or reshape the region beneath a stationary pointer, and a
+    /// producer must not have to synthesise the resulting leave or enter from a later motion.
+    pub fn refresh_hover(
+        &mut self,
+        position: Point,
+        hit: &impl Fn(SurfaceIdentity, Point) -> Option<HitRegion>,
+    ) {
+        match self.target_at(position, hit) {
+            Some((id, _, target)) => self.set_hover(Some(Hover {
+                window: id,
+                region: target.id,
+                cursor: target.cursor,
+            })),
+            None => self.set_hover(None),
+        }
+    }
+
+    fn set_hover(&mut self, next: Option<Hover>) {
+        let same = match (self.hover, next) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.window == b.window && a.region == b.region,
+            _ => false,
+        };
+        if same {
+            // The region is unchanged, but a replacement scene may have restyled it.
+            self.hover = next;
+            return;
+        }
+        if let Some(previous) = self.hover {
+            self.emit(
+                previous.window,
+                Event::Hover {
+                    region: previous.region,
+                    entered: false,
+                },
+            );
+        }
+        self.hover = next;
+        if let Some(current) = next {
+            self.emit(
+                current.window,
+                Event::Hover {
+                    region: current.region,
+                    entered: true,
+                },
+            );
+        }
+    }
+
+    /// The cursor the pointer calls for: a captured region keeps the shape it started with.
+    pub fn cursor(&self) -> Option<CursorShape> {
+        self.capture
+            .and_then(|capture| capture.cursor)
+            .or_else(|| self.hover.and_then(|hover| hover.cursor))
+    }
+
     fn local(&self, id: SurfaceIdentity, p: Point) -> Option<Point> {
         let r = self.windows.get(&id)?.options.bounds;
         Point::new(p.x.get() - r.origin.x.get(), p.y.get() - r.origin.y.get()).ok()
@@ -954,10 +1087,16 @@ fn event_bytes(event: &Event) -> usize {
 fn valid_event(event: &Event) -> bool {
     match event {
         Event::Pointer {
-            button, modifiers, ..
+            button,
+            modifiers,
+            clicks,
+            pressure,
+            ..
         } => {
             modifiers & !modifiers::KNOWN_MASK == 0
                 && button.is_none_or(|(button, _)| button <= buttons::MAXIMUM)
+                && *clicks <= MAX_CLICKS
+                && pressure.is_none_or(|p| p >= Scalar::ZERO && p <= Scalar::ONE)
         }
         Event::Wheel { modifiers, .. } => modifiers & !modifiers::KNOWN_MASK == 0,
         Event::Key {
@@ -1025,6 +1164,30 @@ mod tests {
         assert_eq!(windows.capture.map(|c| c.start), Some(origin));
         windows.release_pointer(id);
         assert!(!windows.has_pointer_capture());
+    }
+    /// A plain report at one point, with no button, click count, or pressure.
+    fn at(x: f64, y: f64) -> PointerReport {
+        PointerReport {
+            position: Point::new(x, y).unwrap(),
+            button: None,
+            modifiers: 0,
+            clicks: 0,
+            pressure: None,
+        }
+    }
+    /// A press of the primary button at one point.
+    fn press(x: f64, y: f64) -> PointerReport {
+        PointerReport {
+            button: Some((0, true)),
+            ..at(x, y)
+        }
+    }
+    fn region(id: u64, role: HitRole) -> HitRegion {
+        HitRegion {
+            id,
+            role,
+            cursor: None,
+        }
     }
     fn key(owner: u64, id: u64) -> SurfaceIdentity {
         SessionIdentity::new(PresenterInstanceId([1; 16]), owner)
@@ -1121,11 +1284,20 @@ mod tests {
         }
         state.publish_scene(a, 1, 10).unwrap();
         state.publish_scene(b, 1, 30).unwrap();
-        let p = Point::new(20., 20.).unwrap();
-        let hits = |id, _| (id == a).then_some((1, HitRole::Input));
-        state.pointer(p, None, 0, hits);
+        let hits = |id, _| (id == a).then_some(region(1, HitRole::Input));
+        state.pointer(at(20., 20.), hits);
         state.publish_scene(a, 1, 11).unwrap();
-        state.pointer(p, None, 0, hits);
+        state.pointer(at(20., 20.), hits);
+        // The enter is stamped with the scene it was decided against, like the motion beside it.
+        let enter = state.take_event(a.context.session).unwrap();
+        assert!(matches!(
+            enter.event,
+            Event::Hover {
+                region: 1,
+                entered: true
+            }
+        ));
+        assert_eq!(enter.scene_revision, 10);
         assert_eq!(
             state.take_event(a.context.session).unwrap().scene_revision,
             10
@@ -1180,6 +1352,194 @@ mod tests {
         assert!(!state.wheel(outside, scroll, 0, |_, _| None));
         assert_eq!(state.focus(), Some(b));
     }
+    /// Drain one owner's events as a compact script, so an ordering assertion reads as the
+    /// sequence a producer would actually act on.
+    fn script(s: &mut Windows, owner: SessionIdentity) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(event) = s.take_event(owner) {
+            out.push(match event.event {
+                Event::Hover { region, entered } => {
+                    format!("{} {region}", if entered { "enter" } else { "leave" })
+                }
+                Event::Pointer { region, button, .. } => match button {
+                    Some((_, true)) => format!("press {region}"),
+                    Some((_, false)) => format!("release {region}"),
+                    None => format!("move {region}"),
+                },
+                Event::Dismissed(_) => "dismissed".to_owned(),
+                Event::Focus(true) => "focus on".to_owned(),
+                Event::Focus(false) => "focus off".to_owned(),
+                Event::Geometry { settled: true, .. } => "geometry settled".to_owned(),
+                Event::Geometry { settled: false, .. } => "geometry".to_owned(),
+                other => format!("{other:?}"),
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn hover_emits_one_transition_per_change() {
+        let a = key(1, 1);
+        let b = key(1, 2);
+        let mut s = Windows::default();
+        s.create(a, 1, options(WindowMode::Floating)).unwrap();
+        let mut second = options(WindowMode::Floating);
+        second.bounds = Rect::new(300., 300., 100., 80.).unwrap();
+        s.create(b, 1, second).unwrap();
+        // Two regions inside the first window, so a move between them is a transition too.
+        let inside_a = |id, point: Point| {
+            (id == a).then(|| {
+                if point.x.get() < 50. {
+                    region(1, HitRole::Input)
+                } else {
+                    region(2, HitRole::Input)
+                }
+            })
+        };
+        let mut moves = Vec::new();
+        for (x, y) in [
+            (10., 10.),
+            // Moving to the second region is a transition even though the window is the same.
+            (60., 10.),
+            // Re-reporting the same position changes nothing.
+            (60., 10.),
+            // Leaving every window is a leave like any other.
+            (900., 900.),
+            (10., 10.),
+            (60., 10.),
+            (900., 900.),
+        ] {
+            s.pointer(at(x, y), inside_a);
+            moves.extend(script(&mut s, a.context.session));
+        }
+        assert_eq!(
+            moves,
+            vec![
+                "enter 1", "move 1", "leave 1", "enter 2", "move 2", "move 2", "leave 2",
+                "enter 1", "move 1", "leave 1", "enter 2", "move 2", "leave 2",
+            ]
+        );
+
+        // Crossing into another window leaves the first before entering the second.
+        let cross = |id, point: Point| {
+            if id == a {
+                return Some(region(1, HitRole::Input));
+            }
+            (id == b && point.x.get() < 50.).then_some(region(9, HitRole::Input))
+        };
+        s.pointer(at(10., 10.), cross);
+        s.pointer(at(310., 310.), cross);
+        assert_eq!(
+            script(&mut s, a.context.session),
+            vec!["enter 1", "move 1", "leave 1", "enter 9", "move 9"]
+        );
+    }
+
+    #[test]
+    fn a_replacement_scene_retires_the_hovered_region() {
+        // A new scene can remove the region under a stationary pointer; the producer must not
+        // have to wait for the next motion to learn that it is no longer hovered.
+        let a = key(1, 1);
+        let mut s = Windows::default();
+        s.create(a, 1, options(WindowMode::Floating)).unwrap();
+        let p = Point::new(20., 20.).unwrap();
+        s.pointer(at(20., 20.), |_, _| Some(region(1, HitRole::Input)));
+        assert_eq!(script(&mut s, a.context.session), vec!["enter 1", "move 1"]);
+
+        // The replacement declares nothing under the pointer.
+        s.refresh_hover(p, &|_, _| None);
+        assert_eq!(script(&mut s, a.context.session), vec!["leave 1"]);
+        // Re-evaluating the same state again emits nothing.
+        s.refresh_hover(p, &|_, _| None);
+        assert!(s.take_event(a.context.session).is_none());
+    }
+
+    #[test]
+    fn a_captured_region_keeps_its_cursor_after_the_pointer_leaves_it() {
+        let a = key(1, 1);
+        let mut s = Windows::default();
+        s.create(a, 1, options(WindowMode::Floating)).unwrap();
+        // A right-edge resize keeps the window's origin still, so the pointer can genuinely
+        // leave the region mid-gesture; a drag would carry the region along with it.
+        let edge = |id, point: Point| {
+            (id == a && point.x.get() < 50.).then_some(HitRegion {
+                id: 4,
+                role: HitRole::Resize(2),
+                cursor: Some(CursorShape::ResizeRight),
+            })
+        };
+        s.pointer(press(20., 20.), edge);
+        assert_eq!(s.cursor(), Some(CursorShape::ResizeRight));
+        assert_eq!(
+            script(&mut s, a.context.session),
+            vec!["focus on", "enter 4", "press 4"]
+        );
+
+        // Past the region's right edge: the gesture must not revert the shape it started with.
+        s.pointer(at(95., 20.), edge);
+        assert_eq!(s.cursor(), Some(CursorShape::ResizeRight));
+        assert_eq!(script(&mut s, a.context.session), vec!["geometry"]);
+
+        // The release ends the gesture, and that is where hover is re-evaluated.
+        s.pointer(
+            PointerReport {
+                button: Some((0, false)),
+                ..at(95., 20.)
+            },
+            edge,
+        );
+        assert_eq!(s.cursor(), None);
+        assert_eq!(
+            script(&mut s, a.context.session),
+            vec!["geometry settled", "leave 4"]
+        );
+    }
+
+    #[test]
+    fn closing_a_window_ends_its_hover() {
+        let a = key(1, 1);
+        let mut s = Windows::default();
+        s.create(a, 1, options(WindowMode::Floating)).unwrap();
+        s.pointer(at(20., 20.), |_, _| Some(region(1, HitRole::Input)));
+        assert_eq!(script(&mut s, a.context.session), vec!["enter 1", "move 1"]);
+        s.close(a, DismissReason::Closed);
+        // The leave precedes the dismissal, so a producer styling on hover clears it in order.
+        assert_eq!(
+            script(&mut s, a.context.session),
+            vec!["leave 1", "dismissed"]
+        );
+    }
+
+    #[test]
+    fn cursor_shapes_are_a_closed_bounded_set() {
+        for shape in [
+            CursorShape::Default,
+            CursorShape::Pointer,
+            CursorShape::Text,
+            CursorShape::Move,
+            CursorShape::Crosshair,
+            CursorShape::NotAllowed,
+            CursorShape::Grab,
+            CursorShape::Grabbing,
+            CursorShape::Wait,
+            CursorShape::Progress,
+            CursorShape::ResizeLeft,
+            CursorShape::ResizeRight,
+            CursorShape::ResizeUp,
+            CursorShape::ResizeDown,
+            CursorShape::ResizeUpLeft,
+            CursorShape::ResizeUpRight,
+            CursorShape::ResizeDownLeft,
+            CursorShape::ResizeDownRight,
+            CursorShape::ResizeLeftRight,
+            CursorShape::ResizeUpDown,
+        ] {
+            assert_eq!(CursorShape::from_index(shape.index()), Some(shape));
+        }
+        assert_eq!(CursorShape::from_index(20), None);
+        assert_eq!(CursorShape::from_index(u64::MAX), None);
+    }
+
     #[test]
     fn modal_focus_and_owner_cleanup_are_isolated() {
         let a = key(1, 1);
@@ -1189,12 +1549,7 @@ mod tests {
         s.request_focus(b).unwrap();
         s.create(a, 1, options(WindowMode::Modal)).unwrap();
         assert!(s.request_focus(b).is_err());
-        assert!(s.pointer(
-            Point::new(500.0, 500.0).unwrap(),
-            Some((1, true)),
-            0,
-            |_, _| None
-        ));
+        assert!(s.pointer(press(500., 500.), |_, _| None));
         s.revoke_owner(a.context.session);
         assert!(s.get(a).is_none());
         assert!(s.get(b).is_some());
@@ -1205,24 +1560,18 @@ mod tests {
         let a = key(1, 1);
         let mut s = Windows::default();
         s.create(a, 1, options(WindowMode::Popup)).unwrap();
-        assert!(s.pointer(
-            Point::new(0.0, 0.0).unwrap(),
-            Some((1, true)),
-            0,
-            |_, _| panic!("dismissal must not hit-test underneath")
-        ));
+        assert!(s.pointer(press(0., 0.), |_, _| panic!(
+            "dismissal must not hit-test underneath"
+        )));
         assert!(s.get(a).is_none());
         assert!(s.pointer(
-            Point::new(0.0, 0.0).unwrap(),
-            Some((1, false)),
-            0,
+            PointerReport {
+                button: Some((0, false)),
+                ..at(0., 0.)
+            },
             |_, _| panic!("release must not click through")
         ));
-        assert!(
-            !s.pointer(Point::new(0.0, 0.0).unwrap(), Some((1, true)), 0, |_, _| {
-                None
-            })
-        );
+        assert!(!s.pointer(press(0., 0.), |_, _| None));
     }
     #[test]
     fn escape_dismisses_one_window_and_consumes_repeat_and_release() {
@@ -1249,12 +1598,7 @@ mod tests {
         s.create(key(1, 1), 1, options(WindowMode::Floating))
             .unwrap();
         s.request_focus(key(1, 1)).unwrap();
-        assert!(!s.pointer(
-            Point::new(400., 400.).unwrap(),
-            Some((1, true)),
-            0,
-            |_, _| None
-        ));
+        assert!(!s.pointer(press(400., 400.), |_, _| None));
         assert_eq!(s.focus(), None);
         assert!(!s.keyboard(Event::Text("terminal".into()), false));
     }
@@ -1335,13 +1679,8 @@ mod tests {
         let a = key(1, 1);
         let mut s = Windows::default();
         s.create(a, 1, options(WindowMode::Floating)).unwrap();
-        s.pointer(
-            Point::new(20.0, 20.0).unwrap(),
-            Some((1, true)),
-            0,
-            |_, _| Some((1, HitRole::Drag)),
-        );
-        s.pointer(Point::new(35.0, 45.0).unwrap(), None, 0, |_, _| None);
+        s.pointer(press(20., 20.), |_, _| Some(region(1, HitRole::Drag)));
+        s.pointer(at(35., 45.), |_, _| None);
         let w = s.get(a).unwrap();
         assert_eq!(w.options.bounds.origin, Point::new(25.0, 35.0).unwrap());
         assert_eq!(w.generation, 1);
