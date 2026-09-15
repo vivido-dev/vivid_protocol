@@ -9,7 +9,10 @@ use crate::identity::{SessionIdentity, SurfaceIdentity};
 use crate::messages::{MessageError, PayloadMap, StrictMap, invalid_value, validate_header_object};
 use crate::vector::{Point, Rect, Scalar};
 
-use super::{DismissReason, Event, ScrollPhase, WindowMode, WindowOptions, valid_event};
+use super::{
+    AccessibleAction, DismissReason, Event, ScrollPhase, SemanticNode, SemanticRole, Semantics,
+    Toggled, WindowMode, WindowOptions, valid_event,
+};
 
 const SCHEMA: &str = "overlay";
 
@@ -607,6 +610,9 @@ impl InputEvent {
                 }),
             ),
             Event::Cancel => (8, Value::Null),
+            Event::Accessibility { node, action } => {
+                (10, Value::Array(vec![u(*node), u(action.index())]))
+            }
             Event::Hover { region, entered } => {
                 (9, Value::Array(vec![u(*region), Value::Bool(*entered)]))
             }
@@ -732,6 +738,18 @@ impl InputEvent {
                     entered: boolean(&a[1], 5)?,
                 }
             }
+            10 => {
+                let a = array::<2>(payload, 5)?;
+                let node = unsigned(&a[0], 5)?;
+                if node == 0 {
+                    return Err(bad(5, "an accessibility action requires a nonzero node"));
+                }
+                Event::Accessibility {
+                    node,
+                    action: AccessibleAction::from_index(unsigned(&a[1], 5)?)
+                        .ok_or(bad(5, "unknown accessible action"))?,
+                }
+            }
             _ => return Err(bad(4, "unknown input event or invalid payload")),
         };
         // A receiver must not dispatch a reserved modifier bit, an unbounded button, or a key
@@ -745,6 +763,200 @@ impl InputEvent {
             event,
         })
     }
+}
+
+/// A window's complete semantic tree for one published scene (`overlay-a11y-v1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetSemantics {
+    pub address: WindowAddress,
+    pub semantics: Semantics,
+}
+impl SetSemantics {
+    pub fn payload(&self) -> Result<PayloadMap, MessageError> {
+        self.address.validate(self.address.surface_id)?;
+        self.semantics
+            .validate()
+            .map_err(|_| bad(4, "invalid semantic tree"))?;
+        let nodes = self
+            .semantics
+            .nodes
+            .iter()
+            .map(node_value)
+            .collect::<Result<Vec<_>, MessageError>>()?;
+        let mut fields = self.address.payload();
+        fields.push((3, u(self.semantics.scene_revision)));
+        fields.push((4, Value::Array(nodes)));
+        Ok(fields)
+    }
+    pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
+        let map = strict(value, &[0, 1, 2, 3, 4])?;
+        let address = WindowAddress::decode(object, &map)?;
+        let list = array_as_slice(map.required(4)?, 4)?;
+        if list.is_empty() || list.len() > super::MAX_SEMANTIC_NODES {
+            return Err(bad(4, "invalid semantic tree size"));
+        }
+        let mut nodes = Vec::with_capacity(list.len());
+        for node in list {
+            nodes.push(parse_node(node)?);
+        }
+        let semantics = Semantics {
+            scene_revision: map.required_u64(3)?,
+            nodes,
+        };
+        semantics
+            .validate()
+            .map_err(|_| bad(4, "invalid semantic tree"))?;
+        Ok(Self { address, semantics })
+    }
+}
+
+fn node_value(node: &SemanticNode) -> Result<Value, MessageError> {
+    let mut fields = vec![
+        (0, u(node.id)),
+        (1, u(node.role.index())),
+        (2, rectangle(node.bounds)),
+    ];
+    if !node.label.is_empty() {
+        fields.push((3, Value::Text(node.label.clone())));
+    }
+    if let Some([value, minimum, maximum]) = node.numeric {
+        fields.push((
+            4,
+            Value::Array(vec![scalar(value), scalar(minimum), scalar(maximum)]),
+        ));
+    }
+    if let Some(level) = node.level {
+        fields.push((5, u(u64::from(level))));
+    }
+    if let Some([position, size]) = node.set {
+        fields.push((
+            6,
+            Value::Array(vec![u(u64::from(position)), u(u64::from(size))]),
+        ));
+    }
+    if let Some(toggled) = node.toggled {
+        fields.push((
+            7,
+            u(match toggled {
+                Toggled::Off => 0,
+                Toggled::On => 1,
+                Toggled::Mixed => 2,
+            }),
+        ));
+    }
+    if node.disabled {
+        fields.push((8, Value::Bool(true)));
+    }
+    if !node.actions.is_empty() {
+        fields.push((
+            9,
+            Value::Array(node.actions.iter().map(|a| u(a.index())).collect()),
+        ));
+    }
+    if !node.children.is_empty() {
+        fields.push((
+            10,
+            Value::Array(node.children.iter().map(|c| u(u64::from(*c))).collect()),
+        ));
+    }
+    Ok(Value::Map(fields))
+}
+
+fn parse_node(value: &Value) -> Result<SemanticNode, MessageError> {
+    let map = strict(value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
+    let id = map.required_u64(0)?;
+    if id == 0 {
+        return Err(bad(0, "semantic node ID must be nonzero"));
+    }
+    let role =
+        SemanticRole::from_index(map.required_u64(1)?).ok_or(bad(1, "unknown semantic role"))?;
+    let bounds = decode_rectangle(map.required(2)?, 2)?;
+    let label = match map.optional(3) {
+        None => String::new(),
+        Some(Value::Text(text)) => text.clone(),
+        Some(_) => return Err(bad(3, "semantic label must be text")),
+    };
+    let numeric = match map.optional(4) {
+        None => None,
+        Some(value) => {
+            let a = array::<3>(value, 4)?;
+            Some([
+                decode_scalar(&a[0], 4)?,
+                decode_scalar(&a[1], 4)?,
+                decode_scalar(&a[2], 4)?,
+            ])
+        }
+    };
+    let level = match map.optional(5) {
+        None => None,
+        Some(value) => Some(
+            u8::try_from(unsigned(value, 5)?).map_err(|_| bad(5, "heading level exceeds u8"))?,
+        ),
+    };
+    let set = match map.optional(6) {
+        None => None,
+        Some(value) => {
+            let a = array::<2>(value, 6)?;
+            Some([
+                u16::try_from(unsigned(&a[0], 6)?)
+                    .map_err(|_| bad(6, "set position exceeds u16"))?,
+                u16::try_from(unsigned(&a[1], 6)?).map_err(|_| bad(6, "set size exceeds u16"))?,
+            ])
+        }
+    };
+    let toggled = match map.optional(7) {
+        None => None,
+        Some(value) => Some(match unsigned(value, 7)? {
+            0 => Toggled::Off,
+            1 => Toggled::On,
+            2 => Toggled::Mixed,
+            _ => return Err(bad(7, "unknown toggled state")),
+        }),
+    };
+    let disabled = match map.optional(8) {
+        None => false,
+        Some(value) => boolean(value, 8)?,
+    };
+    let actions = match map.optional(9) {
+        None => Vec::new(),
+        Some(value) => {
+            let list = array_as_slice(value, 9)?;
+            if list.len() > super::MAX_SEMANTIC_ACTIONS {
+                return Err(bad(9, "semantic node lists too many actions"));
+            }
+            list.iter()
+                .map(|value| {
+                    AccessibleAction::from_index(unsigned(value, 9)?)
+                        .ok_or(bad(9, "unknown accessible action"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    let children = match map.optional(10) {
+        None => Vec::new(),
+        Some(value) => {
+            let list = array_as_slice(value, 10)?;
+            list.iter()
+                .map(|value| {
+                    u32::try_from(unsigned(value, 10)?)
+                        .map_err(|_| bad(10, "semantic child index exceeds u32"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    Ok(SemanticNode {
+        id,
+        role,
+        bounds,
+        label,
+        numeric,
+        level,
+        set,
+        toggled,
+        disabled,
+        actions,
+        children,
+    })
 }
 
 /// A request to place text on the user's clipboard (`overlay-clipboard-v1`).
@@ -982,6 +1194,10 @@ fn small(value: &Value, key: u64) -> Result<u32, MessageError> {
 }
 fn boolean(value: &Value, key: u64) -> Result<bool, MessageError> {
     value.as_bool().ok_or(bad(key, "expected boolean"))
+}
+/// A variable-length array, for the two lists a node may carry.
+fn array_as_slice(value: &Value, key: u64) -> Result<&[Value], MessageError> {
+    value.as_array().ok_or(bad(key, "invalid array type"))
 }
 fn array<const N: usize>(value: &Value, key: u64) -> Result<&[Value; N], MessageError> {
     value
@@ -1223,6 +1439,126 @@ mod tests {
         // A host starts with defaults and learns its own font later; a default that failed
         // validation would revoke the lane before that happened.
         assert!(Environment::default().validate().is_ok());
+    }
+
+    #[test]
+    fn semantic_trees_round_trip_with_their_optional_detail() {
+        use crate::overlay::{AccessibleAction, SemanticNode, SemanticRole, Semantics, Toggled};
+        let full = SetSemantics {
+            address: address(),
+            semantics: Semantics {
+                scene_revision: 9,
+                nodes: vec![
+                    SemanticNode {
+                        id: 1,
+                        role: SemanticRole::Application,
+                        bounds: Rect::new(0., 0., 200., 100.).unwrap(),
+                        label: "Panel".to_owned(),
+                        numeric: None,
+                        level: None,
+                        set: None,
+                        toggled: None,
+                        disabled: false,
+                        actions: Vec::new(),
+                        children: vec![1],
+                    },
+                    SemanticNode {
+                        id: 7,
+                        role: SemanticRole::SpinButton,
+                        bounds: Rect::new(10., 10., 60., 20.).unwrap(),
+                        label: "Count".to_owned(),
+                        numeric: Some([
+                            Scalar::new(5.).unwrap(),
+                            Scalar::new(0.).unwrap(),
+                            Scalar::new(10.).unwrap(),
+                        ]),
+                        level: None,
+                        set: None,
+                        toggled: None,
+                        disabled: true,
+                        actions: vec![AccessibleAction::Increment, AccessibleAction::Decrement],
+                        children: Vec::new(),
+                    },
+                ],
+            },
+        };
+        let bytes = encoded(full.clone().payload().unwrap());
+        assert_eq!(SetSemantics::decode(2, &bytes).unwrap(), full);
+
+        // A node that carries only what it needs stays that way: absent keys are absent.
+        let minimal = SetSemantics {
+            address: address(),
+            semantics: Semantics {
+                scene_revision: 1,
+                nodes: vec![SemanticNode {
+                    id: 1,
+                    role: SemanticRole::Group,
+                    bounds: Rect::new(0., 0., 1., 1.).unwrap(),
+                    label: String::new(),
+                    numeric: None,
+                    level: None,
+                    set: None,
+                    toggled: None,
+                    disabled: false,
+                    actions: Vec::new(),
+                    children: Vec::new(),
+                }],
+            },
+        };
+        let bytes = encoded(minimal.clone().payload().unwrap());
+        let decoded = SetSemantics::decode(2, &bytes).unwrap();
+        assert_eq!(decoded, minimal);
+        assert!(decoded.semantics.nodes[0].toggled.is_none());
+        assert!(decoded.semantics.nodes[0].set.is_none());
+
+        // A toggled state survives, since a switch that reads as mixed is not merely off.
+        let mut toggled = minimal.clone();
+        toggled.semantics.nodes[0].toggled = Some(Toggled::Mixed);
+        assert_eq!(
+            SetSemantics::decode(2, &encoded(toggled.clone().payload().unwrap())).unwrap(),
+            toggled
+        );
+
+        // The struct encoding is not a place to smuggle a zero identity.
+        let mut zero = minimal;
+        zero.semantics.nodes[0].id = 0;
+        assert!(zero.payload().is_err());
+    }
+
+    #[test]
+    fn an_accessibility_action_round_trips_and_refuses_a_zero_node() {
+        let event = Event::Accessibility {
+            node: u64::MAX,
+            action: crate::overlay::AccessibleAction::Increment,
+        };
+        assert_eq!(
+            InputEvent::decode(
+                2,
+                &encoded(
+                    InputEvent {
+                        address: address(),
+                        scene_revision: 3,
+                        event: event.clone(),
+                    }
+                    .payload()
+                    .unwrap()
+                )
+            )
+            .unwrap()
+            .event,
+            event
+        );
+
+        // A zero node is not an identity, so an action naming one cannot be dispatched.
+        let zero = InputEvent {
+            address: address(),
+            scene_revision: 3,
+            event: Event::Accessibility {
+                node: 0,
+                action: crate::overlay::AccessibleAction::Click,
+            },
+        };
+        assert!(zero.payload().is_err());
     }
 
     #[test]

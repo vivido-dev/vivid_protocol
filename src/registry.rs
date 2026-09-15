@@ -35,6 +35,7 @@ pub const OVERLAY_PAINT: &str = "overlay-paint-v1";
 pub const OVERLAY_POINTER: &str = "overlay-pointer-v1";
 pub const OVERLAY_CLIPBOARD: &str = "overlay-clipboard-v1";
 pub const OVERLAY_ENV: &str = "overlay-env-v1";
+pub const OVERLAY_A11Y: &str = "overlay-a11y-v1";
 
 pub mod record {
     pub const SET_OVERLAY_WINDOW: u16 = 0x7020;
@@ -58,6 +59,7 @@ pub mod record {
     pub const OVERLAY_VIEWPORT_CHANGED: u16 = 0x7034;
     pub const SET_OVERLAY_CLIPBOARD: u16 = 0x7035;
     pub const OVERLAY_ENV_CHANGED: u16 = 0x7036;
+    pub const SET_OVERLAY_SEMANTICS: u16 = 0x7037;
     pub const HELLO: u16 = 0x0001;
     pub const WELCOME: u16 = 0x0002;
     pub const OK: u16 = 0x0003;
@@ -336,6 +338,7 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
         OVERLAY_POINTER => Some(&[TERMINAL_OVERLAY]),
         OVERLAY_CLIPBOARD => Some(&[OVERLAY_INPUT]),
         OVERLAY_ENV => Some(&[OVERLAY_INPUT]),
+        OVERLAY_A11Y => Some(&[TERMINAL_OVERLAY]),
         TERMINAL_SURFACE
         | DESKTOP_SURFACE
         | CANVAS_SURFACE

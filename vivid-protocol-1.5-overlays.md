@@ -227,6 +227,7 @@ a scene-revision boundary; dispatch for older queued events remains associated w
 | 7 dismissed | reason: Escape=0, outside press=1, explicit close=2, owner loss=3, parent close=4 |
 | 8 cancel | null |
 | 9 hover | `[region_id, entered_boolean]` |
+| 10 accessibility | `[node_id, action]` |
 
 Points, rectangles, and wheel deltas use the drawing codec's Q32.32 geometry. Region IDs are u64
 (zero denotes the default rectangular hit region). An IME selection is `[start_byte, end_byte]`
@@ -577,3 +578,43 @@ receives null decides for itself, and animating is a reasonable default.
 
 The refresh interval is the display's, and a producer MUST still respect its own track's record
 ceiling, which may be lower. Absence means the host cannot tell.
+
+## Application semantics
+
+The `overlay-a11y-v1` profile lets an overlay describe itself to assistive technology. Its
+prerequisite is `terminal-overlay-v1`. A canvas of paths and glyphs carries no semantics, so
+without this a screen reader sees only the terminal underneath.
+
+`SET_OVERLAY_SEMANTICS` (0x7037) carries the window address in keys 0-2, the published scene
+revision in key 3, and a complete node list in key 4. It is a **complete replacement**, like a
+display list: a node the list no longer names stops existing, so a producer cannot leave a stale
+control for a user to be offered.
+
+A node is a map with keys 0 (nonzero unique ID), 1 (role), 2 (window-local rectangle bounds),
+and optional 3 (label), 4 (numeric `[value, minimum, maximum]`), 5 (heading level, 1-9), 6
+(`[position, size]`, one-based, for a node in a set), 7 (toggled: off=0, on=1, mixed=2), 8
+(disabled), 9 (supported actions, at most 8), and 10 (children, as indices into the list). Roles
+are generic, application, group, heading, text, button, switch, check box, radio button, text
+input, slider, spin button, progress indicator, list, list item, image, link, dialog, tab, and
+separator; actions are default, focus, click, increment, decrement, expand, collapse, and select.
+Both are closed sets, and an unknown value MUST be refused rather than mapped onto something
+generic. Actions carry no payload: one that would need a value, such as setting a slider to an
+arbitrary number, is deliberately not offered, because a host cannot infer one from a gesture and
+inventing it would be a guess about what the user meant.
+
+The list is a tree by construction rather than by inspection. A child's index MUST be greater than
+its parent's, every node except the root MUST appear exactly once as a child, and the root is
+index 0. Those three rules make a cycle impossible without a visited set, make an orphan
+impossible without a reachability walk, and mean a malformed list cannot make a host loop. A tree
+is at most 256 nodes and 32 levels deep; three separate bounds are needed because index ordering
+alone permits a chain of 256 levels. Labels and values are at most 256 UTF-8 bytes each.
+
+The tree is bound to the scene revision it describes. A host MUST refuse or clear semantics whose
+revision is not the window's currently published one, so assistive technology is never told about
+a control that is not on screen. Focus loss, hiding, closing, and lane loss clear it with the
+other revision-bound state.
+
+When assistive technology invokes an action, the host delivers `OVERLAY_INPUT_EVENT` type 10 —
+`[node_id, action]` — on the producer's interactive lane. The node is the application's own ID
+from its tree, so a producer routes it the same way it routes a hit region. Actions are delivered
+with the same coalescing rules as other input: they MUST NOT cross a scene-revision boundary.

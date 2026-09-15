@@ -13,6 +13,219 @@ pub mod wire;
 pub const MAX_WINDOWS: usize = 256;
 pub const MAX_WINDOWS_PER_OWNER: usize = 32;
 pub const MAX_PENDING_EVENTS: usize = 256;
+/// The most nodes one overlay may publish in its semantic tree.
+pub const MAX_SEMANTIC_NODES: usize = 256;
+/// How deep a semantic tree may nest.
+pub const MAX_SEMANTIC_DEPTH: usize = 32;
+/// The most UTF-8 in one semantic node's label or value.
+pub const MAX_SEMANTIC_TEXT_BYTES: usize = 256;
+/// How many actions one semantic node may advertise.
+pub const MAX_SEMANTIC_ACTIONS: usize = 7;
+
+/// What a semantic node is, in the vocabulary assistive technology understands.
+///
+/// A closed set rather than a platform role name: a host maps these onto whatever its toolkit
+/// offers, and an unknown role must fail rather than silently become a generic group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SemanticRole {
+    #[default]
+    Generic,
+    Application,
+    Group,
+    Heading,
+    Text,
+    Button,
+    Switch,
+    CheckBox,
+    RadioButton,
+    TextInput,
+    Slider,
+    SpinButton,
+    ProgressIndicator,
+    List,
+    ListItem,
+    Image,
+    Link,
+    Dialog,
+    Tab,
+    Separator,
+}
+impl SemanticRole {
+    pub fn index(self) -> u64 {
+        self as u64
+    }
+    pub fn from_index(index: u64) -> Option<Self> {
+        const ALL: [SemanticRole; 20] = [
+            SemanticRole::Generic,
+            SemanticRole::Application,
+            SemanticRole::Group,
+            SemanticRole::Heading,
+            SemanticRole::Text,
+            SemanticRole::Button,
+            SemanticRole::Switch,
+            SemanticRole::CheckBox,
+            SemanticRole::RadioButton,
+            SemanticRole::TextInput,
+            SemanticRole::Slider,
+            SemanticRole::SpinButton,
+            SemanticRole::ProgressIndicator,
+            SemanticRole::List,
+            SemanticRole::ListItem,
+            SemanticRole::Image,
+            SemanticRole::Link,
+            SemanticRole::Dialog,
+            SemanticRole::Tab,
+            SemanticRole::Separator,
+        ];
+        ALL.get(usize::try_from(index).ok()?).copied()
+    }
+}
+
+/// What assistive technology asked a semantic node to do.
+///
+/// Every action is payload-free. An action that would carry a value, such as setting a slider to
+/// an arbitrary number, is deliberately absent: a host cannot synthesize one from a gesture, and
+/// inventing a payload would be a guess about what the user meant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AccessibleAction {
+    /// The node's default action, which is a click for a button and a focus for most else.
+    #[default]
+    Default,
+    Focus,
+    Click,
+    Increment,
+    Decrement,
+    Expand,
+    Collapse,
+}
+impl AccessibleAction {
+    pub fn index(self) -> u64 {
+        self as u64
+    }
+    pub fn from_index(index: u64) -> Option<Self> {
+        // Seven actions, each with a counterpart in the toolkits a host builds on. A `Select`
+        // action had no counterpart anywhere and was removed rather than advertised and then
+        // ignored, and `Default` means the node can be activated at all.
+        const ALL: [AccessibleAction; 7] = [
+            AccessibleAction::Default,
+            AccessibleAction::Focus,
+            AccessibleAction::Click,
+            AccessibleAction::Increment,
+            AccessibleAction::Decrement,
+            AccessibleAction::Expand,
+            AccessibleAction::Collapse,
+        ];
+        ALL.get(usize::try_from(index).ok()?).copied()
+    }
+}
+
+/// How a switch or check box reads to assistive technology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggled {
+    Off,
+    On,
+    Mixed,
+}
+
+/// One node of an application's semantic tree, as the application describes itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticNode {
+    /// Application-chosen identity, nonzero and unique within one tree.
+    pub id: u64,
+    pub role: SemanticRole,
+    /// Window-local logical pixels, so assistive technology can point at what it describes.
+    pub bounds: Rect,
+    pub label: String,
+    /// `[current, minimum, maximum]` for a control with a numeric value.
+    pub numeric: Option<[Scalar; 3]>,
+    /// A heading's level.
+    pub level: Option<u8>,
+    /// `[position, size]`, both one-based, for a node that is part of a set.
+    pub set: Option<[u16; 2]>,
+    pub toggled: Option<Toggled>,
+    pub disabled: bool,
+    pub actions: Vec<AccessibleAction>,
+    /// Indices into the tree, not identities. A child's index is always greater than its
+    /// parent's, which makes a cycle impossible by construction rather than by a visited set.
+    pub children: Vec<u32>,
+}
+
+/// A complete application semantic tree for one scene revision.
+///
+/// Complete replacement rather than a delta, like a display list: a node the tree no longer names
+/// stops existing, so a producer cannot leave a stale control behind for assistive technology to
+/// offer a user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Semantics {
+    /// The published scene these nodes describe.
+    pub scene_revision: u64,
+    pub nodes: Vec<SemanticNode>,
+}
+impl Semantics {
+    pub fn validate(&self) -> Result<(), InvalidScene> {
+        if self.scene_revision == 0 {
+            return Err(InvalidScene("semantics require a published scene revision"));
+        }
+        if self.nodes.is_empty() || self.nodes.len() > MAX_SEMANTIC_NODES {
+            return Err(InvalidScene("semantic tree size is out of range"));
+        }
+        let mut identities = BTreeSet::new();
+        for node in &self.nodes {
+            if node.id == 0 || !identities.insert(node.id) {
+                return Err(InvalidScene("semantic node IDs must be nonzero and unique"));
+            }
+            node.bounds.validate()?;
+            if node.label.len() > MAX_SEMANTIC_TEXT_BYTES {
+                return Err(InvalidScene("semantic node label exceeds its ceiling"));
+            }
+            if node.actions.len() > MAX_SEMANTIC_ACTIONS {
+                return Err(InvalidScene("semantic node lists too many actions"));
+            }
+            if node
+                .set
+                .is_some_and(|[position, size]| position == 0 || size == 0 || position > size)
+            {
+                return Err(InvalidScene(
+                    "semantic set position must be within its size",
+                ));
+            }
+        }
+        // Every node but the root is a child exactly once, and a child always sits later in the
+        // list than its parent. Together these make the list a tree and make a cycle impossible.
+        let mut claimed = vec![false; self.nodes.len()];
+        for (index, node) in self.nodes.iter().enumerate() {
+            let mut seen = BTreeSet::new();
+            for child in &node.children {
+                let child = usize::try_from(*child)
+                    .map_err(|_| InvalidScene("semantic child index is out of range"))?;
+                if child <= index || child >= self.nodes.len() || !seen.insert(child) {
+                    return Err(InvalidScene(
+                        "semantic children must follow their parent and be listed once",
+                    ));
+                }
+                if std::mem::replace(&mut claimed[child], true) {
+                    return Err(InvalidScene("a semantic node has two parents"));
+                }
+            }
+        }
+        if claimed[1..].iter().any(|claimed| !claimed) {
+            return Err(InvalidScene("a semantic node is unreachable from the root"));
+        }
+        // Index ordering bounds nothing on its own: a chain of 256 nodes is 256 deep.
+        let mut depth = vec![0_u32; self.nodes.len()];
+        for (index, node) in self.nodes.iter().enumerate() {
+            for child in &node.children {
+                let child = *child as usize;
+                depth[child] = depth[index] + 1;
+                if depth[child] as usize > MAX_SEMANTIC_DEPTH {
+                    return Err(InvalidScene("semantic tree is too deep"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A press sequence longer than this restarts at one, exactly as a fourth terminal click does.
 pub const MAX_CLICKS: u8 = 3;
 /// The most UTF-8 an overlay may copy out in one gesture.
@@ -145,6 +358,11 @@ pub enum Event {
         /// Normalized 0-1 from a device that reports pressure, absent when it reported none.
         /// A host MUST NOT invent a value for hardware that has no such sensor.
         pressure: Option<Scalar>,
+    },
+    /// Assistive technology invoked one semantic node (overlay-a11y-v1).
+    Accessibility {
+        node: u64,
+        action: AccessibleAction,
     },
     /// The pointer entered or left one region (overlay-pointer-v1).
     ///
@@ -1115,6 +1333,8 @@ fn valid_event(event: &Event) -> bool {
             modifiers,
             ..
         } => modifiers & !modifiers::KNOWN_MASK == 0 && keys::valid(*physical),
+        // Zero is not an identity, so an action naming one cannot be dispatched.
+        Event::Accessibility { node, .. } => *node != 0,
         Event::Geometry { bounds, .. } => bounds.validate().is_ok(),
         Event::Text(text) => text.len() <= MAX_EVENT_TEXT_BYTES,
         Event::Ime { preedit, selection } => {
@@ -1519,6 +1739,165 @@ mod tests {
             script(&mut s, a.context.session),
             vec!["leave 1", "dismissed"]
         );
+    }
+
+    /// A node whose identity mirrors its index, so a test reads as a tree shape. The root is
+    /// index 0 with identity 1, because a node ID of zero is not an identity.
+    fn node(index: usize, role: SemanticRole, children: Vec<u32>) -> SemanticNode {
+        SemanticNode {
+            id: index as u64 + 1,
+            role,
+            bounds: Rect::new(0., 0., 10., 10.).unwrap(),
+            label: String::new(),
+            numeric: None,
+            level: None,
+            set: None,
+            toggled: None,
+            disabled: false,
+            actions: Vec::new(),
+            children,
+        }
+    }
+    fn tree(nodes: Vec<SemanticNode>) -> Semantics {
+        Semantics {
+            scene_revision: 1,
+            nodes,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_semantic_tree_validates() {
+        let mut heading = node(1, SemanticRole::Heading, vec![2]);
+        heading.level = Some(2);
+        let mut button = node(2, SemanticRole::Button, Vec::new());
+        button.label = "Press me".to_owned();
+        button.actions = vec![AccessibleAction::Click, AccessibleAction::Focus];
+        tree(vec![node(0, SemanticRole::Group, vec![1]), heading, button])
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_malformed_semantic_tree_is_refused_rather_than_walked() {
+        for nodes in [
+            // A node that parents itself would let a host walk in a cycle.
+            vec![node(0, SemanticRole::Group, vec![0])],
+            // A child that precedes its parent would too.
+            vec![
+                node(0, SemanticRole::Group, vec![1, 2]),
+                node(1, SemanticRole::Group, vec![2]),
+                node(2, SemanticRole::Group, Vec::new()),
+            ],
+            // A child listed twice.
+            vec![
+                node(0, SemanticRole::Group, vec![1, 1]),
+                node(1, SemanticRole::Group, Vec::new()),
+            ],
+            // Two parents claim the same child.
+            vec![
+                node(0, SemanticRole::Group, vec![1, 2]),
+                node(1, SemanticRole::Group, vec![2]),
+                node(2, SemanticRole::Group, Vec::new()),
+            ],
+            // A node nobody parents is unreachable from the root.
+            vec![
+                node(0, SemanticRole::Group, vec![1]),
+                node(1, SemanticRole::Group, Vec::new()),
+                node(2, SemanticRole::Group, Vec::new()),
+            ],
+            // A child index past the end.
+            vec![node(0, SemanticRole::Group, vec![9])],
+        ] {
+            assert!(tree(nodes).validate().is_err());
+        }
+
+        // A repeated identity, which is a different failure from a repeated child index.
+        let mut repeated = node(1, SemanticRole::Group, Vec::new());
+        repeated.id = 1;
+        assert!(
+            tree(vec![node(0, SemanticRole::Group, vec![1]), repeated])
+                .validate()
+                .is_err()
+        );
+
+        // A set position outside its size.
+        let mut broken = node(1, SemanticRole::ListItem, Vec::new());
+        broken.set = Some([3, 2]);
+        assert!(
+            tree(vec![node(0, SemanticRole::List, vec![1]), broken])
+                .validate()
+                .is_err()
+        );
+
+        // A label past its ceiling.
+        let mut wordy = node(1, SemanticRole::Text, Vec::new());
+        wordy.label = "x".repeat(MAX_SEMANTIC_TEXT_BYTES + 1);
+        assert!(
+            tree(vec![node(0, SemanticRole::Group, vec![1]), wordy])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn index_ordering_alone_does_not_bound_depth() {
+        // A chain of 256 nodes satisfies "a child follows its parent" and is still 256 deep, so
+        // depth needs its own ceiling rather than being implied by the ordering rule.
+        let chain = MAX_SEMANTIC_DEPTH + 2;
+        let nodes = (0..chain)
+            .map(|index| {
+                let children = if index + 1 < chain {
+                    vec![(index + 1) as u32]
+                } else {
+                    Vec::new()
+                };
+                node(index, SemanticRole::Group, children)
+            })
+            .collect();
+        let error = tree(nodes).validate().unwrap_err();
+        assert!(format!("{error:?}").contains("deep"), "{error:?}");
+    }
+
+    #[test]
+    fn semantic_roles_and_actions_are_closed_bounded_sets() {
+        for role in [
+            SemanticRole::Generic,
+            SemanticRole::Application,
+            SemanticRole::Group,
+            SemanticRole::Heading,
+            SemanticRole::Text,
+            SemanticRole::Button,
+            SemanticRole::Switch,
+            SemanticRole::CheckBox,
+            SemanticRole::RadioButton,
+            SemanticRole::TextInput,
+            SemanticRole::Slider,
+            SemanticRole::SpinButton,
+            SemanticRole::ProgressIndicator,
+            SemanticRole::List,
+            SemanticRole::ListItem,
+            SemanticRole::Image,
+            SemanticRole::Link,
+            SemanticRole::Dialog,
+            SemanticRole::Tab,
+            SemanticRole::Separator,
+        ] {
+            assert_eq!(SemanticRole::from_index(role.index()), Some(role));
+        }
+        assert_eq!(SemanticRole::from_index(20), None);
+        for action in [
+            AccessibleAction::Default,
+            AccessibleAction::Focus,
+            AccessibleAction::Click,
+            AccessibleAction::Increment,
+            AccessibleAction::Decrement,
+            AccessibleAction::Expand,
+            AccessibleAction::Collapse,
+        ] {
+            assert_eq!(AccessibleAction::from_index(action.index()), Some(action));
+        }
+        // The set is closed: one past the end is not an action.
+        assert_eq!(AccessibleAction::from_index(7), None);
     }
 
     #[test]
