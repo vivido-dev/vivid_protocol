@@ -549,3 +549,31 @@ The write completes within the correlated request, so no more than one is ever o
 producer. A host performs the write through its normal clipboard path, which on a shared display
 server may publish the text to other applications immediately; a producer MUST NOT treat a
 successful reply as evidence that nothing else observed the text.
+
+## Host environment
+
+The `overlay-env-v1` profile tells a producer who the host is, so an overlay can look like the
+pane it sits in without guessing. Its prerequisite is `overlay-input-v1`.
+
+`OVERLAY_ENV_CHANGED` (0x7036) is an unsolicited interactive-lane envelope with request and
+object ID zero. Keys are a nonzero revision (0), the default font family (1), its default size in
+logical pixels (2), appearance (3: light=0, dark=1), reduced motion (4: boolean or null), and the
+display refresh interval in microseconds (5: nonzero or null). The host sends an initial snapshot
+after lane authentication and another when any of it changes. Revisions strictly increase on
+change; an unchanged snapshot does not advance one. A receiver may coalesce queued snapshots.
+
+It is a separate record from `OVERLAY_VIEWPORT_CHANGED` rather than more keys on it, because
+appearance and motion preference change independently of geometry. A producer that caches layout
+keyed by viewport revision must not relayout because the user switched their desktop theme, and
+keying both to one revision would force exactly that.
+
+The font family and size are what an empty `TextStyle` family and an unspecified text size should
+resolve to, so plain text in an overlay matches the terminal around it. A family at most 256 bytes
+and a positive size are bounded as everywhere else.
+
+Reduced motion is **absent** rather than false when the host has no such signal: a host that
+cannot read the preference MUST NOT assert one, exactly as with pointer pressure. A producer that
+receives null decides for itself, and animating is a reasonable default.
+
+The refresh interval is the display's, and a producer MUST still respect its own track's record
+ceiling, which may be lower. Absence means the host cannot tell.

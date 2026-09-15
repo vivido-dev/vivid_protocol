@@ -1135,3 +1135,13 @@ prerequisites = ["overlay-input-v1"]
 value = 0x7035
 name = "SET_OVERLAY_CLIPBOARD"
 state = "standards-track"
+
+[[profile]]
+name = "overlay-env-v1"
+state = "standards-track"
+prerequisites = ["overlay-input-v1"]
+
+[[record]]
+value = 0x7036
+name = "OVERLAY_ENV_CHANGED"
+state = "standards-track"

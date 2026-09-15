@@ -781,6 +781,125 @@ impl Clipboard {
     }
 }
 
+/// Who the host is: the defaults a toolkit needs so an overlay looks like the pane it sits in.
+///
+/// Delivered separately from the viewport because appearance and motion preference change
+/// independently of geometry, and a producer that caches layout per viewport revision must not
+/// relayout because the user switched their desktop theme.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Environment {
+    /// The font a plain `Text` or an empty `TextStyle` family resolves to. Empty asks the host.
+    pub font_family: String,
+    /// The default size for that family, in logical pixels.
+    pub font_size: Scalar,
+    pub appearance: Appearance,
+    /// Whether the user asked for reduced motion, or `None` when the host cannot tell. A host
+    /// that has no such signal MUST report absence rather than assert a preference.
+    pub reduced_motion: Option<bool>,
+    /// How often the display refreshes, or `None` when the host cannot tell. A producer must
+    /// still respect its own track's record ceiling, which may be lower.
+    pub refresh_interval_us: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Appearance {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl Default for Environment {
+    /// A valid environment with no host-specific detail: an empty family asks the host to choose,
+    /// and the size is the one a plain `TextStyle` already defaults to. A default that failed
+    /// validation would let a host revoke a lane before it ever learned its own font.
+    fn default() -> Self {
+        Self {
+            font_family: String::new(),
+            font_size: Scalar::new(16.).expect("16 logical pixels is a valid scalar"),
+            appearance: Appearance::Light,
+            reduced_motion: None,
+            refresh_interval_us: None,
+        }
+    }
+}
+
+impl Environment {
+    pub fn validate(&self) -> Result<(), MessageError> {
+        if self.font_family.len() > text::styled::MAX_FAMILY_BYTES {
+            return Err(bad(1, "environment font family exceeds its ceiling"));
+        }
+        if self.font_size <= Scalar::ZERO {
+            return Err(bad(2, "environment font size must be positive"));
+        }
+        if self.refresh_interval_us == Some(0) {
+            return Err(bad(5, "environment refresh interval must be nonzero"));
+        }
+        Ok(())
+    }
+}
+
+/// `OVERLAY_ENV_CHANGED` (0x7036): an unsolicited interactive-lane envelope with request ID zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentChanged {
+    pub revision: u64,
+    pub environment: Environment,
+}
+impl EnvironmentChanged {
+    pub fn payload(self) -> Result<PayloadMap, MessageError> {
+        self.environment.validate()?;
+        nonzero(self.revision, 0)?;
+        let env = &self.environment;
+        Ok(vec![
+            (0, u(self.revision)),
+            (1, Value::Text(env.font_family.clone())),
+            (2, scalar(env.font_size)),
+            (
+                3,
+                u(match env.appearance {
+                    Appearance::Light => 0,
+                    Appearance::Dark => 1,
+                }),
+            ),
+            (4, env.reduced_motion.map_or(Value::Null, Value::Bool)),
+            (5, env.refresh_interval_us.map_or(Value::Null, u)),
+        ])
+    }
+    pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
+        validate_header_object(object, 0)?;
+        let map = strict(value, &[0, 1, 2, 3, 4, 5])?;
+        let font_family = match map.required(1)? {
+            Value::Text(text) => text.clone(),
+            _ => return Err(bad(1, "environment font family must be text")),
+        };
+        let appearance = match unsigned(map.required(3)?, 3)? {
+            0 => Appearance::Light,
+            1 => Appearance::Dark,
+            _ => return Err(bad(3, "unknown appearance")),
+        };
+        let reduced_motion = match map.required(4)? {
+            Value::Null => None,
+            Value::Bool(value) => Some(*value),
+            _ => return Err(bad(4, "reduced motion must be a boolean or null")),
+        };
+        let refresh_interval_us = match map.required(5)? {
+            Value::Null => None,
+            value => Some(unsigned(value, 5)?),
+        };
+        let environment = Environment {
+            font_family,
+            font_size: decode_scalar(map.required(2)?, 2)?,
+            appearance,
+            reduced_motion,
+            refresh_interval_us,
+        };
+        environment.validate()?;
+        Ok(Self {
+            revision: map.required_u64(0)?,
+            environment,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capture {
     pub address: WindowAddress,
@@ -1097,6 +1216,105 @@ mod tests {
             .is_err()
         );
         assert!(Renew::decode(2, &encoded(renew.payload().unwrap())).is_err());
+    }
+
+    #[test]
+    fn a_default_environment_is_one_a_host_could_already_publish() {
+        // A host starts with defaults and learns its own font later; a default that failed
+        // validation would revoke the lane before that happened.
+        assert!(Environment::default().validate().is_ok());
+    }
+
+    #[test]
+    fn environment_snapshots_round_trip_with_absent_preferences_intact() {
+        let full = EnvironmentChanged {
+            revision: 7,
+            environment: Environment {
+                font_family: "Iosevka Term".to_owned(),
+                font_size: Scalar::new(13.5).unwrap(),
+                appearance: Appearance::Dark,
+                reduced_motion: Some(true),
+                refresh_interval_us: Some(16_667),
+            },
+        };
+        assert_eq!(
+            EnvironmentChanged::decode(0, &encoded(full.clone().payload().unwrap())).unwrap(),
+            full
+        );
+
+        // An unreadable preference stays absent across the wire rather than becoming "false".
+        let unknown = EnvironmentChanged {
+            revision: 1,
+            environment: Environment {
+                font_family: String::new(),
+                font_size: Scalar::new(16.).unwrap(),
+                appearance: Appearance::Light,
+                reduced_motion: None,
+                refresh_interval_us: None,
+            },
+        };
+        let decoded =
+            EnvironmentChanged::decode(0, &encoded(unknown.clone().payload().unwrap())).unwrap();
+        assert_eq!(decoded.environment.reduced_motion, None);
+        assert_eq!(decoded.environment.refresh_interval_us, None);
+        assert_eq!(decoded, unknown);
+    }
+
+    #[test]
+    fn environment_values_outside_their_bounds_are_refused() {
+        let base = |environment: Environment| EnvironmentChanged {
+            revision: 1,
+            environment,
+        };
+        for environment in [
+            Environment {
+                font_family: "x".repeat(text::styled::MAX_FAMILY_BYTES + 1),
+                ..sample_environment()
+            },
+            Environment {
+                font_size: Scalar::ZERO,
+                ..sample_environment()
+            },
+            Environment {
+                font_size: Scalar::new(-1.).unwrap(),
+                ..sample_environment()
+            },
+            Environment {
+                refresh_interval_us: Some(0),
+                ..sample_environment()
+            },
+        ] {
+            assert!(base(environment).payload().is_err());
+        }
+        // A first-rate interval for a 60 Hz display is fine.
+        assert!(base(sample_environment()).payload().is_ok());
+    }
+
+    fn sample_environment() -> Environment {
+        Environment {
+            font_family: String::new(),
+            font_size: Scalar::new(14.).unwrap(),
+            appearance: Appearance::Light,
+            reduced_motion: None,
+            refresh_interval_us: Some(16_667),
+        }
+    }
+
+    #[test]
+    fn an_unknown_appearance_is_refused_rather_than_guessed() {
+        let fields: Vec<(u64, Value)> = EnvironmentChanged {
+            revision: 1,
+            environment: sample_environment(),
+        }
+        .payload()
+        .unwrap()
+        .into_iter()
+        .map(|(key, value)| (key, if key == 3 { Value::Unsigned(9) } else { value }))
+        .collect();
+        assert!(
+            EnvironmentChanged::decode(0, &Value::Map(fields)).is_err(),
+            "an appearance outside the closed set must not decode"
+        );
     }
 
     #[test]

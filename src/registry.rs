@@ -34,6 +34,7 @@ pub const OVERLAY_TYPOGRAPHY: &str = "overlay-typography-v1";
 pub const OVERLAY_PAINT: &str = "overlay-paint-v1";
 pub const OVERLAY_POINTER: &str = "overlay-pointer-v1";
 pub const OVERLAY_CLIPBOARD: &str = "overlay-clipboard-v1";
+pub const OVERLAY_ENV: &str = "overlay-env-v1";
 
 pub mod record {
     pub const SET_OVERLAY_WINDOW: u16 = 0x7020;
@@ -56,6 +57,7 @@ pub mod record {
     pub const OVERLAY_SUBMISSION_OUTCOME: u16 = 0x7033;
     pub const OVERLAY_VIEWPORT_CHANGED: u16 = 0x7034;
     pub const SET_OVERLAY_CLIPBOARD: u16 = 0x7035;
+    pub const OVERLAY_ENV_CHANGED: u16 = 0x7036;
     pub const HELLO: u16 = 0x0001;
     pub const WELCOME: u16 = 0x0002;
     pub const OK: u16 = 0x0003;
@@ -333,6 +335,7 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
         OVERLAY_PAINT => Some(&[TERMINAL_OVERLAY]),
         OVERLAY_POINTER => Some(&[TERMINAL_OVERLAY]),
         OVERLAY_CLIPBOARD => Some(&[OVERLAY_INPUT]),
+        OVERLAY_ENV => Some(&[OVERLAY_INPUT]),
         TERMINAL_SURFACE
         | DESKTOP_SURFACE
         | CANVAS_SURFACE
@@ -413,6 +416,14 @@ mod tests {
         validate_profile_set(profiles).unwrap();
         assert!(matches!(
             validate_profile_set([OVERLAY_CLIPBOARD, TERMINAL_OVERLAY]),
+            Err(ProfileError::MissingPrerequisite { .. })
+        ));
+    }
+
+    #[test]
+    fn the_overlay_environment_profile_requires_overlay_input() {
+        assert!(matches!(
+            validate_profile_set([OVERLAY_ENV, TERMINAL_OVERLAY, TERMINAL_SURFACE]),
             Err(ProfileError::MissingPrerequisite { .. })
         ));
     }

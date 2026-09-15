@@ -2,6 +2,10 @@
 use super::*;
 use crate::vector::Color;
 
+/// Font family names are bounded everywhere they cross the wire, including in the environment
+/// snapshot a host sends.
+pub const MAX_FAMILY_BYTES: usize = 256;
+
 pub const MAX_TEXT_BATCH: usize = 32;
 pub const MAX_TEXT_RUNS: usize = 64;
 pub const MAX_RETAINED_LAYOUTS: usize = 128;
