@@ -98,9 +98,13 @@ A path is `[even_odd_boolean, segments]`. Segment arrays are `[0, point]` (move)
 `[1, point]` (line), `[2, control, end]` (quadratic), `[3, control1, control2, end]` (cubic),
 or `[4]` (close). A contour starts with move; drawing segments require an open contour.
 
-A brush is `[0, color]`, `[1, start, end, stops]`, or `[2, center, radius, stops]` for solid,
-linear, or radial paint. Stops are `[offset, color]`, with nondecreasing unsigned 0–65535
-offsets. Gradients have at least two stops. Linear endpoints differ; radial radius is positive.
+A brush is `[0, color]`, `[1, start, end, stops]`, `[2, center, radius, stops]`, or
+`[3, asset_id, transform_or_null, extend]` for solid, linear, radial, or image paint. Stops are
+`[offset, color]`, with nondecreasing unsigned 0–65535 offsets. Gradients have at least two
+stops. Linear endpoints differ; radial radius is positive. A gradient brush may carry one
+trailing element selecting its interpolation color space: 0 sRGB (the default, and omitted when
+in effect so existing scenes encode unchanged) or 1 Oklab. Commands 11 and 12, image brushes,
+and non-sRGB gradient spaces require `overlay-paint-v1`.
 
 | Tag | Remaining command fields |
 | --- | --- |
@@ -114,6 +118,8 @@ offsets. Gradients have at least two stops. Linear endpoints differ; radial radi
 | 7 | text, origin, size, family, weight, italic, color, optional maximum width |
 | 8 | asset ID, rectangle, opacity |
 | 9 | nonzero unique application region ID, path, role |
+| 11 | rectangle, four corner radii, color, offset, blur, spread, inset: shadow |
+| 12 | path, brush, positive width, cap, join, miter limit, dash array or null, dash offset |
 
 Text is UTF-8. Font family is at most 256 bytes, weight is 1–1000, and size and optional
 maximum width are positive. Empty family selects the host default. The host shapes text
@@ -433,3 +439,39 @@ The standalone legacy single-text service never emits this field.
 Shaping, fit probes, and retained glyph-scene compilation remain on bounded host workers. Batch
 atomicity, negotiated reply limits, retained-layout accounting, owner isolation, and release
 semantics are unchanged. Unsupported terminating presenters/gateways decline the profile.
+
+## Paint commands
+
+The `overlay-paint-v1` profile adds the drawing commands a styled surface needs. Its
+prerequisite is `terminal-overlay-v1`. A presenter that did not accept the profile MUST reject a
+display list carrying these commands, and a producer that did not negotiate it MUST NOT send
+one; the existing decode failure for unknown commands is the correct refusal.
+
+Command 11 casts one blurred rounded rectangle, as CSS `box-shadow` defines it, in window-local
+logical pixels and under the current transform, clip, and opacity:
+
+- The rectangle is `[point, width, height]`. Corner radii are `[top_left, top_right,
+  bottom_right, bottom_left]`; each is non-negative, at most 4096, and the four are scaled down
+  together by the smallest side ratio when they overrun their sides, so the outline never
+  overlaps itself.
+- `offset` translates the shadow relative to the rectangle, `blur` is the gaussian diameter
+  (0 to 4096), and `spread`, from −4096 to 4096, expands or contracts the shape before the
+  blur, adjusting the radii with it.
+- `inset` casts the shadow inside the rectangle's outline rather than behind the region.
+- The command paints only the shadow. Drawing the element over its own outer shadow is the
+  application's business, and an inset shadow is clipped to the rectangle by definition.
+
+Command 12 strokes a path with caps, joins, and an optional dash pattern: cap is 0 butt, 1
+round, 2 square; join is 0 miter, 1 bevel, 2 round; the miter limit is at least 1; a dash array
+holds 1 to 32 lengths, each positive and at most 4096, with a dash offset from 0 to the pattern
+length's ceiling. Command 1 remains the plain stroke and encodes identically to before.
+
+An image brush (`[3, asset_id, transform_or_null, extend]`) fills any path with a retained
+`VECTOR_ASSET` from the same channel. The image sits at its natural pixel size anchored at the
+origin unless the optional affine transform repositions or scales it; `extend` is 0 pad, 1
+repeat, or 2 reflect, governing sampling outside the image's extent. The asset must exist and
+remain unreleased when the scene is decoded; a missing asset fails the whole list.
+
+Shadow commands are charged against the negotiated command budget like any other; they carry no
+path segments. Dash entries and paint extents are bounded by profile ceilings rather than
+negotiated limits, so the twelve-field vector-limits extension is unchanged.

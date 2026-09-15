@@ -1115,3 +1115,8 @@ state = "standards-track"
 name = "overlay-typography-v1"
 state = "standards-track"
 prerequisites = ["overlay-text-layout-v1"]
+
+[[profile]]
+name = "overlay-paint-v1"
+state = "standards-track"
+prerequisites = ["terminal-overlay-v1"]
