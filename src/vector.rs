@@ -373,6 +373,15 @@ pub struct Path {
     pub even_odd: bool,
 }
 impl Path {
+    /// Start a freeform path.
+    ///
+    /// The shape constructors below cover the common cases; this is for everything else. It is
+    /// the Rust counterpart of the chainable builders the Python and TypeScript bindings expose,
+    /// so the same geometry is written the same way in all three languages.
+    pub fn builder() -> PathBuilder {
+        PathBuilder::default()
+    }
+
     pub fn rectangle(rect: Rect) -> Result<Self> {
         rect.validate()?;
         let x = rect.origin.x.get();
@@ -509,6 +518,128 @@ impl Path {
             }
         }
         Ok(())
+    }
+}
+
+/// Builds a path a segment at a time.
+///
+/// Chainable, and sticky about the first thing that went wrong: a coordinate the wire cannot
+/// carry is remembered rather than panicking, so a long chain reports where it actually broke
+/// instead of at whichever call happened to be unwrapped first.
+///
+/// ```
+/// use vivid_protocol::vector::Path;
+///
+/// let arrow = Path::builder()
+///     .move_to(0., 0.)
+///     .line_to(20., 10.)
+///     .quad_to(24., 14., 20., 18.)
+///     .cubic_to(14., 26., 6., 26., 0., 18.)
+///     .close()
+///     .build()
+///     .expect("a path the wire can carry");
+/// assert_eq!(arrow.segments.len(), 6);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct PathBuilder {
+    segments: Vec<Segment>,
+    even_odd: bool,
+    /// The first thing that went wrong, kept so `build` can report it.
+    failed: Option<InvalidScene>,
+}
+
+impl PathBuilder {
+    /// Begin a subpath. A path must start with one, and a `close` applies to the most recent.
+    pub fn move_to(self, x: f64, y: f64) -> Self {
+        self.point(x, y, Segment::Move)
+    }
+
+    pub fn line_to(self, x: f64, y: f64) -> Self {
+        self.point(x, y, Segment::Line)
+    }
+
+    /// A quadratic curve through one control point.
+    pub fn quad_to(mut self, cx: f64, cy: f64, x: f64, y: f64) -> Self {
+        match (Point::new(cx, cy), Point::new(x, y)) {
+            (Ok(control), Ok(end)) => self.push(Segment::Quad(control, end)),
+            (Err(error), _) | (_, Err(error)) => {
+                self.fail(error);
+                self
+            }
+        }
+    }
+
+    /// A cubic curve through two control points.
+    pub fn cubic_to(mut self, ax: f64, ay: f64, bx: f64, by: f64, x: f64, y: f64) -> Self {
+        match (Point::new(ax, ay), Point::new(bx, by), Point::new(x, y)) {
+            (Ok(first), Ok(second), Ok(end)) => self.push(Segment::Cubic(first, second, end)),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                self.fail(error);
+                self
+            }
+        }
+    }
+
+    /// Close the current subpath, joining its end back to where it began.
+    pub fn close(self) -> Self {
+        self.push(Segment::Close)
+    }
+
+    /// Fill by the even-odd rule rather than by winding, which is what puts a hole in a shape
+    /// drawn as two nested subpaths.
+    pub fn even_odd(mut self) -> Self {
+        self.even_odd = true;
+        self
+    }
+
+    /// How many segments have been added, for a caller drawing against the ceiling.
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Finish, checking everything the wire requires: a non-empty path, within the segment
+    /// ceiling, beginning with a move, and closing only a subpath that was opened.
+    pub fn build(self) -> Result<Path> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let path = Path {
+            segments: self.segments,
+            even_odd: self.even_odd,
+        };
+        path.validate()?;
+        Ok(path)
+    }
+
+    fn point(mut self, x: f64, y: f64, segment: fn(Point) -> Segment) -> Self {
+        match Point::new(x, y) {
+            Ok(point) => self.push(segment(point)),
+            Err(error) => {
+                self.fail(error);
+                self
+            }
+        }
+    }
+
+    fn push(mut self, segment: Segment) -> Self {
+        // Capped as it is added rather than only at the end, matching the Python and TypeScript
+        // builders, so a runaway loop stops growing a vector nobody can send.
+        if self.segments.len() >= MAX_PATH_SEGMENTS {
+            self.fail(InvalidScene("path segment limit exceeded"));
+            return self;
+        }
+        self.segments.push(segment);
+        self
+    }
+
+    fn fail(&mut self, error: InvalidScene) {
+        if self.failed.is_none() {
+            self.failed = Some(error);
+        }
     }
 }
 
@@ -685,7 +816,7 @@ pub enum Join {
 }
 
 /// A stroke with caps, joins, and an optional dash pattern. Tag 1 remains the plain stroke.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrokeStyle {
     pub width: Scalar,
     pub cap: Cap,
@@ -694,6 +825,26 @@ pub struct StrokeStyle {
     pub dashes: Vec<Scalar>,
     pub dash_offset: Scalar,
 }
+/// The miter limit a stroke has unless it asks for another, as SVG and CSS use.
+pub const DEFAULT_MITER_LIMIT: Scalar = Scalar(4_i64 << 32);
+
+impl Default for StrokeStyle {
+    /// A stroke that validates.
+    ///
+    /// A derived default would leave the miter limit at zero, which `validate` refuses, so every
+    /// caller of `new` would have had to know to patch a field before the value could be sent.
+    fn default() -> Self {
+        Self {
+            width: Scalar::ONE,
+            cap: Cap::default(),
+            join: Join::default(),
+            miter_limit: DEFAULT_MITER_LIMIT,
+            dashes: Vec::new(),
+            dash_offset: Scalar::ZERO,
+        }
+    }
+}
+
 impl StrokeStyle {
     pub fn new(width: f64) -> Result<Self> {
         Ok(Self {
@@ -1938,5 +2089,154 @@ mod tests {
         }))
         .unwrap();
         assert!(c.encode().is_err());
+    }
+    #[test]
+    fn a_built_path_carries_every_segment_kind_over_the_wire() {
+        let path = Path::builder()
+            .move_to(0., 0.)
+            .line_to(20., 0.)
+            .quad_to(30., 10., 20., 20.)
+            .cubic_to(14., 28., 6., 28., 0., 20.)
+            .close()
+            .build()
+            .unwrap();
+        assert_eq!(path.segments.len(), 5);
+        assert!(!path.even_odd);
+
+        // Through the wire and back unchanged: a builder is only ergonomics over the same shape.
+        let mut canvas = Canvas::new();
+        canvas
+            .fill(path.clone(), Brush::Solid(Color(0xff00ffff)))
+            .unwrap();
+        let frame = Frame {
+            epoch: 1,
+            revision: 1,
+            canvas,
+        };
+        let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
+        assert_eq!(
+            decoded.canvas.commands(),
+            &[Command::Fill(path, Brush::Solid(Color(0xff00ffff)))]
+        );
+    }
+
+    #[test]
+    fn the_even_odd_rule_is_carried_by_the_path_that_asked_for_it() {
+        let ring = Path::builder()
+            .move_to(0., 0.)
+            .line_to(40., 0.)
+            .line_to(40., 40.)
+            .line_to(0., 40.)
+            .close()
+            .move_to(10., 10.)
+            .line_to(30., 10.)
+            .line_to(30., 30.)
+            .line_to(10., 30.)
+            .close()
+            .even_odd()
+            .build()
+            .unwrap();
+        assert!(
+            ring.even_odd,
+            "two subpaths and the even-odd rule is a hole"
+        );
+        assert_eq!(ring.segments.len(), 10);
+    }
+
+    #[test]
+    fn a_builder_reports_the_first_thing_that_went_wrong() {
+        // Two bad coordinates: the diagnosis names the first, not whichever was checked last.
+        let error = Path::builder()
+            .move_to(0., 0.)
+            .line_to(f64::NAN, 0.)
+            .line_to(0., f64::INFINITY)
+            .close()
+            .build()
+            .unwrap_err();
+        assert!(error.0.contains("coordinate"), "{error}");
+
+        // And a later good call does not clear an earlier failure.
+        assert!(
+            Path::builder()
+                .move_to(2e6, 0.)
+                .move_to(0., 0.)
+                .line_to(1., 1.)
+                .build()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_builder_refuses_a_path_the_wire_would_refuse() {
+        // Nothing at all.
+        assert!(Path::builder().build().is_err());
+
+        // A segment before any subpath was opened.
+        assert!(Path::builder().line_to(1., 1.).build().is_err());
+
+        // A close with nothing to close.
+        assert!(Path::builder().close().build().is_err());
+
+        // And the segment ceiling stops the vector growing rather than only failing at the end.
+        let mut builder = Path::builder().move_to(0., 0.);
+        for _ in 0..(MAX_PATH_SEGMENTS + 100) {
+            builder = builder.line_to(1., 1.);
+        }
+        assert_eq!(builder.len(), MAX_PATH_SEGMENTS);
+        assert!(builder.build().is_err());
+    }
+
+    #[test]
+    fn a_builder_and_a_shape_constructor_agree() {
+        // The same rectangle, written both ways.
+        let rect = Rect::new(0., 0., 10., 20.).unwrap();
+        let built = Path::builder()
+            .move_to(0., 0.)
+            .line_to(10., 0.)
+            .line_to(10., 20.)
+            .line_to(0., 20.)
+            .close()
+            .build()
+            .unwrap();
+        assert_eq!(built, Path::rectangle(rect).unwrap());
+    }
+
+    #[test]
+    fn a_default_stroke_is_one_the_wire_accepts() {
+        // A derived default left the miter limit at zero, which validation refuses — so every
+        // caller of `new` had to know to patch a field before the value could be sent.
+        StrokeStyle::default()
+            .validate()
+            .expect("the default validates");
+        StrokeStyle::new(2.)
+            .unwrap()
+            .validate()
+            .expect("a stroke of a given width validates");
+        assert_eq!(StrokeStyle::default().miter_limit, DEFAULT_MITER_LIMIT);
+        assert_eq!(DEFAULT_MITER_LIMIT.get(), 4.);
+
+        // A styled stroke built the easy way reaches the wire intact.
+        let mut canvas = Canvas::new();
+        let mut style = StrokeStyle::new(3.).unwrap();
+        style.cap = Cap::Round;
+        style.join = Join::Bevel;
+        style.dashes = vec![Scalar::new(6.).unwrap(), Scalar::new(3.).unwrap()];
+        canvas
+            .stroke_styled(
+                Path::rectangle(Rect::new(0., 0., 10., 10.).unwrap()).unwrap(),
+                Brush::Solid(Color(0xffffffff)),
+                style.clone(),
+            )
+            .unwrap();
+        let frame = Frame {
+            epoch: 1,
+            revision: 1,
+            canvas,
+        };
+        let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
+        let Command::StyledStroke(_, _, carried) = &decoded.canvas.commands()[0] else {
+            panic!("expected a styled stroke");
+        };
+        assert_eq!(carried, &style);
     }
 }
