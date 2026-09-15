@@ -16,6 +16,64 @@ pub const MAX_EVENT_TEXT_BYTES: usize = 4096;
 pub const MAX_EVENT_QUEUE_BYTES: usize = 128 * 1024;
 pub const MAX_OWNERS: usize = 16;
 
+/// Normative overlay modifier bits. A presenter MUST NOT set a reserved bit, and a receiver
+/// MUST reject an event that does. Platform bitmasks are translated, never forwarded.
+pub mod modifiers {
+    pub const SHIFT: u32 = 1;
+    pub const CONTROL: u32 = 1 << 1;
+    pub const ALT: u32 = 1 << 2;
+    pub const SUPER: u32 = 1 << 3;
+    pub const CAPS_LOCK: u32 = 1 << 4;
+    pub const NUM_LOCK: u32 = 1 << 5;
+    pub const KNOWN_MASK: u32 = SHIFT | CONTROL | ALT | SUPER | CAPS_LOCK | NUM_LOCK;
+}
+
+/// Normative overlay pointer buttons, sharing `desktop-surface-v1` section 7's assignment so a
+/// producer can accept either lane's events without knowing which presenter produced them.
+pub mod buttons {
+    pub const PRIMARY: u16 = 0;
+    pub const AUXILIARY: u16 = 1;
+    pub const SECONDARY: u16 = 2;
+    pub const BACK: u16 = 3;
+    pub const FORWARD: u16 = 4;
+    /// Additional device buttons occupy 5..=MAXIMUM. The range is bounded so a hostile or broken
+    /// device cannot force a producer to size per-button state from an untrusted number.
+    pub const MAXIMUM: u16 = 31;
+}
+
+/// Physical keys are USB HID keyboard-page usages, as in `desktop-surface-v1` section 7.
+pub mod keys {
+    pub const UNMAPPED: u32 = 0;
+    pub const FIRST_USAGE: u32 = 0x04;
+    pub const LAST_USAGE: u32 = 0xe7;
+    /// Zero reports a physical key the keyboard page does not name; it is not an identity.
+    pub fn valid(usage: u32) -> bool {
+        usage == UNMAPPED || (FIRST_USAGE..=LAST_USAGE).contains(&usage)
+    }
+}
+
+/// One wheel or trackpad delta together with the device detail a producer needs to interpret it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scroll {
+    pub dx: Scalar,
+    pub dy: Scalar,
+    /// True for pixel-precise devices such as trackpads, false for detented wheels.
+    pub precise: bool,
+    pub phase: ScrollPhase,
+}
+
+/// Whether a wheel delta came from a pixel-precise device and where it sits in a gesture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScrollPhase {
+    /// A device that reports no gesture boundaries, such as an ordinary detented wheel.
+    #[default]
+    None,
+    Began,
+    Changed,
+    Ended,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowMode {
     Floating,
@@ -79,6 +137,9 @@ pub enum Event {
         dx: Scalar,
         dy: Scalar,
         modifiers: u32,
+        /// True for pixel-precise devices such as trackpads, false for detented wheels.
+        precise: bool,
+        phase: ScrollPhase,
     },
     Key {
         physical: u32,
@@ -687,8 +748,7 @@ impl Windows {
     pub fn wheel(
         &mut self,
         position: Point,
-        dx: Scalar,
-        dy: Scalar,
+        scroll: Scroll,
         modifiers: u32,
         hit: impl Fn(SurfaceIdentity, Point) -> Option<(u64, HitRole)>,
     ) -> bool {
@@ -712,9 +772,11 @@ impl Windows {
                 id,
                 Event::Wheel {
                     position,
-                    dx,
-                    dy,
+                    dx: scroll.dx,
+                    dy: scroll.dy,
                     modifiers,
+                    precise: scroll.precise,
+                    phase: scroll.phase,
                 },
             );
             true
@@ -891,6 +953,18 @@ fn event_bytes(event: &Event) -> usize {
 }
 fn valid_event(event: &Event) -> bool {
     match event {
+        Event::Pointer {
+            button, modifiers, ..
+        } => {
+            modifiers & !modifiers::KNOWN_MASK == 0
+                && button.is_none_or(|(button, _)| button <= buttons::MAXIMUM)
+        }
+        Event::Wheel { modifiers, .. } => modifiers & !modifiers::KNOWN_MASK == 0,
+        Event::Key {
+            physical,
+            modifiers,
+            ..
+        } => modifiers & !modifiers::KNOWN_MASK == 0 && keys::valid(*physical),
         Event::Geometry { bounds, .. } => bounds.validate().is_ok(),
         Event::Text(text) => text.len() <= MAX_EVENT_TEXT_BYTES,
         Event::Ime { preedit, selection } => {
@@ -935,6 +1009,22 @@ mod tests {
         assert!(windows.get(neighbor).is_some());
         assert!(windows.take_overflow(id.context.session));
         assert!(!windows.take_overflow(id.context.session));
+    }
+    #[test]
+    fn capture_records_the_presenter_supplied_origin() {
+        // The presenter establishes capture from its own last observed pointer position, so the
+        // stored origin must be exactly what it passed: gestures measure their delta against it.
+        let mut windows = Windows::default();
+        let id = key(1, 1);
+        windows
+            .create(id, 1, options(WindowMode::Floating))
+            .unwrap();
+        windows.request_focus(id).unwrap();
+        let origin = Point::new(37.5, 12.25).unwrap();
+        windows.capture_pointer(id, origin).unwrap();
+        assert_eq!(windows.capture.map(|c| c.start), Some(origin));
+        windows.release_pointer(id);
+        assert!(!windows.has_pointer_capture());
     }
     fn key(owner: u64, id: u64) -> SurfaceIdentity {
         SessionIdentity::new(PresenterInstanceId([1; 16]), owner)
@@ -1064,32 +1154,30 @@ mod tests {
         state.create(b, 1, options(WindowMode::Floating)).unwrap();
         state.request_focus(b).unwrap();
         let p = Point::new(20., 20.).unwrap();
-        assert!(!state.wheel(p, Scalar::ZERO, Scalar::ONE, 0, |_, _| None));
-        assert!(state.wheel(p, Scalar::ZERO, Scalar::ONE, 0, |id, _| {
+        let scroll = Scroll {
+            dx: Scalar::ZERO,
+            dy: Scalar::ONE,
+            precise: true,
+            phase: ScrollPhase::Changed,
+        };
+        assert!(!state.wheel(p, scroll, 0, |_, _| None));
+        assert!(state.wheel(p, scroll, 0, |id, _| {
             (id == a).then_some((9, HitRole::Input))
         }));
         assert_eq!(state.focus(), Some(b));
         let event = state.take_event(a.context.session).unwrap();
-        assert!(
-            matches!(event.event, Event::Wheel { position, .. } if position == Point::new(10., 10.).unwrap())
-        );
+        // Device detail reaches the producer beside the delta, not folded into it.
+        assert!(matches!(
+            event.event,
+            Event::Wheel { position, precise: true, phase: ScrollPhase::Changed, .. }
+                if position == Point::new(10., 10.).unwrap()
+        ));
         state.close(a, DismissReason::Closed);
         state.create(a, 1, options(WindowMode::Modal)).unwrap();
-        assert!(state.wheel(
-            Point::new(900., 900.).unwrap(),
-            Scalar::ZERO,
-            Scalar::ONE,
-            0,
-            |_, _| None
-        ));
+        let outside = Point::new(900., 900.).unwrap();
+        assert!(state.wheel(outside, scroll, 0, |_, _| None));
         state.revoke_owner(a.context.session);
-        assert!(!state.wheel(
-            Point::new(900., 900.).unwrap(),
-            Scalar::ZERO,
-            Scalar::ONE,
-            0,
-            |_, _| None
-        ));
+        assert!(!state.wheel(outside, scroll, 0, |_, _| None));
         assert_eq!(state.focus(), Some(b));
     }
     #[test]

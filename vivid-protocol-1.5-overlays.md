@@ -213,7 +213,7 @@ a scene-revision boundary; dispatch for older queued events remains associated w
 | --- | --- |
 | 0 focus | boolean |
 | 1 pointer | `[point, region_id, button_or_null, modifiers]` |
-| 2 wheel | `[point, delta_x, delta_y, modifiers]` |
+| 2 wheel | `[point, delta_x, delta_y, modifiers, precise_boolean, phase]` |
 | 3 key | `[physical_key, down, repeat, modifiers]` |
 | 4 committed text | UTF-8 text |
 | 5 IME | `[preedit_text, selection_or_null]` |
@@ -221,13 +221,35 @@ a scene-revision boundary; dispatch for older queued events remains associated w
 | 7 dismissed | reason: Escape=0, outside press=1, explicit close=2, owner loss=3, parent close=4 |
 | 8 cancel | null |
 
-Points, rectangles, and wheel deltas use the drawing codec's Q32.32 geometry. A pointer button is
-`[u16_button, down_boolean]` or null for motion. Region IDs are u64 (zero denotes the default
-rectangular hit region); physical keys and modifier masks are u32. An IME selection is
-`[start_byte, end_byte]` with ordered u32 UTF-8 byte offsets at character boundaries inside the
-preedit string, or null. Language/platform adapters convert their native offset conventions.
-Committed text and preedit text are limited to 4096 UTF-8 bytes each. Unknown event types, extra
-array fields, invalid booleans, and narrowing overflow MUST be rejected before dispatch.
+Points, rectangles, and wheel deltas use the drawing codec's Q32.32 geometry. Region IDs are u64
+(zero denotes the default rectangular hit region). An IME selection is `[start_byte, end_byte]`
+with ordered u32 UTF-8 byte offsets at character boundaries inside the preedit string, or null.
+Language/platform adapters convert their native offset conventions. Committed text and preedit
+text are limited to 4096 UTF-8 bytes each. Unknown event types, extra array fields, invalid
+booleans, and narrowing overflow MUST be rejected before dispatch.
+
+Physical keys, pointer buttons, and modifier masks are normative values, not a presenter's
+platform representation. A presenter MUST translate its native encoding, and both a presenter and
+a producer MUST reject an event carrying a value outside these definitions rather than dispatch
+it. They deliberately match the `desktop-surface-v1` section 7 assignments so a producer can
+accept either lane's events without knowing which presenter produced them.
+
+- A **physical key** is a u32 USB HID keyboard-page usage in `0x04..=0xe7`. Zero reports a
+  physical key the keyboard page does not name and is never an identity. The presenter sends
+  physical transitions; the producer applies its own layout and repeat policy.
+- A **pointer button** is `[u16_button, down_boolean]`, or null for motion. Buttons are primary
+  (`0`), auxiliary (`1`), secondary (`2`), back (`3`), and forward (`4`). Additional device
+  buttons occupy `5..=31`; the range is bounded so a device cannot force a producer to size
+  per-button state from an untrusted number.
+- A **modifier mask** is a u32 of shift (`1`), control (`2`), alt (`4`), super (`8`), caps lock
+  (`16`), and num lock (`32`). All remaining bits are reserved and MUST be zero.
+
+A wheel record additionally carries the device detail a producer needs to interpret its delta.
+`precise_boolean` is true for pixel-precise devices such as trackpads and false for detented
+wheels, whose detents the presenter has already converted to logical pixels. `phase` is none
+(`0`), began (`1`), changed (`2`), ended (`3`), or cancelled (`4`); a device that reports no
+gesture boundaries uses none. Deltas remain logical pixels in both cases, so a producer that
+ignores both fields still scrolls correctly.
 
 `OVERLAY_INPUT_CAPTURE` (0x7031) requests or releases capture for a currently eligible focused
 window. `OVERLAY_INPUT_RENEW` (0x7032) renews the bounded input-lane lease. Host shortcuts are

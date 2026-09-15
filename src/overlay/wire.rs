@@ -9,7 +9,7 @@ use crate::identity::{SessionIdentity, SurfaceIdentity};
 use crate::messages::{MessageError, PayloadMap, StrictMap, invalid_value, validate_header_object};
 use crate::vector::{Point, Rect, Scalar};
 
-use super::{DismissReason, Event, WindowMode, WindowOptions, valid_event};
+use super::{DismissReason, Event, ScrollPhase, WindowMode, WindowOptions, valid_event};
 
 const SCHEMA: &str = "overlay";
 
@@ -541,6 +541,8 @@ impl InputEvent {
                 dx,
                 dy,
                 modifiers,
+                precise,
+                phase,
             } => (
                 2,
                 Value::Array(vec![
@@ -548,6 +550,14 @@ impl InputEvent {
                     scalar(*dx),
                     scalar(*dy),
                     u(u64::from(*modifiers)),
+                    Value::Bool(*precise),
+                    u(match phase {
+                        ScrollPhase::None => 0,
+                        ScrollPhase::Began => 1,
+                        ScrollPhase::Changed => 2,
+                        ScrollPhase::Ended => 3,
+                        ScrollPhase::Cancelled => 4,
+                    }),
                 ]),
             ),
             Event::Key {
@@ -620,12 +630,21 @@ impl InputEvent {
                 }
             }
             2 => {
-                let a = array::<4>(payload, 5)?;
+                let a = array::<6>(payload, 5)?;
                 Event::Wheel {
                     position: decode_point(&a[0], 5)?,
                     dx: decode_scalar(&a[1], 5)?,
                     dy: decode_scalar(&a[2], 5)?,
                     modifiers: small(&a[3], 5)?,
+                    precise: boolean(&a[4], 5)?,
+                    phase: match unsigned(&a[5], 5)? {
+                        0 => ScrollPhase::None,
+                        1 => ScrollPhase::Began,
+                        2 => ScrollPhase::Changed,
+                        3 => ScrollPhase::Ended,
+                        4 => ScrollPhase::Cancelled,
+                        _ => return Err(bad(5, "unknown scroll phase")),
+                    },
                 }
             }
             3 => {
@@ -678,6 +697,11 @@ impl InputEvent {
             8 if *payload == Value::Null => Event::Cancel,
             _ => return Err(bad(4, "unknown input event or invalid payload")),
         };
+        // A receiver must not dispatch a reserved modifier bit, an unbounded button, or a key
+        // outside the HID keyboard page, whatever a presenter claims.
+        if !valid_event(&event) {
+            return Err(bad(5, "invalid or oversized input payload"));
+        }
         Ok(Self {
             address,
             scene_revision: map.required_u64(3)?,
@@ -833,6 +857,7 @@ fn text(value: &Value) -> Result<&str, MessageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::overlay::{buttons, keys, modifiers};
     use crate::{cbor, identity::PresenterInstanceId};
 
     fn owner(id: u64) -> SessionIdentity {
@@ -1011,8 +1036,8 @@ mod tests {
             Event::Pointer {
                 position,
                 region: u64::MAX,
-                button: Some((u16::MAX, true)),
-                modifiers: u32::MAX,
+                button: Some((buttons::MAXIMUM, true)),
+                modifiers: modifiers::KNOWN_MASK,
             },
             Event::Pointer {
                 position,
@@ -1025,12 +1050,28 @@ mod tests {
                 dx: Scalar::new(-2.).unwrap(),
                 dy: Scalar::ONE,
                 modifiers: 2,
+                precise: true,
+                phase: ScrollPhase::Began,
+            },
+            Event::Wheel {
+                position,
+                dx: Scalar::ZERO,
+                dy: Scalar::ONE,
+                modifiers: 0,
+                precise: false,
+                phase: ScrollPhase::None,
             },
             Event::Key {
-                physical: u32::MAX,
+                physical: keys::LAST_USAGE,
                 down: true,
                 repeat: true,
                 modifiers: 3,
+            },
+            Event::Key {
+                physical: keys::UNMAPPED,
+                down: false,
+                repeat: false,
+                modifiers: 0,
             },
             Event::Text("é🦀".into()),
             Event::Ime {
@@ -1063,6 +1104,77 @@ mod tests {
                 input
             );
         }
+    }
+
+    #[test]
+    fn reserved_modifiers_unbounded_buttons_and_foreign_keys_are_refused() {
+        // These encodings are normative. A presenter that forwards a platform bitmask, an
+        // unbounded device button, or a non-HID key code must not reach a producer's dispatch.
+        let refused = [
+            Event::Pointer {
+                position: Point::new(1., 1.).unwrap(),
+                region: 0,
+                button: None,
+                modifiers: modifiers::KNOWN_MASK | (1 << 6),
+            },
+            Event::Pointer {
+                position: Point::new(1., 1.).unwrap(),
+                region: 0,
+                button: Some((buttons::MAXIMUM + 1, true)),
+                modifiers: 0,
+            },
+            Event::Wheel {
+                position: Point::new(1., 1.).unwrap(),
+                dx: Scalar::ZERO,
+                dy: Scalar::ONE,
+                modifiers: u32::MAX,
+                precise: false,
+                phase: ScrollPhase::None,
+            },
+            Event::Key {
+                physical: keys::LAST_USAGE + 1,
+                down: true,
+                repeat: false,
+                modifiers: 0,
+            },
+            Event::Key {
+                physical: keys::FIRST_USAGE - 1,
+                down: true,
+                repeat: false,
+                modifiers: 0,
+            },
+        ];
+        for event in refused {
+            let input = InputEvent {
+                address: address(),
+                scene_revision: 1,
+                event,
+            };
+            assert!(
+                input.payload().is_err(),
+                "{:?} must not encode",
+                input.event
+            );
+        }
+
+        // A hostile presenter cannot smuggle one past the decoder either.
+        let hostile = Value::Map(vec![
+            (0, u(1)),
+            (1, u(2)),
+            (2, u(1)),
+            (3, u(1)),
+            (4, u(3)),
+            (
+                5,
+                Value::Array(vec![
+                    u(u64::from(keys::FIRST_USAGE)),
+                    Value::Bool(true),
+                    Value::Bool(false),
+                    u(u64::from(modifiers::KNOWN_MASK) + 64),
+                ]),
+            ),
+        ]);
+        assert!(InputEvent::decode(2, &hostile).is_err());
     }
 
     #[test]
