@@ -474,6 +474,14 @@ impl Windows {
     pub fn focus(&self) -> Option<SurfaceIdentity> {
         self.focus
     }
+    /// The window `set_pane_focus(true)` would focus, without focusing it.
+    ///
+    /// A host that shares one state machine across several panes needs this: regaining focus is
+    /// only that pane's business if the window that comes back is one of its own, and after a loss
+    /// [`focus`](Self::focus) is `None`, so there is otherwise nothing left to ask.
+    pub fn restorable_focus(&self) -> Option<SurfaceIdentity> {
+        self.focus_candidate()
+    }
     pub fn has_pointer_capture(&self) -> bool {
         self.capture.is_some()
     }
@@ -823,13 +831,15 @@ impl Windows {
             self.emit(id, Event::Focus(true));
         }
     }
-    fn restore_focus(&mut self) {
-        let next = self
-            .focus_history
+    fn focus_candidate(&self) -> Option<SurfaceIdentity> {
+        self.focus_history
             .iter()
             .rev()
             .copied()
-            .find(|id| self.eligible(*id));
+            .find(|id| self.eligible(*id))
+    }
+    fn restore_focus(&mut self) {
+        let next = self.focus_candidate();
         self.change_focus(next);
     }
     pub fn close(&mut self, id: SurfaceIdentity, reason: DismissReason) {
