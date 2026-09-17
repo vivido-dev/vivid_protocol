@@ -58,6 +58,11 @@ state = "standards-track"
 prerequisites = ["live-media-v1"]
 
 [[profile]]
+name = "timed-media-sync-v1"
+state = "standards-track"
+prerequisites = ["timed-media-v1"]
+
+[[profile]]
 name = "audio-gain-v1"
 state = "standards-track"
 prerequisites = ["timed-media-v1"]
@@ -432,6 +437,12 @@ state = "standards-track"
 value = 0x0307
 name = "SET_AUDIO_GAIN"
 state = "standards-track"
+
+[[record]]
+value = 0x0308
+name = "PLAYBACK_HOLD"
+state = "standards-track"
+profile = "timed-media-sync-v1"
 
 [[record]]
 value = 0x0600

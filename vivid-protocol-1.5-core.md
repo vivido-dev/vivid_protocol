@@ -755,6 +755,7 @@ The following are actionable and never enter the coalesced observation queue:
 - `TARGET_CHANGED`;
 - `TRACK_LOST`;
 - `NEED_KEYFRAME` and `NEED_FULL_FRAME`;
+- `PLAYBACK_HOLD` when `timed-media-sync-v1` is negotiated;
 - `MAX_CHANNEL_DATA`;
 - `INPUT_REVOKED`, `INPUT_RESET`, and input watchdog renewal;
 - `CONTEXT_CHANGED` and `SESSION_LEASE_CHANGED`;

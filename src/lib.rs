@@ -32,6 +32,7 @@ pub mod scene;
 pub mod surface;
 pub mod target;
 pub mod time;
+pub mod timed;
 #[cfg(any(feature = "native", feature = "native-transport"))]
 pub mod trace;
 pub mod track;
