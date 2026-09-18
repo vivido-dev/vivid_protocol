@@ -38,6 +38,9 @@ normative:
    copying from a presenter into a producer-selected directory, and the `file-drop-path-v1`
    sub-profile that discloses the committed destination path.
 
+9. [Vivid 1.5 pane overlays](vivid-protocol-1.5-overlays.md) defines optional viewport windows,
+   portable vector scenes, and pane-local interaction.
+
 The machine-readable
 [Vivid 1.5 registry](vivid-protocol-1.5-registry.toml) is normative for numeric assignments and
 assignment status. A prose table and the registry disagreeing is a specification defect; until
@@ -131,9 +134,10 @@ implements the entire profile and every declared prerequisite.
 | `canvas-surface-v1` | Optional | Core | Logical terminal-free canvas target |
 | `live-media-v1` | Optional | Core and one surface profile | Immediate/live video, audio, raster, and image tracks |
 | `timed-media-v1` | Optional | `live-media-v1` | Exact-PTS playback, pause, flush, EOS, and drain |
+| `timed-media-sync-v1` | Optional | `timed-media-v1` | Authoritative holds and synchronized A/V starts |
 | `audio-gain-v1` | Optional | `timed-media-v1` | Track-scoped audio output gain |
 | `desktop-input-v1` | Optional | `desktop-surface-v1`, `live-media-v1` | Epoch-checked input binding and watchdog |
-| `file-drop-v1` | Optional | Core | User-gesture regular-file copy from presenter to producer |
+| `file-drop-v1` | Optional | Core | User-initiated regular-file copy (gesture, paste, or owner-only automation) from presenter to producer |
 | `file-drop-path-v1` | Optional | `file-drop-v1` | Committed absolute destination path on a successful `FILE_RESULT` |
 | `observability-v1` | Optional | Core | Bounded status, change events, and waits |
 | `web-carrier-v1` | Binding-selected | Core | WebTransport and WebSocket carrier constraints |
@@ -207,9 +211,10 @@ The following are not standards-track Vivid 1.5 behavior:
 - implicit input restoration after focus, policy, transport, or target loss;
 - unbounded capability catalogs, observation streams, or browser receive queues;
 - generic file transfer, filesystem browsing, clipboard, secure-attention sequence, credential
-  transport, or login approval; `file-drop-v1` is only the bounded user-gesture copy defined by
-  its normative part, and `file-drop-path-v1` adds only the committed destination path on a
-  successful result; and
+  transport, or login approval; `file-drop-v1` is only the bounded, user-initiated copy defined
+  by its normative part, and `file-drop-path-v1` adds only the committed destination path on a
+  successful result; `overlay-clipboard-v1` is only the bounded, focused, gesture-correlated
+  write defined by its normative part and cannot read a clipboard back; and
 - treating capture-policy bits as operating-system content protection.
 
 The experimental multiplexed carrier may be developed after the baseline object, authority, and

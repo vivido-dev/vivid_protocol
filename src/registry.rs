@@ -11,6 +11,7 @@ pub const DESKTOP_SURFACE: &str = "desktop-surface-v1";
 pub const CANVAS_SURFACE: &str = "canvas-surface-v1";
 pub const LIVE_MEDIA: &str = "live-media-v1";
 pub const TIMED_MEDIA: &str = "timed-media-v1";
+pub const TIMED_MEDIA_SYNC: &str = "timed-media-sync-v1";
 pub const AUDIO_GAIN: &str = "audio-gain-v1";
 pub const AUDIO_INPUT: &str = "audio-input-v1";
 pub const DESKTOP_INPUT: &str = "desktop-input-v1";
@@ -25,7 +26,41 @@ pub const TERMINAL_CONTENT: &str = "terminal-content-v1";
 pub const DESKTOP_CONTENT: &str = "desktop-content-v1";
 pub const CANVAS_CONTENT: &str = "canvas-content-v1";
 
+pub const TERMINAL_OVERLAY: &str = "terminal-overlay-v1";
+pub const VECTOR_SCENE: &str = "vector-scene-v1";
+pub const OVERLAY_INPUT: &str = "overlay-input-v1";
+pub const OVERLAY_TEXT: &str = "overlay-text-v1";
+pub const OVERLAY_TEXT_LAYOUT: &str = "overlay-text-layout-v1";
+pub const OVERLAY_TYPOGRAPHY: &str = "overlay-typography-v1";
+pub const OVERLAY_PAINT: &str = "overlay-paint-v1";
+pub const OVERLAY_POINTER: &str = "overlay-pointer-v1";
+pub const OVERLAY_CLIPBOARD: &str = "overlay-clipboard-v1";
+pub const OVERLAY_ENV: &str = "overlay-env-v1";
+pub const OVERLAY_A11Y: &str = "overlay-a11y-v1";
+
 pub mod record {
+    pub const SET_OVERLAY_WINDOW: u16 = 0x7020;
+    pub const OVERLAY_WINDOW_READY: u16 = 0x7021;
+    pub const OVERLAY_ACTION: u16 = 0x7022;
+    pub const QUERY_OVERLAY: u16 = 0x7023;
+    pub const OVERLAY_STATUS: u16 = 0x7024;
+    pub const MEASURE_OVERLAY_TEXT: u16 = 0x7025;
+    pub const OVERLAY_TEXT_MEASURED: u16 = 0x7026;
+    pub const SET_OVERLAY_EDITOR: u16 = 0x7027;
+    pub const MEASURE_OVERLAY_TEXT_BATCH: u16 = 0x7028;
+    pub const OVERLAY_TEXT_BATCH_MEASURED: u16 = 0x7029;
+    pub const RELEASE_OVERLAY_TEXT_LAYOUTS: u16 = 0x702a;
+    pub const OVERLAY_INPUT_EVENT: u16 = 0x7030;
+    pub const OVERLAY_INPUT_CAPTURE: u16 = 0x7031;
+    pub const OVERLAY_INPUT_RENEW: u16 = 0x7032;
+    pub const VECTOR_FRAME: u16 = 0x800d;
+    pub const VECTOR_ASSET: u16 = 0x800e;
+    pub const VECTOR_ASSET_RELEASE: u16 = 0x800f;
+    pub const OVERLAY_SUBMISSION_OUTCOME: u16 = 0x7033;
+    pub const OVERLAY_VIEWPORT_CHANGED: u16 = 0x7034;
+    pub const SET_OVERLAY_CLIPBOARD: u16 = 0x7035;
+    pub const OVERLAY_ENV_CHANGED: u16 = 0x7036;
+    pub const SET_OVERLAY_SEMANTICS: u16 = 0x7037;
     pub const HELLO: u16 = 0x0001;
     pub const WELCOME: u16 = 0x0002;
     pub const OK: u16 = 0x0003;
@@ -88,6 +123,7 @@ pub mod record {
     pub const DRAIN: u16 = 0x0304;
     pub const PLAYBACK_STATE: u16 = 0x0306;
     pub const SET_AUDIO_GAIN: u16 = 0x0307;
+    pub const PLAYBACK_HOLD: u16 = 0x0308;
 
     pub const CREATE_CONTEXT: u16 = 0x0600;
     pub const CONTEXT_READY: u16 = 0x0601;
@@ -294,6 +330,17 @@ impl std::error::Error for ProfileError {}
 pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
     match profile {
         CORE_CONTROL => Some(&[]),
+        TERMINAL_OVERLAY => Some(&[TERMINAL_SURFACE, VECTOR_SCENE]),
+        VECTOR_SCENE => Some(&[LIVE_MEDIA]),
+        OVERLAY_INPUT => Some(&[TERMINAL_OVERLAY]),
+        OVERLAY_TEXT => Some(&[OVERLAY_INPUT]),
+        OVERLAY_TEXT_LAYOUT => Some(&[OVERLAY_TEXT]),
+        OVERLAY_TYPOGRAPHY => Some(&[OVERLAY_TEXT_LAYOUT]),
+        OVERLAY_PAINT => Some(&[TERMINAL_OVERLAY]),
+        OVERLAY_POINTER => Some(&[TERMINAL_OVERLAY]),
+        OVERLAY_CLIPBOARD => Some(&[OVERLAY_INPUT]),
+        OVERLAY_ENV => Some(&[OVERLAY_INPUT]),
+        OVERLAY_A11Y => Some(&[TERMINAL_OVERLAY]),
         TERMINAL_SURFACE
         | DESKTOP_SURFACE
         | CANVAS_SURFACE
@@ -304,7 +351,7 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
         | MULTIPLEXED_SESSION_CARRIER => Some(&[CORE_CONTROL]),
         FILE_DROP_PATH => Some(&[FILE_DROP]),
         TIMED_MEDIA | AUDIO_INPUT => Some(&[LIVE_MEDIA]),
-        AUDIO_GAIN => Some(&[TIMED_MEDIA]),
+        AUDIO_GAIN | TIMED_MEDIA_SYNC => Some(&[TIMED_MEDIA]),
         DESKTOP_INPUT => Some(&[DESKTOP_SURFACE, LIVE_MEDIA]),
         _ => None,
     }
@@ -351,6 +398,37 @@ mod tests {
         validate_profile_set([FILE_DROP_PATH, FILE_DROP, CORE_CONTROL]).unwrap();
         assert!(matches!(
             validate_profile_set([FILE_DROP_PATH, CORE_CONTROL]),
+            Err(ProfileError::MissingPrerequisite { .. })
+        ));
+    }
+
+    #[test]
+    fn the_overlay_clipboard_profile_requires_overlay_input() {
+        // Reading a clipboard is a 1.5 non-goal with one narrow carve-out; the carve-out still
+        // depends on the input lane, so a set that omits it cannot be negotiated.
+        // The set must be sorted and unique, exactly as a negotiated list would be.
+        let mut profiles = vec![
+            OVERLAY_CLIPBOARD,
+            OVERLAY_INPUT,
+            TERMINAL_OVERLAY,
+            TERMINAL_SURFACE,
+            VECTOR_SCENE,
+            LIVE_MEDIA,
+            CORE_CONTROL,
+        ];
+        profiles.sort_unstable();
+        profiles.dedup();
+        validate_profile_set(profiles).unwrap();
+        assert!(matches!(
+            validate_profile_set([OVERLAY_CLIPBOARD, TERMINAL_OVERLAY]),
+            Err(ProfileError::MissingPrerequisite { .. })
+        ));
+    }
+
+    #[test]
+    fn the_overlay_environment_profile_requires_overlay_input() {
+        assert!(matches!(
+            validate_profile_set([OVERLAY_ENV, TERMINAL_OVERLAY, TERMINAL_SURFACE]),
             Err(ProfileError::MissingPrerequisite { .. })
         ));
     }

@@ -807,6 +807,74 @@ timestamps, buffering, trim, the audio master clock, or encoded data. Gain is re
 gain advances the track revision and sets changed-field bit 4 in `TRACK_CHANGED`. When this
 profile is accepted, `TRACK_STATUS` key 23 reports the current gain for audio tracks.
 
+### 15.2 Synchronized playback and presentation holds
+
+This subsection requires `timed-media-sync-v1`, with prerequisite `timed-media-v1`.
+The 1.5 preface and baseline start policy remain unchanged. Terminating gateways negotiate
+the extension independently on each hop and MUST NOT downgrade synchronized PLAY.
+
+PLAY key 9 additionally accepts `2` (synchronized). Optional key 11 is a nonzero surface
+hold serial, permitted only with policy 2. A resume naming a superseded serial is rejected.
+Admission installs the exact target but leaves the group buffering. The clock and audio
+consumption start together only after the clock track's minimum buffer is ready and every
+active video track has a current-generation decoded picture at or after the target. Old
+readiness cannot satisfy a new operation. Reference pictures before the target are decoded
+and discarded with normal reusable-capacity flow grants. Decoder-drained EOS, not merely
+accepted EOS, resolves a stream with no further eligible picture. No timeout may bypass the
+video barrier and start audio alone. PAUSE cancels the pending start while allowing a target
+picture to prime without advancing the frozen clock.
+
+A presenter MUST reject a minimum-buffer request it cannot satisfy within its bounded storage;
+it MUST NOT admit the request and silently start with a smaller buffer. Zero minimum duration
+does not waive the eligible-picture barrier.
+
+`PLAYBACK_HOLD` (`0x0308`) is an actionable, uncorrelated presenter-to-producer control record.
+Its object ID is the surface ID. It never enters a coalescing observation queue.
+
+| Key | Type | Meaning |
+|---:|---|---|
+| 0 | uint | Context ID |
+| 1 | uint | Surface ID |
+| 2 | uint | Nonzero monotonically increasing surface transition serial |
+| 3 | bool | Held |
+| 4 | uint | Reasons: not visible (bit 0), detached (bit 1), downstream replacement (bit 2), policy (bit 3) |
+| 5 | bool | Producer's playing intent, independent of hold |
+| 6 | bool | Decoder recovery required |
+| 7 | map, optional | Qualified frozen position; absent while unknown |
+
+The position map contains clock track ID (0), channel generation (1), u32 media epoch (2),
+signed PTS in microseconds (3), and estimated flag (4). Track ID and generation are nonzero.
+There is no group-wide epoch. TRACK_STATUS optional key 24 returns the same hold map for
+reconciliation. Unknown reason bits and fields are rejected. A held transition has at least
+one reason. Position refinements advance the serial. All identity and serial domains are
+local to the authenticated session; a relay translates them rather than copying authority.
+
+A terminating gateway MUST hold a timed group when its projection is removed. It stops audio,
+freezes the group clock, and preserves user play/pause intent. It may withhold ingress credit,
+but control, reverse channel traffic, and unrelated tracks remain serviceable. It obtains a
+physical paused clock observation before disposing of reachable downstream decoders. Abrupt
+loss uses the last validated physical observation marked estimated, never accepted packet PTS.
+An explicit newer seek overrides a pending old-position observation. Holds survive lease
+reconciliation and disappear with their owning surface. Hidden startup and completion waits
+return NOT_VISIBLE; clients retry bounded waits after release.
+
+NEED_KEYFRAME reason 6 means presentation resumed with decoder replacement. Optional key 7 is
+the signed resume PTS and required key 8 is the nonzero hold serial. These fields are forbidden
+on reasons 1–5. Unknown PTS remains absent, rather than being fabricated from ingress progress.
+The producer correlates the request with current hold state and retires old generations before
+cancelling their writes. It primes replacement channels from a preceding random-access unit,
+then uses synchronized PLAY at the target and catch-up delivery for decoder references. A
+producer may instead choose a later random-access point, provided every group member uses that
+same new target. Duplicate recovery requests must not restart a completed transition.
+
+Lateness alone is not decoder failure and MUST NOT produce reason 2. Drop late presentation,
+report clock and late-drop progress, and preserve decoder references. Reason 5 retains its
+existing meaning of relay packet loss with otherwise intact decoder state.
+
+Withheld flow is normal during holds and congestion. A media write's elapsed duration alone
+does not prove peer failure. Control liveness, explicit channel failure, or user cancellation
+govern termination; queues and reservations remain bounded while waiting.
+
 ## 16. Media conformance
 
 A producer:

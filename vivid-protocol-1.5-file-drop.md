@@ -5,15 +5,25 @@
 
 ## 1. Scope and invariants
 
-`file-drop-v1` copies one regular file selected by a local operating-system drag gesture from the
-presenter to a directory selected entirely by the producer. It is not a generic file-transfer or
-filesystem-browsing facility. It does not define directories, symbolic links, MIME-only data,
-move, drag-out, native application drag injection, metadata preservation, or local path
-references.
+`file-drop-v1` copies one regular file selected at the presenter to a directory selected entirely by
+the producer. It is not a generic file-transfer or filesystem-browsing facility. It does not define
+directories, symbolic links, MIME-only data, move, drag-out, native application drag injection,
+metadata preservation, or local path references.
 
-The presenter MUST NOT create an offer without a current OS file-drop gesture and an effective
-binding. A suggested name is inert. No record contains a source path, URI, machine identifier,
-timestamp, mode, or source hash. A destination path appears in exactly one place: `FILE_RESULT`
+The presenter MUST NOT create an offer without an effective binding and one of these origins:
+
+1. a current OS file-drop gesture;
+2. an explicit paste keystroke naming a file or clipboard media; or
+3. an owner-only local automation request, made on the presenter's own authenticated automation
+   channel, that names the target window and the file.
+
+The producer cannot tell the origins apart and MUST NOT need to: every origin produces
+byte-identical records. An automation origin carries no authority a gesture lacks. Its file is
+opened, checked, and retained by the presenter under exactly the rules of §3, and its request never
+reaches the producer.
+
+A suggested name is inert. No record contains a source path, URI, machine identifier, timestamp,
+mode, or source hash. On the wire a destination path appears in exactly one place: `FILE_RESULT`
 key 5, only under `file-drop-path-v1` and only on a committed or already-committed result, as
 defined in section 8. File bytes never use a terminal PTY.
 
@@ -192,7 +202,10 @@ control, input revocation/reset, audio flow, rendering, or unrelated tracks.
 
 Consent is presenter policy, not producer authority. A presenter exposes a trusted indication
 that a drop will copy bytes to a remote shell or desktop and MUST NOT render producer text as a
-trusted destination identity. A local deployment may require first-use consent for each complete
+trusted destination identity. The indication applies to every origin in §1: a drop started by
+automation is shown to the person as a gesture's is, never made silent. A presenter MUST NOT fall
+back to typing a local path for an automation origin that has no effective binding; it reports the
+refusal to the requester instead. A local deployment may require first-use consent for each complete
 logical binding. When no effective binding exists, terminal filename-paste behavior is outside
 this profile and remains unchanged.
 
@@ -230,3 +243,10 @@ Key 5 is producer-supplied data, never a presenter-trusted identity. A presenter
 every property above before use and MUST NOT treat the value as evidence about the producer's
 host. A presenter that types the path into a terminal types it as ordinary text for a binding the
 presenter itself created, never as a command.
+
+A presenter MAY return a revalidated key 5 to the local owner-only automation requester that
+started that drop (§1, origin 3), and to no one else. It still never appears in `FILE_DROP_STATUS`,
+a diagnostic, or a log. Whether a presenter offers this profile and whether it types a committed
+path are separate decisions. A presenter MAY offer the profile while typing nothing, so that an
+automation requester receives the path, and it SHOULD type an automation origin's path only when
+that requester asked for it.

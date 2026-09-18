@@ -603,12 +603,57 @@ impl ImageConfiguration {
     }
 }
 
+/// Immutable logical extent and byte ceiling of a retained vector track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorConfiguration {
+    pub width: u32,
+    pub height: u32,
+    pub maximum_scene_bytes: u32,
+}
+impl VectorConfiguration {
+    fn to_value(&self) -> Result<Value, MessageError> {
+        if self.width == 0
+            || self.height == 0
+            || self.width > 16384
+            || self.height > 16384
+            || self.maximum_scene_bytes == 0
+            || self.maximum_scene_bytes as usize > crate::vector::MAX_SCENE_BYTES
+        {
+            return Err(invalid_value(
+                "vector configuration",
+                0,
+                "exceeds vector limits",
+            ));
+        }
+        Ok(Value::Map(vec![
+            (0, Value::Unsigned(u64::from(self.width))),
+            (1, Value::Unsigned(u64::from(self.height))),
+            (2, Value::Unsigned(u64::from(self.maximum_scene_bytes))),
+        ]))
+    }
+    fn from_value(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("vector configuration", value, &[0, 1, 2])?;
+        let read = |key| {
+            u32::try_from(map.required_u64(key)?)
+                .map_err(|_| invalid_value("vector configuration", key, "exceeds u32"))
+        };
+        let config = Self {
+            width: read(0)?,
+            height: read(1)?,
+            maximum_scene_bytes: read(2)?,
+        };
+        config.to_value()?;
+        Ok(config)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KindConfiguration {
     Video(VideoConfiguration),
     Audio(AudioConfiguration),
     Raster(RasterConfiguration),
     EncodedImage(ImageConfiguration),
+    VectorScene(VectorConfiguration),
 }
 
 impl KindConfiguration {
@@ -618,6 +663,7 @@ impl KindConfiguration {
             Self::Audio(_) => TrackKind::Audio,
             Self::Raster(_) => TrackKind::Raster,
             Self::EncodedImage(_) => TrackKind::EncodedImage,
+            Self::VectorScene(_) => TrackKind::VectorScene,
         }
     }
 
@@ -627,11 +673,15 @@ impl KindConfiguration {
             Self::Audio(value) => value.to_value(),
             Self::Raster(value) => value.to_value(),
             Self::EncodedImage(value) => value.to_value(),
+            Self::VectorScene(value) => value.to_value(),
         }
     }
 
     fn from_value(kind: TrackKind, value: &Value) -> Result<Self, MessageError> {
         match kind {
+            TrackKind::VectorScene => {
+                Ok(Self::VectorScene(VectorConfiguration::from_value(value)?))
+            }
             TrackKind::Video => Ok(Self::Video(VideoConfiguration::from_value(value)?)),
             TrackKind::Audio => Ok(Self::Audio(AudioConfiguration::from_value(value)?)),
             TrackKind::Raster => Ok(Self::Raster(RasterConfiguration::from_value(value)?)),
@@ -702,6 +752,15 @@ impl TrackConfiguration {
                 "uplink requires live realtime audio without a surface slot or retained pixels",
             ));
         }
+        if matches!(self.kind, KindConfiguration::VectorScene(_))
+            && (self.slot != 5 || self.mode != TrackMode::Live || self.lane != LaneClass::Bulk)
+        {
+            return Err(invalid_value(
+                "track configuration",
+                3,
+                "vector scenes require live bulk visual slot 5",
+            ));
+        }
         require_nonzero("track configuration", 0, self.context_id)?;
         require_nonzero("track configuration", 1, self.surface_id)?;
         if probe {
@@ -757,6 +816,9 @@ impl TrackConfiguration {
                 media::rgba8_raw_frame_body_len(configuration.width, configuration.height)
             }
             KindConfiguration::EncodedImage(configuration) => Ok(configuration.encoded_length),
+            KindConfiguration::VectorScene(configuration) => {
+                Ok(configuration.maximum_scene_bytes + 12)
+            }
         }
         .map_err(|_| {
             invalid_value(

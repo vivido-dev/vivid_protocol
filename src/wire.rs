@@ -371,6 +371,15 @@ struct WriterState {
     unflushed_records: usize,
 }
 
+#[cfg(any(feature = "native", feature = "native-transport"))]
+impl WriterState {
+    fn close(&mut self) {
+        self.closed = true;
+        self.unflushed_records = 0;
+        self.io = WriterIo::Sink(io::sink());
+    }
+}
+
 /// Cloneable, sequence-safe half of a Vivid connection.
 #[derive(Clone)]
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -478,6 +487,9 @@ impl ConnectionWriter {
         })?;
         let body_length = u32::try_from(body_length)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record body exceeds u32"))?;
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
+        }
         let mut state = self
             .state
             .lock()
@@ -501,10 +513,12 @@ impl ConnectionWriter {
             object_id,
             sequence: state.send_sequence,
         };
-        write_writer_parts(&mut state.io, &header.encode(), parts)?;
+        let written = write_writer_parts(&mut state.io, &header.encode(), parts);
         if self.shutdown_requested.load(Ordering::Acquire) {
+            state.close();
             return Err(writer_closed_error());
         }
+        written?;
 
         state.unflushed_records = state.unflushed_records.saturating_add(1);
         let must_flush = state.flush_mode == FlushMode::Immediate
@@ -527,7 +541,12 @@ impl ConnectionWriter {
             || has_correlated_control_envelope(record_type, parts)
             || state.unflushed_records >= BATCH_RECORD_LIMIT;
         if must_flush {
-            flush_writer(&mut state.io)?;
+            let flushed = flush_writer(&mut state.io);
+            if self.shutdown_requested.load(Ordering::Acquire) {
+                state.close();
+                return Err(writer_closed_error());
+            }
+            flushed?;
             state.unflushed_records = 0;
         }
         Ok(header.sequence)
@@ -585,26 +604,35 @@ impl ConnectionWriter {
     pub fn shutdown(&self) -> io::Result<()> {
         // Publish cancellation before waking a native syscall. Some platforms may report a
         // concurrently shut-down write as successful even though its bytes were discarded.
-        self.shutdown_requested.store(true, Ordering::Release);
-        // Wake native readers and writers before waiting for an in-flight record to finish.
-        let result = self
+        if self.shutdown_requested.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let native = self
             .native_shutdown
             .lock()
             .map_err(|_| io::Error::other("Vivid shutdown lock is poisoned"))?
-            .take()
-            .map_or(Ok(()), |io| io.shutdown());
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
-        if state.closed {
-            return Ok(());
-        }
-        state.closed = true;
-        state.unflushed_records = 0;
-        // Dropping a live adapter is its transport-independent close signal. Native socket
-        // shutdown above is still required because their read and write halves are cloned.
-        state.io = WriterIo::Sink(io::sink());
+            .take();
+        let result = native.as_ref().map_or(Ok(()), NativeShutdown::shutdown);
+        // Windows can leave a synchronous send pending after shutdown until the peer releases
+        // its paused decoder. Waiting for the writer lock here prevents a gateway from sending
+        // the independent DESTROY_TRACK that releases that decoder. Publish cancellation and
+        // return; the in-flight writer closes its transport when the syscall finishes.
+        let mut state = if native.is_some() {
+            match self.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::WouldBlock) => return result,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(io::Error::other("Vivid connection writer lock is poisoned"));
+                }
+            }
+        } else {
+            // Generic adapters have no native shutdown handle; dropping the adapter remains
+            // their close mechanism. Its owner must cancel blocked custom I/O separately.
+            self.state
+                .lock()
+                .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?
+        };
+        state.close();
         result
     }
 
@@ -1403,6 +1431,36 @@ mod tests {
 
     #[test]
     #[cfg(any(feature = "native", feature = "native-transport"))]
+    fn native_shutdown_and_subsequent_writes_do_not_wait_for_writer_lock() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let connection = Connection::open(
+            &Endpoint::Tcp(listener.local_addr().unwrap().to_string()),
+            ConnectionKind::Track,
+        )
+        .unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let writer = connection.writer();
+        let state = writer.state.lock().unwrap();
+        let closing = writer.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            closing.shutdown().unwrap();
+            closing.shutdown().unwrap();
+            assert_eq!(
+                closing.write_record(0x1234, 0, 1, &[]).unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            tx.send(()).unwrap();
+        });
+        let completed = rx.recv_timeout(Duration::from_secs(2));
+        // Release even on failure so the broken implementation cannot hang the test suite.
+        drop(state);
+        closer.join().unwrap();
+        completed.expect("cancellation or a new write waited for the writer mutex");
+    }
+
+    #[test]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
     fn shutdown_interrupts_a_blocked_write_without_closing_another_connection() {
         use std::sync::mpsc;
         use std::time::Instant;
@@ -1454,6 +1512,9 @@ mod tests {
             );
             std::thread::yield_now();
         }
+        // Let the worker enter the OS send, rather than cancelling in the tiny interval
+        // between taking the writer mutex and issuing that syscall.
+        std::thread::sleep(Duration::from_millis(50));
         let (closed_tx, closed_rx) = mpsc::channel();
         let closing = writer.clone();
         let closer = std::thread::spawn(move || closed_tx.send(closing.shutdown()).unwrap());
