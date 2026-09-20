@@ -1465,19 +1465,18 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Instant;
 
+        // Scheduling-dependent bounds only catch genuinely wedged code; generous so a
+        // loaded installer-build machine cannot trip them.
+        const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+        // Grace to distinguish a blocked sender from one whose payload fit in the buffers.
+        const BLOCK_GRACE: Duration = Duration::from_millis(100);
+        const MAX_BLOCK_ATTEMPTS: u32 = 5;
+        // Largest body the Track limit admits. The fill loop saturates the send buffer,
+        // but the peer's receive buffer (with autotuning) may still accept megabytes, so
+        // a small payload can complete before shutdown and make the run vacuous.
+        const PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (peer, _) = listener.accept().unwrap();
-        let mut filling = stream.try_clone().unwrap();
-        let connection = Connection::new_version(
-            Some(ReaderIo::Tcp(stream.try_clone().unwrap())),
-            WriterIo::Tcp(stream),
-            ConnectionKind::Track,
-            VIVID_MAJOR,
-            VIVID_MINOR,
-        )
-        .unwrap();
-        let (_reader, writer) = connection.split().unwrap();
         // Keep a second owner alive through cancellation, reusing object ID 1 below.
         let neighbor = Connection::open(
             &Endpoint::Tcp(listener.local_addr().unwrap().to_string()),
@@ -1486,56 +1485,82 @@ mod tests {
         .unwrap();
         let (mut neighbor_peer, _) = listener.accept().unwrap();
         neighbor_peer
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(SETTLE_TIMEOUT))
             .unwrap();
-        // Fill the socket before starting the record write, without relying on buffer sizes.
-        filling.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            assert!(Instant::now() < deadline, "socket did not saturate");
-            match filling.write(&[0; 65536]) {
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("fill failed: {error}"),
-            }
-        }
-        filling.set_nonblocking(false).unwrap();
-        let sending = writer.clone();
-        let sender = std::thread::spawn(move || {
-            sending.write_record(0x1234, 0, 1, &vec![0; 4 * 1024 * 1024])
-        });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while writer.state.try_lock().is_ok() {
-            assert!(
-                Instant::now() < deadline,
-                "record write never took the lock"
-            );
-            std::thread::yield_now();
-        }
-        // Let the worker enter the OS send, rather than cancelling in the tiny interval
-        // between taking the writer mutex and issuing that syscall.
-        std::thread::sleep(Duration::from_millis(50));
-        let (closed_tx, closed_rx) = mpsc::channel();
-        let closing = writer.clone();
-        let closer = std::thread::spawn(move || closed_tx.send(closing.shutdown()).unwrap());
-        let result = closed_rx.recv_timeout(Duration::from_secs(2));
-        // Always release the worker, including when running this regression against broken code.
-        let _ = peer.shutdown(Shutdown::Both);
-        assert!(sender.join().unwrap().is_err());
-        closer.join().unwrap();
-        result
-            .expect("shutdown waited for the blocked write")
-            .unwrap();
-        writer.shutdown().unwrap();
-        assert_eq!(
-            writer.write_record(0x1234, 0, 1, &[]).unwrap_err().kind(),
-            io::ErrorKind::BrokenPipe
-        );
 
-        neighbor.writer().write_record(0x1234, 0, 1, &[7]).unwrap();
-        let mut received = vec![0; PREFACE_SIZE + HEADER_SIZE + 1];
-        neighbor_peer.read_exact(&mut received).unwrap();
-        assert_eq!(received.last(), Some(&7));
+        for _attempt in 0..MAX_BLOCK_ATTEMPTS {
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (peer, _) = listener.accept().unwrap();
+            let mut filling = stream.try_clone().unwrap();
+            let connection = Connection::new_version(
+                Some(ReaderIo::Tcp(stream.try_clone().unwrap())),
+                WriterIo::Tcp(stream),
+                ConnectionKind::Track,
+                VIVID_MAJOR,
+                VIVID_MINOR,
+            )
+            .unwrap();
+            let (_reader, writer) = connection.split().unwrap();
+            // Fill the socket before starting the record write, without relying on buffer sizes.
+            filling.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + SETTLE_TIMEOUT;
+            loop {
+                assert!(Instant::now() < deadline, "socket did not saturate");
+                match filling.write(&[0; 65536]) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("fill failed: {error}"),
+                }
+            }
+            filling.set_nonblocking(false).unwrap();
+            let sending = writer.clone();
+            let sender = std::thread::spawn(move || {
+                sending.write_record(0x1234, 0, 1, &vec![0; PAYLOAD_BYTES])
+            });
+            let deadline = Instant::now() + SETTLE_TIMEOUT;
+            while writer.state.try_lock().is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "record write never took the lock"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Let the worker enter the OS send, rather than cancelling in the tiny interval
+            // between taking the writer mutex and issuing that syscall.
+            std::thread::sleep(BLOCK_GRACE);
+            if sender.is_finished() {
+                // Kernel buffers swallowed the payload, so shutdown cannot interrupt
+                // anything. Release and retry with fresh sockets.
+                let _ = peer.shutdown(Shutdown::Both);
+                let _ = sender.join();
+                continue;
+            }
+            // The sender holds the lock without returning: blocked in, or about to enter,
+            // the send syscall. Either way shutdown must interrupt it.
+            let (closed_tx, closed_rx) = mpsc::channel();
+            let closing = writer.clone();
+            let closer = std::thread::spawn(move || closed_tx.send(closing.shutdown()).unwrap());
+            let result = closed_rx.recv_timeout(SETTLE_TIMEOUT);
+            // Always release the worker, including when running this regression against broken code.
+            let _ = peer.shutdown(Shutdown::Both);
+            assert!(sender.join().unwrap().is_err());
+            closer.join().unwrap();
+            result
+                .expect("shutdown waited for the blocked write")
+                .unwrap();
+            writer.shutdown().unwrap();
+            assert_eq!(
+                writer.write_record(0x1234, 0, 1, &[]).unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+
+            neighbor.writer().write_record(0x1234, 0, 1, &[7]).unwrap();
+            let mut received = vec![0; PREFACE_SIZE + HEADER_SIZE + 1];
+            neighbor_peer.read_exact(&mut received).unwrap();
+            assert_eq!(received.last(), Some(&7));
+            return;
+        }
+        panic!("sender write never blocked after {MAX_BLOCK_ATTEMPTS} attempts");
     }
 
     #[test]
