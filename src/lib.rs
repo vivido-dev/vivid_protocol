@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod anchor;
+pub mod audio_input;
 pub mod auth;
 pub mod cbor;
 pub mod context;
@@ -23,6 +24,7 @@ pub mod lease;
 pub mod media;
 pub mod messages;
 pub mod observation;
+pub mod overlay;
 pub mod registry;
 pub mod resource;
 pub mod revision;
@@ -30,9 +32,11 @@ pub mod scene;
 pub mod surface;
 pub mod target;
 pub mod time;
+pub mod timed;
 #[cfg(any(feature = "native", feature = "native-transport"))]
 pub mod trace;
 pub mod track;
+pub mod vector;
 pub mod web;
 pub mod wire;
 
@@ -42,5 +46,8 @@ pub const VIVID_MINOR: u8 = 5;
 pub const CONTROL_MAX_RECORD_BODY: u32 = 1024 * 1024;
 pub const DEFAULT_MAX_RECORD_BODY: u32 = 64 * 1024 * 1024;
 pub const HARD_MAX_RECORD_BODY: u32 = 64 * 1024 * 1024;
+/// Ceiling an interactive lane may grant one record. The lane must stay responsive while bulk
+/// media is saturated, so it carries input and small snapshots rather than payloads.
+pub const LANE_MAX_RECORD_BODY: u32 = 64 * 1024;
 /// Maximum timeout carried by one correlated `WAIT_TRACK` request.
 pub const MAX_TRACK_WAIT_TIMEOUT_US: u64 = 30_000_000;

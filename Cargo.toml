@@ -1,6 +1,6 @@
 [package]
 name = "vivid_protocol"
-version = "1.5.4"
+version = "1.5.9"
 edition = "2024"
 rust-version = "1.87.0"
 license = "Apache-2.0"
@@ -31,8 +31,8 @@ hmac = "0.13"
 sha2 = "0.11"
 subtle = "2.6"
 zeroize = { version = "1.9", features = ["derive"] }
-zstd = { version = "0.13", optional = true }
-zstd-safe = { version = "7.2", optional = true }
+zstd = { version = "0.14", optional = true }
+zstd-safe = { version = "8", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ruzstd = "0.9"
@@ -40,6 +40,7 @@ ruzstd = "0.9"
 [[bench]]
 name = "stage0"
 harness = false
+required-features = ["native"]
 
 # The §7 model checker explores ~10^6 composed states and must stay a practical part of
 # `cargo test`. opt-level 1 keeps debug assertions and cheap incremental builds while bringing

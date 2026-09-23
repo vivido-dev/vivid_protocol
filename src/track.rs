@@ -534,7 +534,11 @@ pub struct ImageConfiguration {
 }
 
 impl ImageConfiguration {
-    fn validate(&self) -> Result<(), MessageError> {
+    /// Check the encoding, dimensions, and declared length against the media specification.
+    ///
+    /// Public so a producer can reject a container before it becomes a track configuration,
+    /// instead of each SDK binding reimplementing these bounds.
+    pub fn validate(&self) -> Result<(), MessageError> {
         if !(1..=2).contains(&self.encoding) {
             return Err(invalid_value(
                 "image configuration",
@@ -599,12 +603,57 @@ impl ImageConfiguration {
     }
 }
 
+/// Immutable logical extent and byte ceiling of a retained vector track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorConfiguration {
+    pub width: u32,
+    pub height: u32,
+    pub maximum_scene_bytes: u32,
+}
+impl VectorConfiguration {
+    fn to_value(&self) -> Result<Value, MessageError> {
+        if self.width == 0
+            || self.height == 0
+            || self.width > 16384
+            || self.height > 16384
+            || self.maximum_scene_bytes == 0
+            || self.maximum_scene_bytes as usize > crate::vector::MAX_SCENE_BYTES
+        {
+            return Err(invalid_value(
+                "vector configuration",
+                0,
+                "exceeds vector limits",
+            ));
+        }
+        Ok(Value::Map(vec![
+            (0, Value::Unsigned(u64::from(self.width))),
+            (1, Value::Unsigned(u64::from(self.height))),
+            (2, Value::Unsigned(u64::from(self.maximum_scene_bytes))),
+        ]))
+    }
+    fn from_value(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("vector configuration", value, &[0, 1, 2])?;
+        let read = |key| {
+            u32::try_from(map.required_u64(key)?)
+                .map_err(|_| invalid_value("vector configuration", key, "exceeds u32"))
+        };
+        let config = Self {
+            width: read(0)?,
+            height: read(1)?,
+            maximum_scene_bytes: read(2)?,
+        };
+        config.to_value()?;
+        Ok(config)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KindConfiguration {
     Video(VideoConfiguration),
     Audio(AudioConfiguration),
     Raster(RasterConfiguration),
     EncodedImage(ImageConfiguration),
+    VectorScene(VectorConfiguration),
 }
 
 impl KindConfiguration {
@@ -614,6 +663,7 @@ impl KindConfiguration {
             Self::Audio(_) => TrackKind::Audio,
             Self::Raster(_) => TrackKind::Raster,
             Self::EncodedImage(_) => TrackKind::EncodedImage,
+            Self::VectorScene(_) => TrackKind::VectorScene,
         }
     }
 
@@ -623,11 +673,15 @@ impl KindConfiguration {
             Self::Audio(value) => value.to_value(),
             Self::Raster(value) => value.to_value(),
             Self::EncodedImage(value) => value.to_value(),
+            Self::VectorScene(value) => value.to_value(),
         }
     }
 
     fn from_value(kind: TrackKind, value: &Value) -> Result<Self, MessageError> {
         match kind {
+            TrackKind::VectorScene => {
+                Ok(Self::VectorScene(VectorConfiguration::from_value(value)?))
+            }
             TrackKind::Video => Ok(Self::Video(VideoConfiguration::from_value(value)?)),
             TrackKind::Audio => Ok(Self::Audio(AudioConfiguration::from_value(value)?)),
             TrackKind::Raster => Ok(Self::Raster(RasterConfiguration::from_value(value)?)),
@@ -638,8 +692,34 @@ impl KindConfiguration {
     }
 }
 
+/// Media byte direction, independent of which role creates the track.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u64)]
+pub enum TrackDirection {
+    #[default]
+    Downlink = 0,
+    Uplink = 1,
+}
+
+impl TryFrom<u64> for TrackDirection {
+    type Error = MessageError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Downlink),
+            1 => Ok(Self::Uplink),
+            _ => Err(invalid_value(
+                "track configuration",
+                16,
+                "unknown direction",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackConfiguration {
+    pub direction: TrackDirection,
     pub context_id: u64,
     pub surface_id: u64,
     pub track_id: u64,
@@ -659,6 +739,28 @@ pub struct TrackConfiguration {
 
 impl TrackConfiguration {
     pub fn validate(&self, probe: bool) -> Result<(), MessageError> {
+        if self.direction == TrackDirection::Uplink
+            && (!matches!(self.kind, KindConfiguration::Audio(_))
+                || self.mode != TrackMode::Live
+                || self.lane != LaneClass::Realtime
+                || self.slot != 0
+                || self.retained_pixel_charge != 0)
+        {
+            return Err(invalid_value(
+                "track configuration",
+                16,
+                "uplink requires live realtime audio without a surface slot or retained pixels",
+            ));
+        }
+        if matches!(self.kind, KindConfiguration::VectorScene(_))
+            && (self.slot != 5 || self.mode != TrackMode::Live || self.lane != LaneClass::Bulk)
+        {
+            return Err(invalid_value(
+                "track configuration",
+                3,
+                "vector scenes require live bulk visual slot 5",
+            ));
+        }
         require_nonzero("track configuration", 0, self.context_id)?;
         require_nonzero("track configuration", 1, self.surface_id)?;
         if probe {
@@ -714,6 +816,9 @@ impl TrackConfiguration {
                 media::rgba8_raw_frame_body_len(configuration.width, configuration.height)
             }
             KindConfiguration::EncodedImage(configuration) => Ok(configuration.encoded_length),
+            KindConfiguration::VectorScene(configuration) => {
+                Ok(configuration.maximum_scene_bytes + 12)
+            }
         }
         .map_err(|_| {
             invalid_value(
@@ -736,7 +841,7 @@ impl TrackConfiguration {
 
     pub fn payload(&self, probe: bool) -> Result<PayloadMap, MessageError> {
         self.validate(probe)?;
-        Ok(vec![
+        let mut payload = vec![
             (0, Value::Unsigned(self.context_id)),
             (1, Value::Unsigned(self.surface_id)),
             (2, Value::Unsigned(self.track_id)),
@@ -753,7 +858,11 @@ impl TrackConfiguration {
             (13, Value::Unsigned(self.target_latency_us)),
             (14, Value::Unsigned(self.maximum_latency_us)),
             (15, Value::Unsigned(self.retained_pixel_charge)),
-        ])
+        ];
+        if self.direction != TrackDirection::Downlink {
+            payload.push((16, Value::Unsigned(self.direction as u64)));
+        }
+        Ok(payload)
     }
 
     pub fn decode(
@@ -764,12 +873,13 @@ impl TrackConfiguration {
         let map = StrictMap::new(
             "track configuration",
             payload,
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         )?;
         let track_id = map.required_u64(2)?;
         validate_header_object(header_object_id, track_id)?;
         let kind = TrackKind::try_from(map.required_u64(3)?)?;
         let configuration = Self {
+            direction: TrackDirection::try_from(map.optional_u64(16)?.unwrap_or(0))?,
             context_id: map.required_u64(0)?,
             surface_id: map.required_u64(1)?,
             track_id,
@@ -965,6 +1075,102 @@ impl SignedValue for Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// The exact keys and order of a `MAX_CHANNEL_DATA` body.
+    ///
+    /// Pinned against a literal rather than against another call to the same function: this is the
+    /// regression the three hand-written copies could not have, because each was its own authority
+    /// on what the map should contain.
+    #[test]
+    fn a_flow_grant_carries_the_owner_tuple_then_the_two_maxima() {
+        let address = TrackAddress {
+            context_id: 1,
+            surface_id: 2,
+            track_id: 3,
+            channel_generation: ChannelGeneration::new(4),
+        };
+
+        assert_eq!(
+            max_channel_data_payload(address, 65_536, 128),
+            vec![
+                (0, Value::Unsigned(1)),
+                (1, Value::Unsigned(2)),
+                (2, Value::Unsigned(3)),
+                (3, Value::Unsigned(4)),
+                (4, Value::Unsigned(65_536)),
+                (5, Value::Unsigned(128)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_keyframe_request_carries_its_minimum_epoch_and_reason() {
+        let address = TrackAddress {
+            context_id: 7,
+            surface_id: 8,
+            track_id: 9,
+            channel_generation: ChannelGeneration::new(2),
+        };
+
+        assert_eq!(
+            need_keyframe_payload(address, 5, 2),
+            vec![
+                (0, Value::Unsigned(7)),
+                (1, Value::Unsigned(8)),
+                (2, Value::Unsigned(9)),
+                (3, Value::Unsigned(2)),
+                (4, Value::Unsigned(5)),
+                (5, Value::Unsigned(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_full_frame_request_takes_its_reason_rather_than_assuming_one() {
+        // One presenter parameterised this reason and another hardcoded 1. Same value, but the
+        // shared encoder has to accept it or the two cannot both use this.
+        let address = TrackAddress {
+            context_id: 1,
+            surface_id: 1,
+            track_id: 1,
+            channel_generation: ChannelGeneration::new(1),
+        };
+
+        assert_eq!(
+            need_full_frame_payload(address, 1).last(),
+            Some(&(4, Value::Unsigned(1)))
+        );
+        assert_eq!(
+            need_full_frame_payload(address, 3).last(),
+            Some(&(4, Value::Unsigned(3)))
+        );
+    }
+
+    #[test]
+    fn every_channel_notification_opens_with_the_same_owner_tuple() {
+        // The property that makes a wrong-track notification impossible to misread: all three
+        // answer "which track" in keys 0 through 3, in one order.
+        let address = TrackAddress {
+            context_id: 11,
+            surface_id: 12,
+            track_id: 13,
+            channel_generation: ChannelGeneration::new(14),
+        };
+        let expected = [
+            (0, Value::Unsigned(11)),
+            (1, Value::Unsigned(12)),
+            (2, Value::Unsigned(13)),
+            (3, Value::Unsigned(14)),
+        ];
+
+        for payload in [
+            max_channel_data_payload(address, 1, 1),
+            need_keyframe_payload(address, 0, 0),
+            need_full_frame_payload(address, 1),
+        ] {
+            assert_eq!(&payload[..4], &expected[..], "payload: {payload:?}");
+        }
+    }
     use super::*;
 
     #[test]
@@ -1056,6 +1262,7 @@ mod tests {
     #[test]
     fn strict_raster_track_configuration_round_trips() {
         let configuration = TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 2,
             track_id: 3,
@@ -1092,6 +1299,7 @@ mod tests {
         opus_head.extend_from_slice(&[1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]);
         let maximum_record_body = media::audio_body_len(4_096).unwrap();
         let configuration = TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 2,
             track_id: 3,
@@ -1123,4 +1331,62 @@ mod tests {
             configuration
         );
     }
+}
+
+/// One track's complete owner tuple, as a presenter names it when notifying its producer.
+///
+/// The three channel notifications below all begin with it, in the same key order, because they all
+/// answer "which track" before they answer anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackAddress {
+    pub context_id: u64,
+    pub surface_id: u64,
+    pub track_id: u64,
+    pub channel_generation: ChannelGeneration,
+}
+
+impl TrackAddress {
+    fn prefix(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (2, Value::Unsigned(self.track_id)),
+            (3, Value::Unsigned(self.channel_generation.get())),
+        ]
+    }
+}
+
+/// The body of `MAX_CHANNEL_DATA`: the absolute cumulative maxima a channel may now reach.
+///
+/// These are the ceilings, not an increment. A presenter that sends a smaller maximum than it sent
+/// before is telling its producer nothing new, and media §6 makes the maxima monotonic for exactly
+/// that reason.
+pub fn max_channel_data_payload(
+    address: TrackAddress,
+    maximum_body_bytes: u64,
+    maximum_media_records: u64,
+) -> PayloadMap {
+    let mut payload = address.prefix();
+    payload.push((4, Value::Unsigned(maximum_body_bytes)));
+    payload.push((5, Value::Unsigned(maximum_media_records)));
+    payload
+}
+
+/// The body of `NEED_KEYFRAME`, media §13.
+///
+/// `minimum_epoch` is the epoch the presenter will accept a keyframe at or after; zero means the
+/// current one. `reason` distinguishes a decoder reset from a transport loss, and only the latter
+/// hands the replacement channel a fresh epoch.
+pub fn need_keyframe_payload(address: TrackAddress, minimum_epoch: u32, reason: u64) -> PayloadMap {
+    let mut payload = address.prefix();
+    payload.push((4, Value::Unsigned(u64::from(minimum_epoch))));
+    payload.push((5, Value::Unsigned(reason)));
+    payload
+}
+
+/// The body of `NEED_FULL_FRAME`, media §13: a raster delta chain that cannot continue.
+pub fn need_full_frame_payload(address: TrackAddress, reason: u64) -> PayloadMap {
+    let mut payload = address.prefix();
+    payload.push((4, Value::Unsigned(reason)));
+    payload
 }

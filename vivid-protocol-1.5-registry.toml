@@ -6,6 +6,8 @@ unlisted_numeric_state = "unassigned"
 # This file is the authoritative numeric-assignment source for Vivid 1.5.
 # Valid states are: reserved, experimental, standards-track, retired.
 # Numeric assignments are append-only within the Vivid 1.5 version.
+# Explicit [[record]] assignments take precedence over enclosing [[record_range]]
+# defaults; unlisted_numeric_state applies only outside all declared ranges.
 
 [[record_range]]
 start = 0x7000
@@ -56,6 +58,11 @@ state = "standards-track"
 prerequisites = ["live-media-v1"]
 
 [[profile]]
+name = "timed-media-sync-v1"
+state = "standards-track"
+prerequisites = ["timed-media-v1"]
+
+[[profile]]
 name = "audio-gain-v1"
 state = "standards-track"
 prerequisites = ["timed-media-v1"]
@@ -89,6 +96,11 @@ prerequisites = ["vivid-core-control-v1"]
 name = "multiplexed-session-carrier-v1"
 state = "experimental"
 prerequisites = ["vivid-core-control-v1"]
+
+[[profile]]
+name = "audio-input-v1"
+state = "standards-track"
+prerequisites = ["live-media-v1"]
 
 [[surface_profile]]
 name = "generic-content-v1"
@@ -124,6 +136,16 @@ state = "standards-track"
 [[connection_kind]]
 value = 3
 name = "FILE_TRANSFER"
+state = "standards-track"
+
+[[channel_advance_reason]]
+value = 1
+name = "TIMELINE_DISCONTINUITY"
+state = "standards-track"
+
+[[channel_advance_reason]]
+value = 3
+name = "RECOVERY"
 state = "standards-track"
 
 [[record]]
@@ -415,6 +437,12 @@ state = "standards-track"
 value = 0x0307
 name = "SET_AUDIO_GAIN"
 state = "standards-track"
+
+[[record]]
+value = 0x0308
+name = "PLAYBACK_HOLD"
+state = "standards-track"
+profile = "timed-media-sync-v1"
 
 [[record]]
 value = 0x0600
@@ -954,4 +982,187 @@ state = "standards-track"
 [[limit]]
 value = 30
 name = "SEEN_ANCHOR_IDS"
+state = "standards-track"
+
+# Pane-local vector overlay extension assignments.
+
+[[profile]]
+name = "terminal-overlay-v1"
+state = "standards-track"
+prerequisites = ["terminal-surface-v1", "vector-scene-v1"]
+
+[[profile]]
+name = "vector-scene-v1"
+state = "standards-track"
+prerequisites = ["live-media-v1"]
+
+[[profile]]
+name = "overlay-input-v1"
+state = "standards-track"
+prerequisites = ["terminal-overlay-v1"]
+
+[[record]]
+value = 0x7020
+name = "SET_OVERLAY_WINDOW"
+state = "standards-track"
+
+[[record]]
+value = 0x7021
+name = "OVERLAY_WINDOW_READY"
+state = "standards-track"
+
+[[record]]
+value = 0x7022
+name = "OVERLAY_ACTION"
+state = "standards-track"
+
+[[record]]
+value = 0x7023
+name = "QUERY_OVERLAY"
+state = "standards-track"
+
+[[record]]
+value = 0x7024
+name = "OVERLAY_STATUS"
+state = "standards-track"
+
+[[record]]
+value = 0x7030
+name = "OVERLAY_INPUT_EVENT"
+state = "standards-track"
+
+[[record]]
+value = 0x7031
+name = "OVERLAY_INPUT_CAPTURE"
+state = "standards-track"
+
+[[record]]
+value = 0x7032
+name = "OVERLAY_INPUT_RENEW"
+state = "standards-track"
+
+[[record]]
+value = 0x800d
+name = "VECTOR_FRAME"
+state = "standards-track"
+
+[[record]]
+value = 0x800e
+name = "VECTOR_ASSET"
+state = "standards-track"
+
+[[track_kind]]
+value = 5
+name = "vector-scene"
+state = "standards-track"
+
+[[visual_slot]]
+value = 5
+name = "vector-scene"
+state = "standards-track"
+
+[[welcome_extension]]
+value = 15
+name = "vector-limits"
+profile = "vector-scene-v1"
+state = "standards-track"
+
+[[record]]
+value = 0x800f
+name = "VECTOR_ASSET_RELEASE"
+state = "standards-track"
+
+[[record]]
+value = 0x7033
+name = "OVERLAY_SUBMISSION_OUTCOME"
+state = "standards-track"
+
+[[record]]
+value = 0x7034
+name = "OVERLAY_VIEWPORT_CHANGED"
+state = "standards-track"
+
+[[profile]]
+name = "overlay-text-v1"
+state = "standards-track"
+prerequisites = ["overlay-input-v1"]
+
+[[record]]
+value = 0x7025
+name = "MEASURE_OVERLAY_TEXT"
+state = "standards-track"
+
+[[record]]
+value = 0x7026
+name = "OVERLAY_TEXT_MEASURED"
+state = "standards-track"
+
+[[record]]
+value = 0x7027
+name = "SET_OVERLAY_EDITOR"
+state = "standards-track"
+
+[[profile]]
+name = "overlay-text-layout-v1"
+state = "standards-track"
+prerequisites = ["overlay-text-v1"]
+
+[[record]]
+value = 0x7028
+name = "MEASURE_OVERLAY_TEXT_BATCH"
+state = "standards-track"
+
+[[record]]
+value = 0x7029
+name = "OVERLAY_TEXT_BATCH_MEASURED"
+state = "standards-track"
+
+[[record]]
+value = 0x702a
+name = "RELEASE_OVERLAY_TEXT_LAYOUTS"
+state = "standards-track"
+
+[[profile]]
+name = "overlay-typography-v1"
+state = "standards-track"
+prerequisites = ["overlay-text-layout-v1"]
+
+[[profile]]
+name = "overlay-paint-v1"
+state = "standards-track"
+prerequisites = ["terminal-overlay-v1"]
+
+[[profile]]
+name = "overlay-pointer-v1"
+state = "standards-track"
+prerequisites = ["terminal-overlay-v1"]
+
+[[profile]]
+name = "overlay-clipboard-v1"
+state = "standards-track"
+prerequisites = ["overlay-input-v1"]
+
+[[record]]
+value = 0x7035
+name = "SET_OVERLAY_CLIPBOARD"
+state = "standards-track"
+
+[[profile]]
+name = "overlay-env-v1"
+state = "standards-track"
+prerequisites = ["overlay-input-v1"]
+
+[[record]]
+value = 0x7036
+name = "OVERLAY_ENV_CHANGED"
+state = "standards-track"
+
+[[profile]]
+name = "overlay-a11y-v1"
+state = "standards-track"
+prerequisites = ["terminal-overlay-v1"]
+
+[[record]]
+value = 0x7037
+name = "SET_OVERLAY_SEMANTICS"
 state = "standards-track"

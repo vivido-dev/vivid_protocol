@@ -1,15 +1,17 @@
 use std::io;
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
-use std::fs::{self, File};
+use crate::trace::{self, TraceComponent, TraceDirection, TraceGuard, TraceHop, TraceOutcome};
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use std::io::{IoSlice, Read, Write};
 #[cfg(any(feature = "native", feature = "native-transport"))]
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
 use std::os::unix::net::UnixStream;
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use std::path::{Path, PathBuf};
+#[cfg(any(feature = "native", feature = "native-transport"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use std::sync::{Arc, Mutex};
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -228,6 +230,20 @@ impl ReaderIo {
             Self::Other(_) => Ok(()),
         }
     }
+
+    fn set_read_deadline(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_read_timeout(timeout),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_read_timeout(timeout),
+            // The stream type is erased, so there is no portable way to bound a read of it.
+            // Report that instead of silently ignoring the deadline a caller believes it has.
+            Self::Other(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this connection's transport cannot bound a read",
+            )),
+        }
+    }
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -329,7 +345,7 @@ enum WriterIo {
     #[cfg(unix)]
     Unix(UnixStream),
     Live(Box<dyn Write + Send>),
-    Trace(File),
+    Trace(TraceGuard),
     Sink(io::Sink),
 }
 
@@ -348,10 +364,20 @@ impl WriterIo {
 #[cfg(any(feature = "native", feature = "native-transport"))]
 struct WriterState {
     io: WriterIo,
+    closed: bool,
     send_sequence: u64,
     send_body_limit: u32,
     flush_mode: FlushMode,
     unflushed_records: usize,
+}
+
+#[cfg(any(feature = "native", feature = "native-transport"))]
+impl WriterState {
+    fn close(&mut self) {
+        self.closed = true;
+        self.unflushed_records = 0;
+        self.io = WriterIo::Sink(io::sink());
+    }
 }
 
 /// Cloneable, sequence-safe half of a Vivid connection.
@@ -359,6 +385,40 @@ struct WriterState {
 #[cfg(any(feature = "native", feature = "native-transport"))]
 pub struct ConnectionWriter {
     state: Arc<Mutex<WriterState>>,
+    // Cancellation must not wait for the mutex held by a blocked transport write.
+    native_shutdown: Arc<Mutex<Option<NativeShutdown>>>,
+    shutdown_requested: Arc<AtomicBool>,
+}
+
+#[cfg(any(feature = "native", feature = "native-transport"))]
+enum NativeShutdown {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+#[cfg(any(feature = "native", feature = "native-transport"))]
+impl NativeShutdown {
+    fn from_writer(writer: &WriterIo) -> io::Result<Option<Self>> {
+        Ok(match writer {
+            WriterIo::Tcp(stream) => Some(Self::Tcp(stream.try_clone()?)),
+            #[cfg(unix)]
+            WriterIo::Unix(stream) => Some(Self::Unix(stream.try_clone()?)),
+            _ => None,
+        })
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        let result = match self {
+            Self::Tcp(stream) => stream.shutdown(Shutdown::Both),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.shutdown(Shutdown::Both),
+        };
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+            other => other,
+        }
+    }
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -411,6 +471,9 @@ impl ConnectionWriter {
         parts: &[&[u8]],
         checkpoint: bool,
     ) -> io::Result<u64> {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
+        }
         if flags & !RECORD_KNOWN_FLAGS != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -424,10 +487,16 @@ impl ConnectionWriter {
         })?;
         let body_length = u32::try_from(body_length)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record body exceeds u32"))?;
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
+        }
         if body_length > state.send_body_limit || body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -444,7 +513,12 @@ impl ConnectionWriter {
             object_id,
             sequence: state.send_sequence,
         };
-        write_writer_parts(&mut state.io, &header.encode(), parts)?;
+        let written = write_writer_parts(&mut state.io, &header.encode(), parts);
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            state.close();
+            return Err(writer_closed_error());
+        }
+        written?;
 
         state.unflushed_records = state.unflushed_records.saturating_add(1);
         let must_flush = state.flush_mode == FlushMode::Immediate
@@ -467,7 +541,12 @@ impl ConnectionWriter {
             || has_correlated_control_envelope(record_type, parts)
             || state.unflushed_records >= BATCH_RECORD_LIMIT;
         if must_flush {
-            flush_writer(&mut state.io)?;
+            let flushed = flush_writer(&mut state.io);
+            if self.shutdown_requested.load(Ordering::Acquire) {
+                state.close();
+                return Err(writer_closed_error());
+            }
+            flushed?;
             state.unflushed_records = 0;
         }
         Ok(header.sequence)
@@ -478,6 +557,9 @@ impl ConnectionWriter {
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
+        }
         if mode == FlushMode::Immediate && state.unflushed_records != 0 {
             flush_writer(&mut state.io)?;
             state.unflushed_records = 0;
@@ -491,6 +573,9 @@ impl ConnectionWriter {
             .state
             .lock()
             .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
+        }
         flush_writer(&mut state.io)?;
         state.unflushed_records = 0;
         Ok(())
@@ -498,11 +583,57 @@ impl ConnectionWriter {
 
     pub fn set_send_body_limit(&self, maximum: u32) -> io::Result<()> {
         validate_body_limit(maximum)?;
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?
-            .send_body_limit = maximum;
+            .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?;
+        if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(writer_closed_error());
+        }
+        state.send_body_limit = maximum;
         Ok(())
+    }
+
+    /// Close the underlying transport for every clone of this writer.
+    ///
+    /// A Vivid track channel has an independent connection and a reverse-channel reader. Merely
+    /// dropping the producer's write handle leaves that reader blocked and keeps the peer's
+    /// connection slot live. Shutdown is therefore explicit and shared: native sockets are shut
+    /// down in both directions, while stream adapters are dropped so multiplexed transports can
+    /// observe their own channel close.
+    pub fn shutdown(&self) -> io::Result<()> {
+        // Publish cancellation before waking a native syscall. Some platforms may report a
+        // concurrently shut-down write as successful even though its bytes were discarded.
+        if self.shutdown_requested.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let native = self
+            .native_shutdown
+            .lock()
+            .map_err(|_| io::Error::other("Vivid shutdown lock is poisoned"))?
+            .take();
+        let result = native.as_ref().map_or(Ok(()), NativeShutdown::shutdown);
+        // Windows can leave a synchronous send pending after shutdown until the peer releases
+        // its paused decoder. Waiting for the writer lock here prevents a gateway from sending
+        // the independent DESTROY_TRACK that releases that decoder. Publish cancellation and
+        // return; the in-flight writer closes its transport when the syscall finishes.
+        let mut state = if native.is_some() {
+            match self.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::WouldBlock) => return result,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(io::Error::other("Vivid connection writer lock is poisoned"));
+                }
+            }
+        } else {
+            // Generic adapters have no native shutdown handle; dropping the adapter remains
+            // their close mechanism. Its owner must cancel blocked custom I/O separately.
+            self.state
+                .lock()
+                .map_err(|_| io::Error::other("Vivid connection writer lock is poisoned"))?
+        };
+        state.close();
+        result
     }
 
     fn write_raw_preface(&self, preface: &[u8; PREFACE_SIZE]) -> io::Result<()> {
@@ -538,6 +669,16 @@ pub struct BorrowedRecord<'a> {
 impl ConnectionReader {
     fn clear_establishment_read_deadline(&mut self) -> io::Result<()> {
         self.io.clear_establishment_read_deadline()
+    }
+
+    /// Bound every subsequent [`ConnectionReader::read_record`] to a socket-level timeout.
+    ///
+    /// `None` restores unbounded reads. This is what lets a caller wait for one record without
+    /// committing to wait forever, which a language binding driving a transfer or lane from a
+    /// worker thread needs. Only native socket transports can honour it; anything else reports
+    /// [`io::ErrorKind::Unsupported`] rather than pretending the deadline exists.
+    pub fn set_read_deadline(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io.set_read_deadline(timeout)
     }
 
     pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
@@ -645,11 +786,11 @@ impl Connection {
         Self::new(Some(ReaderIo::Other(reader)), WriterIo::Live(writer), kind)
     }
 
+    /// Create a new, private metadata-only NDJSON trace. Existing paths are rejected.
+    /// No preface or record body is persisted. Dropping the last writer drains the bounded queue.
     pub fn trace(path: &Path, kind: ConnectionKind) -> io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        Self::new(None, WriterIo::Trace(File::create(path)?), kind)
+        let guard = TraceGuard::file(path, TraceComponent::Protocol, TraceHop::Local, [0; 16])?;
+        Self::new(None, WriterIo::Trace(guard), kind)
     }
 
     pub fn sink(kind: ConnectionKind) -> io::Result<Self> {
@@ -673,8 +814,11 @@ impl Connection {
             DEFAULT_MAX_RECORD_BODY
         };
         let writer = ConnectionWriter {
+            native_shutdown: Arc::new(Mutex::new(NativeShutdown::from_writer(&io)?)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(WriterState {
                 io,
+                closed: false,
                 send_sequence: 0,
                 send_body_limit: body_limit,
                 flush_mode: FlushMode::Immediate,
@@ -822,6 +966,14 @@ fn validate_body_limit(maximum: u32) -> io::Result<()> {
     }
 }
 
+#[cfg(any(feature = "native", feature = "native-transport"))]
+fn writer_closed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "Vivid connection writer is closed",
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectionalLimits {
     pub peer_limit: u32,
@@ -842,13 +994,30 @@ fn write_writer(io: &mut WriterIo, bytes: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         WriterIo::Unix(stream) => stream.write_all(bytes),
         WriterIo::Live(stream) => stream.write_all(bytes),
-        WriterIo::Trace(file) => file.write_all(bytes),
+        WriterIo::Trace(_) => Ok(()),
         WriterIo::Sink(sink) => sink.write_all(bytes),
     }
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
 fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
+    if let WriterIo::Trace(guard) = io {
+        let header = RecordHeader::decode(header.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid trace record header")
+        })?);
+        guard.emitter().emit(
+            TraceDirection::Send,
+            header.record_type,
+            u64::from(header.body_length),
+            header.sequence,
+            trace::object_kind(header.record_type, header.object_id),
+            Some(header.object_id),
+            None,
+            None,
+            TraceOutcome::Ok,
+        );
+        return Ok(());
+    }
     let mut part_index = 0_usize;
     let mut part_offset = 0_usize;
     while part_index <= parts.len() {
@@ -887,7 +1056,7 @@ fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::
                 #[cfg(unix)]
                 WriterIo::Unix(stream) => stream.write_vectored(&slices[..slice_count]),
                 WriterIo::Live(stream) => stream.write_vectored(&slices[..slice_count]),
-                WriterIo::Trace(file) => file.write_vectored(&slices[..slice_count]),
+                WriterIo::Trace(_) => unreachable!("trace handled before transport writes"),
                 WriterIo::Sink(sink) => sink.write_vectored(&slices[..slice_count]),
             };
             match result {
@@ -895,6 +1064,10 @@ fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::
                 result => break result?,
             }
         };
+        let offered: usize = slices[..slice_count].iter().map(|slice| slice.len()).sum();
+        if written > offered {
+            return Err(io::Error::other("writer reported more bytes than offered"));
+        }
         if written == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -978,7 +1151,7 @@ fn flush_writer(io: &mut WriterIo) -> io::Result<()> {
         #[cfg(unix)]
         WriterIo::Unix(stream) => stream.flush(),
         WriterIo::Live(stream) => stream.flush(),
-        WriterIo::Trace(file) => file.flush(),
+        WriterIo::Trace(_) => Ok(()),
         WriterIo::Sink(sink) => sink.flush(),
     }
 }
@@ -1112,8 +1285,11 @@ mod tests {
     #[cfg(any(feature = "native", feature = "native-transport"))]
     fn test_writer(writer: impl Write + Send + 'static, flush_mode: FlushMode) -> ConnectionWriter {
         ConnectionWriter {
+            native_shutdown: Arc::new(Mutex::new(None)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(WriterState {
                 io: WriterIo::Live(Box::new(writer)),
+                closed: false,
                 send_sequence: 0,
                 send_body_limit: 1024,
                 flush_mode,
@@ -1254,6 +1430,173 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
+    fn native_shutdown_and_subsequent_writes_do_not_wait_for_writer_lock() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let connection = Connection::open(
+            &Endpoint::Tcp(listener.local_addr().unwrap().to_string()),
+            ConnectionKind::Track,
+        )
+        .unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let writer = connection.writer();
+        let state = writer.state.lock().unwrap();
+        let closing = writer.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            closing.shutdown().unwrap();
+            closing.shutdown().unwrap();
+            assert_eq!(
+                closing.write_record(0x1234, 0, 1, &[]).unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            tx.send(()).unwrap();
+        });
+        let completed = rx.recv_timeout(Duration::from_secs(2));
+        // Release even on failure so the broken implementation cannot hang the test suite.
+        drop(state);
+        closer.join().unwrap();
+        completed.expect("cancellation or a new write waited for the writer mutex");
+    }
+
+    #[test]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
+    fn shutdown_interrupts_a_blocked_write_without_closing_another_connection() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        // Scheduling-dependent bounds only catch genuinely wedged code; generous so a
+        // loaded installer-build machine cannot trip them.
+        const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+        // Grace to distinguish a blocked sender from one whose payload fit in the buffers.
+        const BLOCK_GRACE: Duration = Duration::from_millis(100);
+        const MAX_BLOCK_ATTEMPTS: u32 = 5;
+        // Largest body the Track limit admits. The fill loop saturates the send buffer,
+        // but the peer's receive buffer (with autotuning) may still accept megabytes, so
+        // a small payload can complete before shutdown and make the run vacuous.
+        const PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // Keep a second owner alive through cancellation, reusing object ID 1 below.
+        let neighbor = Connection::open(
+            &Endpoint::Tcp(listener.local_addr().unwrap().to_string()),
+            ConnectionKind::Track,
+        )
+        .unwrap();
+        let (mut neighbor_peer, _) = listener.accept().unwrap();
+        neighbor_peer
+            .set_read_timeout(Some(SETTLE_TIMEOUT))
+            .unwrap();
+
+        for _attempt in 0..MAX_BLOCK_ATTEMPTS {
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (peer, _) = listener.accept().unwrap();
+            let mut filling = stream.try_clone().unwrap();
+            let connection = Connection::new_version(
+                Some(ReaderIo::Tcp(stream.try_clone().unwrap())),
+                WriterIo::Tcp(stream),
+                ConnectionKind::Track,
+                VIVID_MAJOR,
+                VIVID_MINOR,
+            )
+            .unwrap();
+            let (_reader, writer) = connection.split().unwrap();
+            // Fill the socket before starting the record write, without relying on buffer sizes.
+            filling.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + SETTLE_TIMEOUT;
+            loop {
+                assert!(Instant::now() < deadline, "socket did not saturate");
+                match filling.write(&[0; 65536]) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("fill failed: {error}"),
+                }
+            }
+            filling.set_nonblocking(false).unwrap();
+            let sending = writer.clone();
+            let sender = std::thread::spawn(move || {
+                sending.write_record(0x1234, 0, 1, &vec![0; PAYLOAD_BYTES])
+            });
+            let deadline = Instant::now() + SETTLE_TIMEOUT;
+            while writer.state.try_lock().is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "record write never took the lock"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Let the worker enter the OS send, rather than cancelling in the tiny interval
+            // between taking the writer mutex and issuing that syscall.
+            std::thread::sleep(BLOCK_GRACE);
+            if sender.is_finished() {
+                // Kernel buffers swallowed the payload, so shutdown cannot interrupt
+                // anything. Release and retry with fresh sockets.
+                let _ = peer.shutdown(Shutdown::Both);
+                let _ = sender.join();
+                continue;
+            }
+            // The sender holds the lock without returning: blocked in, or about to enter,
+            // the send syscall. Either way shutdown must interrupt it.
+            let (closed_tx, closed_rx) = mpsc::channel();
+            let closing = writer.clone();
+            let closer = std::thread::spawn(move || closed_tx.send(closing.shutdown()).unwrap());
+            let result = closed_rx.recv_timeout(SETTLE_TIMEOUT);
+            // Always release the worker, including when running this regression against broken code.
+            let _ = peer.shutdown(Shutdown::Both);
+            assert!(sender.join().unwrap().is_err());
+            closer.join().unwrap();
+            result
+                .expect("shutdown waited for the blocked write")
+                .unwrap();
+            writer.shutdown().unwrap();
+            assert_eq!(
+                writer.write_record(0x1234, 0, 1, &[]).unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+
+            neighbor.writer().write_record(0x1234, 0, 1, &[7]).unwrap();
+            let mut received = vec![0; PREFACE_SIZE + HEADER_SIZE + 1];
+            neighbor_peer.read_exact(&mut received).unwrap();
+            assert_eq!(received.last(), Some(&7));
+            return;
+        }
+        panic!("sender write never blocked after {MAX_BLOCK_ATTEMPTS} attempts");
+    }
+
+    #[test]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
+    fn writer_shutdown_closes_both_native_tcp_halves() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let writer_stream = stream.try_clone().unwrap();
+        let connection = Connection::new_version(
+            Some(ReaderIo::Tcp(stream)),
+            WriterIo::Tcp(writer_stream),
+            ConnectionKind::Track,
+            VIVID_MAJOR,
+            VIVID_MINOR,
+        )
+        .unwrap();
+        let (_reader, writer) = connection.split().unwrap();
+
+        writer.shutdown().unwrap();
+        writer.shutdown().unwrap();
+        assert_eq!(
+            writer.write_record(1, 0, 0, &[]).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        assert_eq!(
+            received,
+            encode_preface(ConnectionKind::Track, DEFAULT_MAX_RECORD_BODY),
+            "the peer did not observe EOF after the writer half retired"
+        );
+    }
+
+    #[test]
     #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
     fn split_clears_the_unix_establishment_deadlines() {
         let (stream, _peer) = UnixStream::pair().unwrap();
@@ -1324,8 +1667,11 @@ mod tests {
     fn cloned_writers_serialize_complete_records_and_sequences() {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writer = ConnectionWriter {
+            native_shutdown: Arc::new(Mutex::new(None)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(WriterState {
                 io: WriterIo::Live(Box::new(SharedBytes(bytes.clone()))),
+                closed: false,
                 send_sequence: 0,
                 send_body_limit: 16,
                 flush_mode: FlushMode::Immediate,
