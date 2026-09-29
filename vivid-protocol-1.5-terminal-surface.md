@@ -136,6 +136,19 @@ Scanners are fragmentation-safe and preserve malformed or oversized candidates b
 Accepting both APC and ConPTY forms is a deployment migration behavior; a session selects one
 emission form.
 
+On Windows, ConPTY may insert `CR LF` at a soft wrap within this printable envelope, optionally
+followed by `CSI row ; column H` and a repaint of the preceding character when the wrap scrolls
+the viewport. The repainted character must equal the preceding canonical character and is consumed
+with the CUP. A ConPTY binding reconstructs
+the canonical envelope by removing only these wrap insertions, including those within its prefix
+or suffix. CUP parameters are positive decimal values of at most five digits and at most 32767.
+The raw candidate, including insertions, is bounded to 2048 bytes; the canonical envelope still
+obeys the 192-byte limit and the exact field grammar above. Other control sequences are invalid,
+and malformed candidates remain byte-exact terminal data. Authentication and replay checks apply
+to the reconstructed fields without modification. Consumed wrap controls do not advance the
+presenter's text cursor or scroll its grid: they describe the zero-width marker's transport,
+not application text. The anchor belongs to the cursor position before the complete raw candidate.
+
 ### 4.3 Authenticator
 
 Let `context_id_be` and `anchor_id_be` be eight-byte big-endian values. Using the session
@@ -231,7 +244,7 @@ above rather than this clean-closure materialization.
 Anchors require:
 
 - the correct endpoint and authority reaching the producer;
-- marker bytes preserved exactly;
+- canonical marker bytes preserved exactly (after bounded ConPTY reconstruction in §4.2);
 - the marker reaching the presenter that issued the session tag; and
 - one unambiguous target terminal parser.
 

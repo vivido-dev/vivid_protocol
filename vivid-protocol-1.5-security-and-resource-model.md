@@ -1,5 +1,20 @@
 # Vivid Protocol 1.5 Security and Resource Model
 
+## Microphone consent and resource ownership
+
+When `audio-input-v1` is negotiated, the media specification's uplink rules supplement this model.
+Root/lease authentication authorizes creation of a microphone request, not opening the local
+capture device. Local user consent remains necessary and is revoked on mute or attachment loss.
+Labels supplied by producers are untrusted display text, not identity or routing authority.
+
+The complete owner/context/surface/track/channel-generation identity qualifies capture requests,
+flow grants, queued PCM, and cleanup. Gateway attachment identifiers additionally fence delivery
+across client replacement. Gateways do not transfer root secrets, channel keys, or flow authority.
+The media receiver is the uplink flow authority; it reserves finite ingress before issuing credit.
+Bitrate, record rate, in-flight bodies, and local PCM queues remain bounded even though no visual
+slot, retained pixels, playback decoder, or surface clock is created. A capture error or violation
+revokes only its route. No microphone media or capability material belongs in PTYs or diagnostics.
+
 This file is a normative part of the
 [Vivid Protocol 1.5 specification](vivid-protocol-1.5-spec.md).
 

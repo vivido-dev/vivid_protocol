@@ -405,36 +405,43 @@ impl InputGate {
                 };
             }
         }
-        self.latest_binding = Some(binding.clone());
-        self.advance_grant_generation()?;
-        self.release_active()?;
-        if binding.disabled() {
-            return Ok(BindingOutcome::Disabled);
-        }
+        let grant_generation = self.next_grant_generation()?;
+        let release_generation = self.next_release_generation()?;
         let tuple = InputTuple {
             producer_epoch: binding.producer_epoch,
-            grant_generation: self.grant_generation,
+            grant_generation,
             context_id: binding.context_id,
             surface_id: binding.surface_id,
             surface_generation: binding.surface_generation,
         };
         let effective_classes = effective_classes & binding.requested_classes;
-        if effective_classes == 0
+        let (outcome, active) = if binding.disabled() {
+            (BindingOutcome::Disabled, None)
+        } else if effective_classes == 0
             || !(MIN_WATCHDOG_US..=MAX_WATCHDOG_US).contains(&effective_watchdog_us)
         {
-            return Ok(BindingOutcome::Denied(tuple));
-        }
-        let watchdog_deadline = now
-            .checked_add_micros(effective_watchdog_us)
-            .ok_or_else(|| invalid_value("INPUT_BOUND", 8, "overflows local time"))?;
-        self.active = Some(ActiveGrant {
-            binding: tuple,
-            effective_classes,
-            watchdog_timeout_us: effective_watchdog_us,
-            watchdog_deadline,
-            renewal_sequence: 0,
-        });
-        Ok(BindingOutcome::Enabled(tuple))
+            (BindingOutcome::Denied(tuple), None)
+        } else {
+            let watchdog_deadline = now
+                .checked_add_micros(effective_watchdog_us)
+                .ok_or_else(|| invalid_value("INPUT_BOUND", 8, "overflows local time"))?;
+            (
+                BindingOutcome::Enabled(tuple),
+                Some(ActiveGrant {
+                    binding: tuple,
+                    effective_classes,
+                    watchdog_timeout_us: effective_watchdog_us,
+                    watchdog_deadline,
+                    renewal_sequence: 0,
+                }),
+            )
+        };
+        // Commit only after every fallible generation and deadline check succeeds.
+        self.latest_binding = Some(binding);
+        self.grant_generation = grant_generation;
+        self.release_generation = release_generation;
+        self.active = active;
+        Ok(outcome)
     }
 
     pub fn renew(
@@ -459,17 +466,21 @@ impl InputGate {
                 "is stale, late, or inconsistent",
             ));
         }
-        active.renewal_sequence = renewal_sequence;
-        active.watchdog_deadline = received_at
+        let watchdog_deadline = received_at
             .checked_add_micros(active.watchdog_timeout_us)
             .ok_or_else(|| invalid_value("INPUT_LEASE_RENEW", 6, "overflows local time"))?;
+        active.renewal_sequence = renewal_sequence;
+        active.watchdog_deadline = watchdog_deadline;
         Ok(())
     }
 
     pub fn revoke(&mut self) -> Result<GrantGeneration, MessageError> {
-        self.advance_grant_generation()?;
-        self.release_active()?;
-        Ok(self.grant_generation)
+        let grant_generation = self.next_grant_generation()?;
+        let release_generation = self.next_release_generation()?;
+        self.grant_generation = grant_generation;
+        self.release_generation = release_generation;
+        self.active = None;
+        Ok(grant_generation)
     }
 
     pub fn authorize(
@@ -513,22 +524,20 @@ impl InputGate {
         Ok(operation(event))
     }
 
-    fn release_active(&mut self) -> Result<(), MessageError> {
-        if self.active.take().is_some() {
-            self.release_generation = self
-                .release_generation
+    fn next_release_generation(&self) -> Result<u64, MessageError> {
+        if self.active.is_some() {
+            self.release_generation
                 .checked_add(1)
-                .ok_or_else(|| invalid_value("input release", 0, "exhausted"))?;
+                .ok_or_else(|| invalid_value("input release", 0, "exhausted"))
+        } else {
+            Ok(self.release_generation)
         }
-        Ok(())
     }
 
-    fn advance_grant_generation(&mut self) -> Result<(), MessageError> {
-        self.grant_generation = self
-            .grant_generation
+    fn next_grant_generation(&self) -> Result<GrantGeneration, MessageError> {
+        self.grant_generation
             .advance()
-            .map_err(|_| invalid_value("input grant", 1, "exhausted"))?;
-        Ok(())
+            .map_err(|_| invalid_value("input grant", 1, "exhausted"))
     }
 }
 
@@ -577,6 +586,115 @@ mod tests {
             reason: 6,
             requested_watchdog_us: 1_000_000,
         }
+    }
+
+    fn assert_unchanged(actual: &InputGate, before: &InputGate) {
+        assert_eq!(actual.latest_binding, before.latest_binding);
+        assert_eq!(actual.grant_generation, before.grant_generation);
+        assert_eq!(actual.release_generation, before.release_generation);
+        let snapshot = |gate: &InputGate| {
+            gate.active().map(|a| {
+                (
+                    a.binding,
+                    a.effective_classes,
+                    a.watchdog_timeout_us,
+                    a.watchdog_deadline,
+                    a.renewal_sequence,
+                )
+            })
+        };
+        assert_eq!(snapshot(actual), snapshot(before));
+    }
+
+    #[test]
+    fn failed_binding_and_revocation_preserve_both_owners() {
+        let now = Monotonic::from_micros(0);
+        let mut gate = InputGate::default();
+        gate.apply_binding(binding(1), INPUT_CLASS_KEYBOARD, 1_000_000, now)
+            .unwrap();
+        let mut other = InputGate::default();
+        let mut other_binding = binding(1); // Same local surface and epoch, another context.
+        other_binding.context_id = 9;
+        other
+            .apply_binding(other_binding, INPUT_CLASS_KEYBOARD, 1_000_000, now)
+            .unwrap();
+        let other_before = other.clone();
+        for boundary in 0..3 {
+            let mut failed = gate.clone();
+            let time = match boundary {
+                0 => Monotonic::from_micros(u64::MAX),
+                1 => {
+                    failed.grant_generation = GrantGeneration::new(u64::MAX);
+                    now
+                }
+                _ => {
+                    failed.release_generation = u64::MAX;
+                    now
+                }
+            };
+            let before = failed.clone();
+            for _ in 0..2 {
+                assert!(
+                    failed
+                        .apply_binding(binding(2), INPUT_CLASS_KEYBOARD, 1_000_000, time)
+                        .is_err()
+                );
+                assert_unchanged(&failed, &before);
+            }
+            if boundary != 0 {
+                assert!(failed.revoke().is_err());
+                assert_unchanged(&failed, &before);
+            } else {
+                assert!(matches!(
+                    failed
+                        .apply_binding(binding(2), INPUT_CLASS_KEYBOARD, 1_000_000, now)
+                        .unwrap(),
+                    BindingOutcome::Enabled(_)
+                ));
+            }
+            assert_unchanged(&other, &other_before);
+            let active = other.active().unwrap();
+            other
+                .authorize(
+                    InputEvent::Key {
+                        binding: active.binding,
+                        usage: 4,
+                        pressed: true,
+                    },
+                    SurfaceGeneration::ONE,
+                    now,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn overflowing_renewal_does_not_consume_sequence() {
+        let mut gate = InputGate::default();
+        gate.apply_binding(
+            binding(1),
+            INPUT_CLASS_KEYBOARD,
+            1_000_000,
+            Monotonic::from_micros(u64::MAX - 1_000_000),
+        )
+        .unwrap();
+        let before = gate.clone();
+        let tuple = gate.active().unwrap().binding;
+        for _ in 0..2 {
+            assert!(
+                gate.renew(tuple, 1, 1_000_000, Monotonic::from_micros(u64::MAX - 1))
+                    .is_err()
+            );
+            assert_unchanged(&gate, &before);
+        }
+        gate.renew(
+            tuple,
+            1,
+            1_000_000,
+            Monotonic::from_micros(u64::MAX - 1_000_000),
+        )
+        .unwrap();
+        assert_eq!(gate.active().unwrap().renewal_sequence, 1);
     }
 
     #[test]

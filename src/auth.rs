@@ -29,7 +29,7 @@ impl Secret32 {
         if value.len() != 64 || !value.is_ascii() {
             return Err(AuthError::InvalidSecretEncoding);
         }
-        let mut bytes = [0_u8; SECRET_BYTES];
+        let mut bytes = Zeroizing::new([0_u8; SECRET_BYTES]);
         for (index, output) in bytes.iter_mut().enumerate() {
             let high =
                 unhex(value.as_bytes()[index * 2]).ok_or(AuthError::InvalidSecretEncoding)?;
@@ -37,7 +37,7 @@ impl Secret32 {
                 unhex(value.as_bytes()[index * 2 + 1]).ok_or(AuthError::InvalidSecretEncoding)?;
             *output = (high << 4) | low;
         }
-        Ok(Self(bytes))
+        Ok(Self(*bytes))
     }
 
     pub fn expose(&self) -> &[u8; SECRET_BYTES] {

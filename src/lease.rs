@@ -165,6 +165,7 @@ struct Attempt {
     welcome: Vec<u8>,
     transport_live: bool,
     post_hello_admitted: bool,
+    resume_from: Option<ResumeGeneration>,
 }
 
 impl Attempt {
@@ -268,6 +269,13 @@ impl LeaseMachine {
         if session_id == 0 {
             return Err(LeaseTransitionError::BadState);
         }
+        if self
+            .attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.resume_from.is_some())
+        {
+            return Err(LeaseTransitionError::AuthenticationFailed);
+        }
         match self.state {
             LeaseState::Issued => {
                 self.state = LeaseState::Reserved;
@@ -283,6 +291,7 @@ impl LeaseMachine {
                     welcome: welcome.clone(),
                     transport_live: true,
                     post_hello_admitted: false,
+                    resume_from: None,
                 });
                 Ok(AttemptDecision::Fresh {
                     session_id,
@@ -294,7 +303,12 @@ impl LeaseMachine {
                 if self.profile_fingerprint != Some(profile_fingerprint) {
                     return Err(LeaseTransitionError::AuthenticationFailed);
                 }
-                self.exact_retry(attempt_id, client_nonce, hello_bytes)
+                let decision = self.exact_retry(attempt_id, client_nonce, hello_bytes)?;
+                self.attempt
+                    .as_mut()
+                    .expect("validated retry has an attempt")
+                    .transport_live = true;
+                Ok(decision)
             }
             LeaseState::Active => {
                 if self.profile_fingerprint != Some(profile_fingerprint) {
@@ -387,13 +401,26 @@ impl LeaseMachine {
         server_nonce: [u8; 32],
         welcome: Vec<u8>,
     ) -> Result<AttemptDecision, LeaseTransitionError> {
-        if self.state == LeaseState::Reserved {
+        if matches!(self.state, LeaseState::Reserved | LeaseState::Active) {
             if self.profile_fingerprint != Some(profile_fingerprint)
                 || self.logical_session_id != Some(session_id)
             {
                 return Err(LeaseTransitionError::AuthenticationFailed);
             }
-            return self.exact_retry(attempt_id, client_nonce, hello_bytes);
+            let retryable = self.attempt.as_ref().is_some_and(|attempt| {
+                attempt.resume_from == Some(expected_generation)
+                    && !attempt.post_hello_admitted
+                    && (self.state == LeaseState::Reserved || !attempt.transport_live)
+            });
+            if !retryable {
+                return Err(LeaseTransitionError::AuthenticationFailed);
+            }
+            let decision = self.exact_retry(attempt_id, client_nonce, hello_bytes)?;
+            self.attempt
+                .as_mut()
+                .expect("validated retry has an attempt")
+                .transport_live = true;
+            return Ok(decision);
         }
         if self.state != LeaseState::Suspended {
             return Err(LeaseTransitionError::BadState);
@@ -406,12 +433,16 @@ impl LeaseMachine {
         {
             return Err(LeaseTransitionError::AuthenticationFailed);
         }
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(LeaseTransitionError::Exhausted)?;
         self.resume_generation = self
             .resume_generation
             .advance()
             .map_err(|_| LeaseTransitionError::Exhausted)?;
         self.state = LeaseState::Reserved;
-        self.advance_revision()?;
+        self.revision = next_revision;
         self.attempt = Some(Attempt {
             attempt_id,
             client_nonce,
@@ -421,6 +452,7 @@ impl LeaseMachine {
             welcome: welcome.clone(),
             transport_live: true,
             post_hello_admitted: false,
+            resume_from: Some(expected_generation),
         });
         Ok(AttemptDecision::Fresh {
             session_id,

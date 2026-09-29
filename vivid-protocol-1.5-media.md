@@ -3,7 +3,7 @@
 This file is a normative part of the
 [Vivid Protocol 1.5 specification](vivid-protocol-1.5-spec.md).
 
-It defines `live-media-v1` and `timed-media-v1`.
+It defines `live-media-v1`, `timed-media-v1`, and `audio-input-v1`.
 
 ## 1. Track model
 
@@ -18,6 +18,7 @@ Track kinds are video (`1`), audio (`2`), raster (`3`), and encoded image (`4`).
 
 | Value | Slot | Legal kinds |
 |---:|---|---|
+| 0 | No playback slot; uplink audio only | Audio, direction uplink |
 | 1 | `primary-video` | Video |
 | 2 | `audio` | Audio |
 | 3 | `raster` | Raster |
@@ -69,8 +70,10 @@ does not allocate or carry a descriptor/policy; creation uses a nonzero track ID
 | 13 | uint | Target latency in microseconds; live mode |
 | 14 | uint | Maximum latency in microseconds |
 | 15 | uint | Requested retained-pixel charge |
+| 16 | uint | Optional immutable direction: downlink (`0`, default), uplink (`1`) |
 
-This is a strict schema.
+This is a strict schema. Downlink senders SHOULD omit key 16 for compatibility. Uplink requires
+negotiated `audio-input-v1`; see §17. Other direction values are invalid.
 
 Keys 8 through 11 are contractual claims. Zero is invalid for a created streaming track. For a
 still image, key 8 is 1, key 9 covers transfer size over the presenter's minimum accounting
@@ -348,9 +351,19 @@ discards decoder state, and returns `CHANNEL_ADVANCED` with the new generation, 
 track revision. Video requires a key unit; raster requires a full frame; image requires the
 complete image; audio starts with a valid independent access unit and its declared initialization.
 
+Reason 1 is `TIMELINE_DISCONTINUITY`; reason 3 is `RECOVERY`. A producer that supplies a causation
+ID on a timeline discontinuity groups that discontinuity across the linked timed tracks on the
+same surface. It MUST advance every participating linked track with that same causation ID before
+sending replacement media on any of them. A terminating gateway MAY wait for the complete group
+before replacing its independent outer decoders. Recovery is track-scoped and MUST NOT be inferred
+to advance linked tracks.
+
 No single-use ticket is minted or transported.
 
 ## 6. Absolute channel-local flow control
+
+This section describes downlink roles. For uplink, §17 reverses the media-sender and flow-authority
+roles without changing cumulative accounting or channel authentication.
 
 Flow-control state is scoped to one channel generation. The producer tracks:
 
@@ -527,7 +540,7 @@ accounting (`5`), and recovery (`6`).
 
 ## 9. Video packet format
 
-A `VIDEO_PACKET` body is unchanged from the portable 1.1 body:
+A `VIDEO_PACKET` body has the following portable layout:
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -565,7 +578,7 @@ Canonical packetizations:
 
 ## 10. Audio packet format
 
-An `AUDIO_PACKET` body is unchanged from the portable 1.1 body:
+An `AUDIO_PACKET` body has the following portable layout:
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -794,6 +807,74 @@ timestamps, buffering, trim, the audio master clock, or encoded data. Gain is re
 gain advances the track revision and sets changed-field bit 4 in `TRACK_CHANGED`. When this
 profile is accepted, `TRACK_STATUS` key 23 reports the current gain for audio tracks.
 
+### 15.2 Synchronized playback and presentation holds
+
+This subsection requires `timed-media-sync-v1`, with prerequisite `timed-media-v1`.
+The 1.5 preface and baseline start policy remain unchanged. Terminating gateways negotiate
+the extension independently on each hop and MUST NOT downgrade synchronized PLAY.
+
+PLAY key 9 additionally accepts `2` (synchronized). Optional key 11 is a nonzero surface
+hold serial, permitted only with policy 2. A resume naming a superseded serial is rejected.
+Admission installs the exact target but leaves the group buffering. The clock and audio
+consumption start together only after the clock track's minimum buffer is ready and every
+active video track has a current-generation decoded picture at or after the target. Old
+readiness cannot satisfy a new operation. Reference pictures before the target are decoded
+and discarded with normal reusable-capacity flow grants. Decoder-drained EOS, not merely
+accepted EOS, resolves a stream with no further eligible picture. No timeout may bypass the
+video barrier and start audio alone. PAUSE cancels the pending start while allowing a target
+picture to prime without advancing the frozen clock.
+
+A presenter MUST reject a minimum-buffer request it cannot satisfy within its bounded storage;
+it MUST NOT admit the request and silently start with a smaller buffer. Zero minimum duration
+does not waive the eligible-picture barrier.
+
+`PLAYBACK_HOLD` (`0x0308`) is an actionable, uncorrelated presenter-to-producer control record.
+Its object ID is the surface ID. It never enters a coalescing observation queue.
+
+| Key | Type | Meaning |
+|---:|---|---|
+| 0 | uint | Context ID |
+| 1 | uint | Surface ID |
+| 2 | uint | Nonzero monotonically increasing surface transition serial |
+| 3 | bool | Held |
+| 4 | uint | Reasons: not visible (bit 0), detached (bit 1), downstream replacement (bit 2), policy (bit 3) |
+| 5 | bool | Producer's playing intent, independent of hold |
+| 6 | bool | Decoder recovery required |
+| 7 | map, optional | Qualified frozen position; absent while unknown |
+
+The position map contains clock track ID (0), channel generation (1), u32 media epoch (2),
+signed PTS in microseconds (3), and estimated flag (4). Track ID and generation are nonzero.
+There is no group-wide epoch. TRACK_STATUS optional key 24 returns the same hold map for
+reconciliation. Unknown reason bits and fields are rejected. A held transition has at least
+one reason. Position refinements advance the serial. All identity and serial domains are
+local to the authenticated session; a relay translates them rather than copying authority.
+
+A terminating gateway MUST hold a timed group when its projection is removed. It stops audio,
+freezes the group clock, and preserves user play/pause intent. It may withhold ingress credit,
+but control, reverse channel traffic, and unrelated tracks remain serviceable. It obtains a
+physical paused clock observation before disposing of reachable downstream decoders. Abrupt
+loss uses the last validated physical observation marked estimated, never accepted packet PTS.
+An explicit newer seek overrides a pending old-position observation. Holds survive lease
+reconciliation and disappear with their owning surface. Hidden startup and completion waits
+return NOT_VISIBLE; clients retry bounded waits after release.
+
+NEED_KEYFRAME reason 6 means presentation resumed with decoder replacement. Optional key 7 is
+the signed resume PTS and required key 8 is the nonzero hold serial. These fields are forbidden
+on reasons 1–5. Unknown PTS remains absent, rather than being fabricated from ingress progress.
+The producer correlates the request with current hold state and retires old generations before
+cancelling their writes. It primes replacement channels from a preceding random-access unit,
+then uses synchronized PLAY at the target and catch-up delivery for decoder references. A
+producer may instead choose a later random-access point, provided every group member uses that
+same new target. Duplicate recovery requests must not restart a completed transition.
+
+Lateness alone is not decoder failure and MUST NOT produce reason 2. Drop late presentation,
+report clock and late-drop progress, and preserve decoder references. Reason 5 retains its
+existing meaning of relay packet loss with otherwise intact decoder state.
+
+Withheld flow is normal during holds and congestion. A media write's elapsed duration alone
+does not prove peer failure. Control liveness, explicit channel failure, or user cancellation
+govern termination; queues and reservations remain bounded while waiting.
+
 ## 16. Media conformance
 
 A producer:
@@ -822,3 +903,54 @@ Regression suites cover lost channel acceptance, duplicate opens, half-open old 
 generation advance, zero and duplicate flow updates, maximum counters near overflow, channel loss
 during parsing, two owners reusing every local ID, replacement without input changes, live A/V
 clocking, timed pre-roll, pause, flush, EOS, drain, keyframe recovery, and full-frame recovery.
+
+## 17. Microphone input (`audio-input-v1`)
+
+This optional profile requires `live-media-v1`. Producers MUST NOT probe or create an uplink track
+unless it was accepted in WELCOME. The producer remains the object owner and channel initiator;
+direction changes media ownership, not authentication, identity, or control authority.
+
+An uplink track MUST be audio, live mode, realtime lane, slot zero, with zero retained-pixel charge.
+It MUST NOT be activated into a surface slot, projected as visual content, mixed into presenter
+playback, or used as a surface playback clock. A surface may own it without any scene nodes.
+PLAY, PAUSE, FLUSH, gain, decode-readiness, and presentation/drain semantics do not control local
+capture. Channel acceptance is the applicable readiness milestone.
+
+The interoperable initial configuration is `pcm_s16le` / `pcm-packet-v1`, no extradata or codec
+string, 48,000 Hz, one channel, channel mask 4, 960 samples per 20,000 µs packet. The maximum access
+unit is 1,920 bytes. With the existing 48-byte AUDIO_PACKET header, the maximum media body is 1,968
+bytes. Claims are 50,000 millihertz, 50 records/s, 787,200 encoded body bits/s, 19,680 in-flight body
+bytes, 40,000 µs target latency, and 200,000 µs maximum latency. Implementations MAY reject other
+configurations as unsupported rather than silently converting the wire contract.
+
+After ordinary authenticated CHANNEL_OPEN, the presenter sends CHANNEL_ACCEPTED with **zero**
+cumulative byte and record maxima. The producer is now the flow authority and sends
+MAX_CHANNEL_DATA on that same connection. The presenter sends AUDIO_PACKET only after credit is
+available; neither role sends media in the opposite direction. At most ten packets / 19,680 body
+bytes may be outstanding. Credit is returned only as receiver storage becomes reusable. The
+existing sustained-rate token bucket applies with the roles reversed.
+
+Epoch is 1 within each microphone generation. Packet IDs are nonzero and strictly increasing for
+the track; re-originating gateways allocate independent packet IDs. PTS is nonnegative monotonic
+capture-relative microseconds, DTS equals PTS, duration is 20,000 µs, and both trim counts are zero.
+Successive delivered PTS values differ by at least one packet duration. Dropped capture preserves
+PTS gaps. EOS carries the full tuple/generation, epoch 1 (or 0 if no media was sent), and the exact
+last AUDIO_PACKET **connection sequence**, or zero when none was sent. EOS is not charged to flow.
+
+Capture requires explicit local consent. Creating a track or opening a device remotely is not
+consent. Selection is scoped to a complete authenticated route, never inferred from remote pane
+focus or a title supplied by an application. Mute and revocation stop capture, discard queued
+speech, and terminate the channel (best-effort EOS followed by cancellation). Unlike playback EOS,
+microphone EOS MUST NOT drain buffered speech. A later enable requires a fresh channel generation
+and fresh consent. Transport loss has the same silence/revocation behavior.
+
+Every hop MUST bound PCM queues and write stalls independently of control, terminal input, and
+other tracks. Stale local queue entries older than 200 ms are discarded; starvation emits silence
+at the remote device. Samples already handed to an OS/app capture buffer cannot be retracted.
+No media bytes, secrets, or microphone grants may be carried by a terminal PTY.
+
+A byte-transparent relay preserves the session. A terminating gateway authenticates independent
+inner and outer sessions, maps the complete owner/context/surface/track/generation tuple, and owns
+separate credit, sequence, and EOS state on each hop. Replacing a foreground attachment revokes
+its delivery routes; stale attachment messages MUST NOT reach a new owner or generation. A remote
+virtual device may survive mute/detach, emitting silence, independently of channel lifetime.

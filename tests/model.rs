@@ -16,6 +16,7 @@
 //! when one is broken.
 
 use std::collections::{HashSet, VecDeque};
+use std::rc::Rc;
 
 use vivid_protocol::grant::{
     Eligibility, GrantOutcome, InputGrant, Renewal, reason as grant_reason,
@@ -59,7 +60,9 @@ const CLIENT_NONCE: [u8; 32] = [0xc; 32];
 const SERVER_NONCE: [u8; 32] = [0xd; 32];
 const FINGERPRINT: [u8; 32] = [0xe; 32];
 const HELLO_BODY: &[u8] = b"model-hello";
-const WELCOME_BODY: &[u8] = b"model-welcome";
+// The model checks byte-identical WELCOME replay, not payload decoding. Keeping the opaque body
+// empty avoids allocating it every time a concrete lease machine is cloned during exploration.
+const WELCOME_BODY: &[u8] = b"";
 
 /// The transition alphabet. Every variant is offered from every state where it could apply, and
 /// the exploration asserts each fires at least once.
@@ -74,6 +77,8 @@ enum T {
     ControlLostUnclean,
     ResumeValid,
     ResumeStale,
+    ResumeRetryExact,
+    ResumeRetryDifferent,
     GraceExpiry,
     LeaseRevoke,
     ParentRevoke,
@@ -128,6 +133,8 @@ const ALL_TRANSITIONS: &[T] = &[
     T::ControlLostUnclean,
     T::ResumeValid,
     T::ResumeStale,
+    T::ResumeRetryExact,
+    T::ResumeRetryDifferent,
     T::GraceExpiry,
     T::LeaseRevoke,
     T::ParentRevoke,
@@ -291,34 +298,17 @@ enum Deadline {
     Expired,
 }
 
-#[derive(PartialEq, Eq, Hash)]
-struct Key {
-    lease_state: u8,
-    resume_generation: u64,
-    post_hello_admitted: bool,
-    charged: bool,
-    lane: Option<Lane>,
-    channel: Channel,
-    flow: (u64, u64),
-    focused: bool,
-    surface_generation: u64,
-    deadline: Deadline,
-    epoch: u64,
-    grant_state: u64,
-    gate_active: bool,
-    has_retired: bool,
-    held: bool,
-    renewed: bool,
-    has_pending_renewal: bool,
-    generation_bucket: u64,
-    other: (u8, bool, bool),
-}
+/// Packed abstract state used only for BFS deduplication. Every component has a deliberately
+/// tiny finite domain, so retaining machine-word-sized fields in a padded struct wastes both
+/// memory and hashing work across the roughly two million reachable states.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Key(u64);
 
 /// The second owner: an independent lease and gate driven by its own small alphabet, sharing
 /// every numeric ID with owner A.
 #[derive(Clone)]
 struct OwnerB {
-    lease: LeaseMachine,
+    lease: Rc<LeaseMachine>,
     gate: InputGate,
     bound: bool,
 }
@@ -326,7 +316,7 @@ struct OwnerB {
 #[derive(Clone)]
 struct Model {
     // Owner A: the real machines, paired presenter-side and producer-side.
-    lease: LeaseMachine,
+    lease: Rc<LeaseMachine>,
     grant: InputGrant,
     gate: InputGate,
     lane: Option<Lane>,
@@ -346,6 +336,7 @@ struct Model {
     pending_renewal: Option<Renewal>,
     // Lease bookkeeping.
     post_hello_admitted: bool,
+    control_lost: bool,
     charged: bool,
     // The largest grant generation either side has reported on this path.
     max_generation_seen: u64,
@@ -357,7 +348,10 @@ struct Model {
 impl Model {
     fn new(broken_revocation: bool) -> Self {
         Self {
-            lease: LeaseMachine::new(CleanupPolicy::SuspendOnUncleanLoss, 5_000_000),
+            lease: Rc::new(LeaseMachine::new(
+                CleanupPolicy::SuspendOnUncleanLoss,
+                5_000_000,
+            )),
             grant: InputGrant::new(),
             gate: InputGate::default(),
             lane: None,
@@ -373,11 +367,15 @@ impl Model {
             renewed: false,
             pending_renewal: None,
             post_hello_admitted: false,
+            control_lost: false,
             // A lease reservation is charged from the moment the lease is issued.
             charged: true,
             max_generation_seen: 0,
             other: OwnerB {
-                lease: LeaseMachine::new(CleanupPolicy::SuspendOnUncleanLoss, 5_000_000),
+                lease: Rc::new(LeaseMachine::new(
+                    CleanupPolicy::SuspendOnUncleanLoss,
+                    5_000_000,
+                )),
                 gate: InputGate::default(),
                 bound: false,
             },
@@ -411,35 +409,61 @@ impl Model {
     /// machines travel with the state; nothing the transitions consult is absent from the key
     /// unless it is a function of the key itself.
     fn key(&self) -> Key {
-        Key {
-            lease_state: self.lease.state() as u8,
-            resume_generation: self
-                .lease
+        let mut bits = 0;
+        let mut width = 0;
+        let mut push = |value: u64, field_width: u32| {
+            assert!(
+                value < (1_u64 << field_width),
+                "abstract state value {value} exceeds its {field_width}-bit field"
+            );
+            bits |= value << width;
+            width += field_width;
+        };
+
+        push(self.lease.state() as u64, 3);
+        push(
+            self.lease
                 .resume_generation()
                 .get()
                 .min(MAX_RESUME_GENERATION),
-            post_hello_admitted: self.post_hello_admitted,
-            charged: self.charged,
-            lane: self.lane,
-            channel: self.channel,
-            flow: (self.flow.sent_body_bytes, self.flow.sent_media_records),
-            focused: self.focused,
-            surface_generation: self.surface_generation,
-            deadline: self.deadline(),
-            epoch: self.epoch,
-            grant_state: self.grant.state(),
-            gate_active: self.gate.active().is_some(),
-            has_retired: self.retired_tuple.is_some(),
-            held: self.held,
-            renewed: self.renewed,
-            has_pending_renewal: self.pending_renewal.is_some(),
-            generation_bucket: self.max_generation_seen.min(MAX_EPOCH * 4),
-            other: (
-                self.other.lease.state() as u8,
-                self.other.gate.active().is_some(),
-                self.other.bound,
-            ),
-        }
+            2,
+        );
+        push(self.post_hello_admitted.into(), 1);
+        push(self.control_lost.into(), 1);
+        push(self.charged.into(), 1);
+
+        let lane = self.lane.map_or(0, |lane| {
+            (1 << 4)
+                | lane.generation
+                | (u64::from(lane.live) << 2)
+                | (u64::from(lane.admitted_input) << 3)
+        });
+        push(lane, 5);
+
+        push(self.channel.generation, 2);
+        push(self.channel.phase as u64, 3);
+        push(self.channel.media_admitted.into(), 1);
+        push(self.channel.parsing.into(), 1);
+        push(self.channel.flow_update.into(), 1);
+        push(self.flow.sent_body_bytes, 9);
+        push(self.flow.sent_media_records, 3);
+        push(self.focused.into(), 1);
+        push(self.surface_generation, 2);
+        push(self.deadline() as u64, 2);
+        push(self.epoch, 2);
+        push(self.grant.state(), 2);
+        push(self.gate.active().is_some().into(), 1);
+        push(self.retired_tuple.is_some().into(), 1);
+        push(self.held.into(), 1);
+        push(self.renewed.into(), 1);
+        push(self.pending_renewal.is_some().into(), 1);
+        push(self.max_generation_seen.min(MAX_EPOCH * 4), 4);
+        push(self.other.lease.state() as u64, 3);
+        push(self.other.gate.active().is_some().into(), 1);
+        push(self.other.bound.into(), 1);
+
+        debug_assert!(width <= u64::BITS);
+        Key(bits)
     }
 
     fn eligibility(&self) -> Eligibility {
@@ -550,9 +574,8 @@ impl Model {
         self.flow = ChannelFlow::default();
     }
 
-    fn attempt(&self) -> Result<AttemptDecision, vivid_protocol::lease::LeaseTransitionError> {
-        let mut lease = self.lease.clone();
-        lease.begin_activation(
+    fn attempt(&mut self) -> Result<AttemptDecision, vivid_protocol::lease::LeaseTransitionError> {
+        Rc::make_mut(&mut self.lease).begin_activation(
             ATTEMPT,
             CLIENT_NONCE,
             HELLO_BODY,
@@ -563,7 +586,152 @@ impl Model {
         )
     }
 
+    /// Cheaply reject disabled transitions before `fire` clones the concrete protocol machines.
+    ///
+    /// The model has a deliberately wide alphabet, but only a small fraction of it applies to
+    /// any one state. Keeping this predicate conservative preserves exhaustive exploration: a
+    /// `true` may still be rejected by `fire`, while `false` means the branch's leading guard is
+    /// known to reject it.
+    fn may_fire(&self, kind: T, report: &Report) -> bool {
+        let lease_state = self.lease.state();
+        let resume_generation = self.lease.resume_generation().get();
+        match kind {
+            T::Activate => lease_state == LeaseState::Issued,
+            T::ActivateRetryExact => {
+                resume_generation == 0
+                    && matches!(lease_state, LeaseState::Reserved | LeaseState::Active)
+            }
+            T::ActivateRetryDifferent => {
+                matches!(lease_state, LeaseState::Reserved | LeaseState::Active)
+                    && !report.cases.contains(&Case::SimultaneousActivation)
+            }
+            T::WelcomeCommitted => lease_state == LeaseState::Reserved,
+            T::PostHelloAdmitted => lease_state == LeaseState::Active && !self.post_hello_admitted,
+            T::ControlLostClean | T::ControlLostUnclean => {
+                matches!(lease_state, LeaseState::Reserved | LeaseState::Active)
+            }
+            T::ResumeValid => {
+                lease_state == LeaseState::Suspended && resume_generation < MAX_RESUME_GENERATION
+            }
+            T::ResumeRetryExact | T::ResumeRetryDifferent => {
+                resume_generation != 0
+                    && matches!(lease_state, LeaseState::Reserved | LeaseState::Active)
+            }
+            T::ResumeStale => {
+                lease_state == LeaseState::Suspended
+                    && resume_generation != 0
+                    && !report.cases.contains(&Case::StaleResumeRejected)
+            }
+            T::GraceExpiry => lease_state == LeaseState::Suspended,
+            T::LeaseRevoke => !matches!(
+                lease_state,
+                LeaseState::Closed | LeaseState::Revoked | LeaseState::Expired
+            ),
+            T::ParentRevoke => lease_state == LeaseState::Active,
+            T::OldControlRecord => {
+                lease_state == LeaseState::Active
+                    && resume_generation != 0
+                    && !report.cases.contains(&Case::OldControlRecordIgnored)
+            }
+            T::LaneOpen => {
+                lease_state == LeaseState::Active
+                    && self
+                        .lane
+                        .is_none_or(|lane| lane.generation < MAX_LANE_GENERATION)
+            }
+            T::LaneDuplicate => {
+                self.lane.is_some_and(|lane| lane.live)
+                    && !report.cases.contains(&Case::DuplicateLaneBusy)
+            }
+            T::LaneLoss => self.lane.is_some_and(|lane| lane.live),
+            T::LaneRetry => self.lane.is_some_and(|lane| {
+                !lane.live
+                    && (!lane.admitted_input
+                        || !report.cases.contains(&Case::LaneRetryRefusedAfterInput))
+            }),
+            T::LaneStaleRecord => {
+                self.lane
+                    .is_some_and(|lane| lane.generation >= MAX_LANE_GENERATION)
+                    && !report.cases.contains(&Case::OldLaneRecordIgnored)
+            }
+            T::ChannelOpen => {
+                lease_state == LeaseState::Active && self.channel.phase == ChannelPhase::None
+            }
+            T::ChannelDuplicate => {
+                matches!(
+                    self.channel.phase,
+                    ChannelPhase::Attaching
+                        | ChannelPhase::AcceptedUnconfirmed
+                        | ChannelPhase::Established
+                ) && if self.channel.media_admitted {
+                    !report
+                        .cases
+                        .contains(&Case::DuplicateChannelRefusedAfterMedia)
+                } else {
+                    !report.cases.contains(&Case::DuplicateChannelReplayed)
+                }
+            }
+            T::ChannelAccept => self.channel.phase == ChannelPhase::Attaching,
+            T::ChannelAcceptConfirmed | T::ChannelAcceptLost => {
+                self.channel.phase == ChannelPhase::AcceptedUnconfirmed
+            }
+            T::ChannelAdvance => {
+                lease_state == LeaseState::Active
+                    && matches!(
+                        self.channel.phase,
+                        ChannelPhase::Established | ChannelPhase::Lost
+                    )
+                    && self.channel.generation < MAX_CHANNEL_GENERATION
+            }
+            T::MediaAccept => self.channel.phase == ChannelPhase::Established,
+            T::MediaParseBegin => self.channel.media_admitted && !self.channel.parsing,
+            T::MediaParseEnd => self.channel.parsing,
+            T::FlowUpdateBegin => {
+                self.channel.phase == ChannelPhase::Established && !self.channel.flow_update
+            }
+            T::FlowUpdateComplete => self.channel.flow_update,
+            T::ChannelLoss => self.channel.phase == ChannelPhase::Established,
+            T::OldTransportMedia => {
+                self.channel.phase == ChannelPhase::Established
+                    && self.channel.generation >= MAX_CHANNEL_GENERATION
+                    && !report.cases.contains(&Case::OldChannelMediaIgnored)
+            }
+            T::BindEnable => lease_state == LeaseState::Active && self.epoch < MAX_EPOCH,
+            T::BindDisable => self.last_binding.is_some() && self.epoch < MAX_EPOCH,
+            T::BindLowerEpoch => self.epoch >= MAX_EPOCH,
+            T::BindRetrySame => self.last_binding.is_some(),
+            T::BindRetryDifferent => self
+                .last_binding
+                .as_ref()
+                .is_some_and(|binding| binding.requested_classes != 0),
+            T::RenewSend => self.gate.active().is_some() && self.pending_renewal.is_none(),
+            T::RenewDeliver => self.pending_renewal.is_some(),
+            T::TimePass => self.gate.active().is_some() && self.deadline() != Deadline::Expired,
+            T::WatchdogFire => self.gate.active().is_some() && self.deadline() == Deadline::Expired,
+            T::FocusLoss => self.focused,
+            T::FocusGain => !self.focused,
+            T::SurfaceGenerationChange => {
+                self.surface_generation < MAX_SURFACE_GENERATION && self.epoch != 0
+            }
+            T::EventPress | T::EventRelease => {
+                let pressed = kind == T::EventPress;
+                (pressed != self.held || self.gate.active().is_none())
+                    && !(self.gate.active().is_none()
+                        && self.retired_tuple.is_none()
+                        && report.cases.contains(&Case::InputRejectedBeforeEnable))
+            }
+            T::EventOldTuple => self.retired_tuple.is_some(),
+            T::EventWrongSurfaceGeneration => self.gate.active().is_some(),
+            T::OtherActivate => self.other.lease.state() == LeaseState::Issued,
+            T::OtherBind => self.other.lease.state() == LeaseState::Active && !self.other.bound,
+            T::OtherTeardown | T::CrossInject => self.other.lease.state() == LeaseState::Active,
+        }
+    }
+
     fn fire(&self, kind: T, report: &mut Report) -> Option<Model> {
+        if !self.may_fire(kind, report) {
+            return None;
+        }
         let mut next = self.clone();
         let mut violations = Vec::new();
         let result = (|| {
@@ -572,7 +740,7 @@ impl Model {
                     if self.lease.state() != LeaseState::Issued {
                         return None;
                     }
-                    match next.lease.begin_activation(
+                    match Rc::make_mut(&mut next.lease).begin_activation(
                         ATTEMPT,
                         CLIENT_NONCE,
                         HELLO_BODY,
@@ -589,6 +757,9 @@ impl Model {
                     }
                 }
                 T::ActivateRetryExact => {
+                    if self.lease.resume_generation().get() != 0 {
+                        return None;
+                    }
                     if !matches!(
                         self.lease.state(),
                         LeaseState::Reserved | LeaseState::Active
@@ -601,6 +772,7 @@ impl Model {
                         }
                         // The retried attempt is fresh: admission must recur on it.
                         next.post_hello_admitted = false;
+                        next.control_lost = false;
                     }
                     Some(())
                 }
@@ -613,7 +785,7 @@ impl Model {
                         return None;
                     }
                     report.cases.insert(Case::SimultaneousActivation);
-                    let mut racing = next.lease.clone();
+                    let mut racing = next.lease.as_ref().clone();
                     if racing
                         .begin_activation(
                             ATTEMPT_OTHER,
@@ -634,7 +806,7 @@ impl Model {
                     if self.lease.state() != LeaseState::Reserved {
                         return None;
                     }
-                    if next.lease.commit_welcome().is_err() {
+                    if Rc::make_mut(&mut next.lease).commit_welcome().is_err() {
                         violations.push("welcome commit failed from Reserved".to_owned());
                     }
                     if self.lease.resume_generation().get() >= 1 {
@@ -646,7 +818,7 @@ impl Model {
                     if self.lease.state() != LeaseState::Active || self.post_hello_admitted {
                         return None;
                     }
-                    if next.lease.admit_post_hello().is_err() {
+                    if Rc::make_mut(&mut next.lease).admit_post_hello().is_err() {
                         violations.push("post-hello admit failed from Active".to_owned());
                     }
                     next.post_hello_admitted = true;
@@ -661,7 +833,9 @@ impl Model {
                     }
                     report.cases.insert(Case::ClosedClean);
                     next.presenter_revoke(grant_reason::PRESENTER_SHUTDOWN, kind, &mut violations);
-                    if next.lease.confirm_transport_lost(true) != Ok(LeaseState::Closed) {
+                    if Rc::make_mut(&mut next.lease).confirm_transport_lost(true)
+                        != Ok(LeaseState::Closed)
+                    {
                         violations.push("a clean loss did not close the lease".to_owned());
                     }
                     next.charged = false;
@@ -688,7 +862,8 @@ impl Model {
                         _ => {}
                     }
                     next.presenter_revoke(grant_reason::SUSPENSION, kind, &mut violations);
-                    let outcome = next.lease.confirm_transport_lost(false);
+                    let outcome = Rc::make_mut(&mut next.lease).confirm_transport_lost(false);
+                    next.control_lost = true;
                     match (self.lease.state(), self.post_hello_admitted) {
                         (LeaseState::Reserved, _) | (LeaseState::Active, false) => {
                             // The loss is retryable: the machine stays put for an exact retry.
@@ -717,7 +892,7 @@ impl Model {
                         return None;
                     }
                     let generation = self.lease.resume_generation();
-                    match next.lease.begin_resume(
+                    match Rc::make_mut(&mut next.lease).begin_resume(
                         generation,
                         ATTEMPT,
                         CLIENT_NONCE,
@@ -730,8 +905,53 @@ impl Model {
                         Ok(AttemptDecision::Fresh { .. }) => {
                             // The resumed attempt is fresh: admission must recur on it.
                             next.post_hello_admitted = false;
+                            next.control_lost = false;
                         }
                         other => violations.push(format!("a valid resume was refused: {other:?}")),
+                    }
+                    Some(())
+                }
+                T::ResumeRetryExact | T::ResumeRetryDifferent => {
+                    if self.lease.resume_generation().get() == 0
+                        || !matches!(
+                            self.lease.state(),
+                            LeaseState::Reserved | LeaseState::Active
+                        )
+                    {
+                        return None;
+                    }
+                    let generation = self.lease.resume_generation();
+                    let should_replay = kind == T::ResumeRetryExact
+                        && !self.post_hello_admitted
+                        && (self.lease.state() == LeaseState::Reserved || self.control_lost);
+                    let result = Rc::make_mut(&mut next.lease).begin_resume(
+                        vivid_protocol::revision::ResumeGeneration::new(generation.get() - 1),
+                        if kind == T::ResumeRetryExact {
+                            ATTEMPT
+                        } else {
+                            ATTEMPT_OTHER
+                        },
+                        CLIENT_NONCE,
+                        HELLO_BODY,
+                        FINGERPRINT,
+                        SESSION,
+                        SERVER_NONCE,
+                        WELCOME_BODY.to_vec(),
+                    );
+                    if should_replay {
+                        if !matches!(result, Ok(AttemptDecision::ExactReplay { session_id: SESSION, server_nonce: SERVER_NONCE, ref welcome }) if welcome == WELCOME_BODY)
+                        {
+                            violations
+                                .push(format!("lost resume WELCOME was not replayed: {result:?}"));
+                        }
+                        next.control_lost = false;
+                    } else if result.is_ok() {
+                        violations.push(
+                            "live, competing, or post-HELLO resume retry was accepted".into(),
+                        );
+                    }
+                    if next.lease.resume_generation() != generation {
+                        violations.push("resume retry advanced its generation".into());
                     }
                     Some(())
                 }
@@ -744,8 +964,7 @@ impl Model {
                     }
                     report.cases.insert(Case::StaleResumeRejected);
                     let stale = self.lease.resume_generation().get() - 1;
-                    if next
-                        .lease
+                    if Rc::make_mut(&mut next.lease)
                         .begin_resume(
                             vivid_protocol::revision::ResumeGeneration::new(stale),
                             ATTEMPT,
@@ -767,7 +986,7 @@ impl Model {
                         return None;
                     }
                     report.cases.insert(Case::GraceExpired);
-                    if next.lease.expire().is_err() {
+                    if Rc::make_mut(&mut next.lease).expire().is_err() {
                         violations.push("grace expiry failed from Suspended".to_owned());
                     }
                     next.charged = false;
@@ -789,7 +1008,7 @@ impl Model {
                     // The other owner's machines must not notice this owner's teardown.
                     let probe = self.other_probe();
                     next.presenter_revoke(grant_reason::AUTHORITY_LOSS, kind, &mut violations);
-                    if next.lease.revoke().is_err() {
+                    if Rc::make_mut(&mut next.lease).revoke().is_err() {
                         violations.push("lease revoke failed".to_owned());
                     }
                     next.charged = false;
@@ -1347,9 +1566,7 @@ impl Model {
                     if next.other.lease.state() != LeaseState::Issued {
                         return None;
                     }
-                    if next
-                        .other
-                        .lease
+                    if Rc::make_mut(&mut next.other.lease)
                         .begin_activation(
                             ATTEMPT,
                             CLIENT_NONCE,
@@ -1363,7 +1580,10 @@ impl Model {
                     {
                         violations.push("the other owner's activation failed".to_owned());
                     }
-                    if next.other.lease.commit_welcome().is_err() {
+                    if Rc::make_mut(&mut next.other.lease)
+                        .commit_welcome()
+                        .is_err()
+                    {
                         violations.push("the other owner's welcome commit failed".to_owned());
                     }
                     Some(())
@@ -1390,7 +1610,7 @@ impl Model {
                     if next.other.lease.state() != LeaseState::Active {
                         return None;
                     }
-                    if next.other.lease.revoke().is_err() {
+                    if Rc::make_mut(&mut next.other.lease).revoke().is_err() {
                         violations.push("the other owner's revoke failed".to_owned());
                     }
                     if next.other.gate.revoke().is_err() {

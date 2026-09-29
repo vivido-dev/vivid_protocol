@@ -13,6 +13,10 @@ resource contracts, maintains retained scene state, and renders surfaces.
 A **producer** creates surfaces, tracks, and scene nodes and may receive presenter-originated input
 when the negotiated profiles permit it.
 
+With `audio-input-v1`, a producer may also receive presenter-originated microphone media on an
+authenticated realtime track. The media specification defines the reversed flow roles and local
+consent requirements; object ownership and the session roles do not change.
+
 A **controller** holds root authority and may create contexts and session leases. It may also be a
 producer.
 
@@ -444,7 +448,7 @@ longer a surface, track, scene node, or queryable session object and follows the
 post-disconnect rules. This exception never applies after unclean root-session loss.
 
 Either endpoint may send `PING`; the peer promptly returns `PONG` with the same request ID.
-Optional timestamp keys follow the Vivid 1.1 four-timestamp pattern:
+Optional timestamp keys follow a four-timestamp pattern:
 
 | Message | Key | Meaning |
 |---|---:|---|
@@ -751,6 +755,7 @@ The following are actionable and never enter the coalesced observation queue:
 - `TARGET_CHANGED`;
 - `TRACK_LOST`;
 - `NEED_KEYFRAME` and `NEED_FULL_FRAME`;
+- `PLAYBACK_HOLD` when `timed-media-sync-v1` is negotiated;
 - `MAX_CHANNEL_DATA`;
 - `INPUT_REVOKED`, `INPUT_RESET`, and input watchdog renewal;
 - `CONTEXT_CHANGED` and `SESSION_LEASE_CHANGED`;

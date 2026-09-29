@@ -67,6 +67,21 @@ immutable track and channel-generation state, final-gated desktop input, portabl
 layouts, and authenticated terminal anchors. Native builds also include metadata-only protocol
 tracing. The crate contains no renderer and does not choose your application architecture.
 
+`Connection::trace` and `TraceGuard::file` write metadata-only NDJSON. They never persist
+record bodies, authentication material, media, file contents, or input payloads. A trace must use
+a new path (existing files and symlinks are rejected); Unix files are created with mode `0600`.
+The bounded asynchronous writer may drop metadata under load. Dropping the last connection
+writer or trace guard drains queued records; `flush` on an offline connection is not a drain barrier.
+
+Authentication codecs scrub internal CBOR trees and failed encodings. Callers still own input
+slices, returned encoded bodies, and generic decoded values; use `zeroize::Zeroizing` when those
+buffers contain secrets. This does not erase the process environment or caller-created copies.
+
+AAC initialization validation checks sample-rate and channel metadata. Explicit channel layouts
+use the MPEG-4 mapping; layout zero requires a complete bounded General Audio program
+configuration element. This is not a complete AAC bitstream decoder or a promise that a presenter
+supports every validated layout.
+
 API documentation is on [docs.rs](https://docs.rs/vivid_protocol).
 
 ## Protocol in 30 seconds
@@ -82,15 +97,12 @@ placement is useful; they are absent from terminal-free root-scene deployments.
 
 For record layouts, state machines, profile negotiation, security requirements, and
 interoperability rules, read the normative multipart
-**[Vivid Protocol 1.5 specification](vivid-protocol-1.5-spec.md)**. Implementers migrating from
-the retired source/ticket/credit model should also read the
-**[1.1 to 1.5 migration guide](vivid-protocol-1.1-to-1.5-migration.md)**.
+**[Vivid Protocol 1.5 specification](vivid-protocol-1.5-spec.md)**.
 
 ## Compatibility
 
-This crate implements Vivid Protocol 1.5 and requires Rust 1.87 or newer. Vivid 1.5 is not
-wire-compatible with Vivid 1.1. Protocol support is negotiated by coherent named profiles; the
-preface selects the exact wire version.
+This crate implements Vivid Protocol 1.5 and requires Rust 1.87 or newer. Protocol support is
+negotiated by coherent named profiles; the preface selects the exact wire version.
 
 ## Contributing
 

@@ -1,10 +1,11 @@
 use std::fmt::{self, Display, Formatter};
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_DEPTH: usize = 16;
 const MAX_VALUE_LENGTH: usize = 16 * 1024 * 1024;
 const MAX_CONTAINER_LENGTH: usize = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub enum Value {
     Unsigned(u64),
     Negative(i64),
@@ -140,8 +141,8 @@ impl Encoder {
         Self::default()
     }
 
-    pub fn into_vec(self) -> Vec<u8> {
-        self.bytes
+    pub fn into_vec(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
     }
 
     pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
@@ -149,7 +150,7 @@ impl Encoder {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.bytes.clear();
+        self.bytes.zeroize();
     }
 
     pub fn map(&mut self, length: usize) {
@@ -214,6 +215,12 @@ impl Encoder {
     }
 }
 
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodeError(String);
 
@@ -237,6 +244,9 @@ pub fn encode_into(output: &mut Vec<u8>, value: &Value) -> Result<(), EncodeErro
     let mut encoder = Encoder::from_vec(std::mem::take(output));
     encoder.clear();
     let result = encode_value(&mut encoder, value, 0);
+    if result.is_err() {
+        encoder.bytes.zeroize();
+    }
     *output = encoder.into_vec();
     result
 }
@@ -258,8 +268,10 @@ pub fn encode_preserving_map(
         return Err(EncodeError("CBOR map keys are not strictly sorted".into()));
     }
     for entry in preserved {
-        decode_at_depth(&entry.encoded_value, 1)
-            .map_err(|error| EncodeError(format!("invalid preserved CBOR value: {error}")))?;
+        let _value = Zeroizing::new(
+            decode_at_depth(&entry.encoded_value, 1)
+                .map_err(|error| EncodeError(format!("invalid preserved CBOR value: {error}")))?,
+        );
     }
 
     let mut encoder = Encoder::new();
@@ -367,11 +379,11 @@ pub fn decode(bytes: &[u8]) -> Result<Value, DecodeError> {
 
 fn decode_at_depth(bytes: &[u8], depth: usize) -> Result<Value, DecodeError> {
     let mut decoder = Decoder { bytes, offset: 0 };
-    let value = decoder.value(depth)?;
+    let mut value = Zeroizing::new(decoder.value(depth)?);
     if decoder.offset != bytes.len() {
         return Err(DecodeError("trailing bytes after CBOR value".into()));
     }
-    Ok(value)
+    Ok(std::mem::replace(&mut *value, Value::Null))
 }
 
 /// Decode a canonical numeric-keyed map while retaining unknown values as borrowed byte slices.
@@ -456,19 +468,20 @@ impl Decoder<'_> {
             }
             4 => {
                 let length = self.container_length(additional, 1)?;
-                let mut values = Vec::with_capacity(length);
+                let mut values = Zeroizing::new(Vec::with_capacity(length));
                 for _ in 0..length {
                     values.push(self.value(depth + 1)?);
                 }
-                Ok(Value::Array(values))
+                Ok(Value::Array(std::mem::take(&mut *values)))
             }
             5 => {
                 let length = self.container_length(additional, 2)?;
-                let mut entries = Vec::with_capacity(length);
+                let mut entries = Zeroizing::new(Vec::with_capacity(length));
                 let mut previous = None;
                 for _ in 0..length {
-                    let key = match self.value(depth + 1)? {
-                        Value::Unsigned(key) => key,
+                    let key_value = Zeroizing::new(self.value(depth + 1)?);
+                    let key = match &*key_value {
+                        Value::Unsigned(key) => *key,
                         _ => {
                             return Err(DecodeError(
                                 "CBOR map key is not an unsigned integer".into(),
@@ -481,7 +494,7 @@ impl Decoder<'_> {
                     previous = Some(key);
                     entries.push((key, self.value(depth + 1)?));
                 }
-                Ok(Value::Map(entries))
+                Ok(Value::Map(std::mem::take(&mut *entries)))
             }
             7 => match additional {
                 20 => Ok(Value::Bool(false)),

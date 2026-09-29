@@ -29,6 +29,7 @@ pub fn is_actionable(record_type: u16) -> bool {
     matches!(
         record_type,
         messages::TARGET_CHANGED
+            | messages::PLAYBACK_HOLD
             | messages::TRACK_LOST
             | messages::NEED_KEYFRAME
             | messages::NEED_FULL_FRAME
