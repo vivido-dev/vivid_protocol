@@ -28,17 +28,56 @@ the WebTransport request. Before connection:
 3. it creates a random 256-bit, one-use web-session admission ticket;
 4. it binds the ticket to exact Origin, browser generation, route, allowed carrier mode, stream
    count, byte budget, and an activation timeout no greater than 30 seconds; and
-5. the browser supplies the ticket in the WebTransport `headers` option, never the URL.
+5. the browser supplies the ticket through a WebTransport admission form of §2.1 or §2.2, never
+   the URL.
 
-The request header is:
+Each WebTransport endpoint supports exactly one admission form, fixed by deployment configuration
+and known to its web application. A session never mixes the forms. If no form is available to the
+deployed browser/server combination, it uses the WebSocket fallback. A query parameter, path
+component, fragment, cookie workaround, or loggable redirect is forbidden.
+
+### 2.1 Header admission
+
+The browser supplies the ticket in the WebTransport `headers` option. The request header is:
 
 ```text
 Vivid-Admission: <unpadded-base64url-32-bytes>
 ```
 
-If the deployed browser/server combination cannot set and validate this header, it uses the
-WebSocket fallback. A query parameter, path component, fragment, cookie workaround, or loggable
-redirect is forbidden.
+### 2.2 In-band admission
+
+A browser that cannot set WebTransport request headers presents the ticket in band. After `ready`
+and the checks of §4.1, it opens exactly one bidirectional stream, writes exactly 33 bytes, and
+finishes the stream:
+
+```text
+admission frame = ticket (32 bytes) || binding mode (1 byte)
+binding mode    = 0x00 "none" | 0x01 "exporter-v1"
+```
+
+The server:
+
+- accepts at most one client-initiated bidirectional stream before admission, resets any other
+  stream, and closes the session on a datagram;
+- requires exactly 33 bytes followed by the end of the stream within a deadline of at most
+  10 seconds from session acceptance;
+- validates and consumes the ticket against the Fetch-supplied Origin of the WebTransport request,
+  exactly as for header admission, and validates the requested binding mode for the route;
+- opens and accepts no Vivid stream before admission succeeds; and
+- confirms by writing exactly 9 bytes and finishing the stream:
+
+```text
+confirmation = "VIVDADM1" (ASCII, 8 bytes) || confirmed binding mode (1 byte)
+```
+
+Any failure closes the WebTransport session. Neither the close code nor the reason contains the
+ticket or distinguishes failure causes. The browser treats the session as admitted only after it
+reads exactly the confirmation followed by the end of the stream; any other sequence closes the
+session. The admission stream is not a Vivid connection and carries no Vivid byte. A server sends
+the confirmation only for a session carried by HTTP/3.
+
+Accepting the session before admission makes every unadmitted session a §4.4 resource: the server
+bounds their number and releases each one at the deadline.
 
 The server validates the Fetch-supplied Origin; it does not trust an Origin string echoed by a
 native client. It atomically consumes the admission after validating the WebTransport request and
@@ -97,17 +136,28 @@ The browser requests:
 ```text
 protocols: ["vivid-1.5"]
 allowPooling: false
-headers: {
+headers: {                                    (header admission, §2.1, only)
   "Vivid-Admission": admission,
   "Vivid-Channel-Binding": "exporter-v1" | "none"
 }
 ```
 
+The offer and selection travel in the WebTransport over HTTP/3 `WT-Available-Protocols` field (a
+Structured Field List of Strings) and `WT-Protocol` field (a Structured Field String). The server
+selects the protocol by returning `WT-Protocol`; without it the browser reports no selected
+protocol.
+
 It verifies after `ready`:
 
 - the selected protocol is exactly `vivid-1.5`;
-- the server-confirmed binding mode equals the request; and
-- the actual `reliability` mode.
+- the server-confirmed binding mode equals the request: the `Vivid-Channel-Binding` response header
+  for header admission, or the confirmation's binding octet for in-band admission; and
+- the actual `reliability` mode. With in-band admission, a browser that does not expose
+  `reliability` relies on the confirmation, which a server sends only over HTTP/3, as evidence of
+  `independent-streams`.
+
+With in-band admission the protocol and reliability checks precede the admission frame, and the
+binding check follows the confirmation.
 
 Two carrier modes exist:
 
@@ -136,7 +186,8 @@ Each reliable bidirectional WebTransport stream maps to exactly one Vivid connec
 - unexpected or excess streams are reset before Vivid allocation.
 
 The web admission establishes route capacity before application streams are accepted. Early
-streams are reset, not buffered.
+streams are reset, not buffered. The in-band admission stream of §2.2 is the only stream accepted
+before admission; it is not a Vivid connection.
 
 Resetting a track stream detaches only that track channel. Resetting the interactive stream revokes
 input. Resetting control or closing the WebTransport session triggers the clean/unclean session
@@ -163,6 +214,8 @@ The HTTP response confirms:
 ```text
 Vivid-Channel-Binding: exporter-v1
 ```
+
+With in-band admission the confirmation's binding octet is `0x01` instead.
 
 A transparent gateway relaying a Vivid peer on another transport selects `none`, because the
 remote peer cannot access this WebTransport exporter. Both Vivid peers then use the all-zero
