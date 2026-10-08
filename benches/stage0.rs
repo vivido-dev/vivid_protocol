@@ -1,3 +1,8 @@
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "benchmark reports convert byte and latency counts to floating-point rates"
+)]
+
 mod stage0 {
     pub mod allocator;
     pub mod report;
@@ -230,6 +235,10 @@ struct Stage4Evidence {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per independent gate"
+)]
 struct GateResult {
     passed: bool,
     stage0_allocations: u64,
@@ -404,7 +413,7 @@ fn run_send_sample(
         let connection = Connection::from_streams(
             Box::new(io::empty()),
             Box::new(CountingWriter {
-                stats: stats.clone(),
+                stats: Arc::clone(&stats),
             }),
             connection_kind(flow.kind),
         )?;
@@ -462,7 +471,7 @@ fn send_flow(prepared: &mut PreparedFlow<'_>, mode: SendMode) -> io::Result<()> 
                 )?;
             }
             (MediaKind::Image, SendMode::PreStage0) => {
-                let body = prepared.payload.to_vec();
+                let body = prepared.payload.clone();
                 prepared
                     .connection
                     .write_record(IMAGE_DATA, 0, prepared.flow.object_id, &body)?;
@@ -535,7 +544,7 @@ fn send_flow(prepared: &mut PreparedFlow<'_>, mode: SendMode) -> io::Result<()> 
     Ok(())
 }
 
-fn video_packet<'a>(packet_id: u64, data: &'a [u8]) -> VideoPacket<'a> {
+fn video_packet(packet_id: u64, data: &[u8]) -> VideoPacket<'_> {
     let pts_us = i64::try_from(packet_id.saturating_sub(1))
         .unwrap_or(i64::MAX)
         .saturating_mul(16_667);
@@ -550,7 +559,7 @@ fn video_packet<'a>(packet_id: u64, data: &'a [u8]) -> VideoPacket<'a> {
     }
 }
 
-fn audio_packet<'a>(packet_id: u64, data: &'a [u8]) -> AudioPacket<'a> {
+fn audio_packet(packet_id: u64, data: &[u8]) -> AudioPacket<'_> {
     let pts_us = i64::try_from(packet_id.saturating_sub(1))
         .unwrap_or(i64::MAX)
         .saturating_mul(20_000);
@@ -569,7 +578,7 @@ fn audio_packet<'a>(packet_id: u64, data: &'a [u8]) -> AudioPacket<'a> {
 fn measure_receive_allocations(scenario: &Scenario, mode: SendMode) -> AllocationSnapshot {
     let maximum = usize::try_from(scenario.maximum_body_bytes()).unwrap_or(usize::MAX);
     let mut reusable = Vec::with_capacity(maximum);
-    let (_, allocations) = measure(|| {
+    let ((), allocations) = measure(|| {
         for flow in scenario.flows.iter().filter(|flow| !flow.blocked) {
             let body_bytes = usize::try_from(flow.body_bytes()).unwrap_or(usize::MAX);
             for _ in 0..flow.records {
@@ -716,7 +725,7 @@ fn distribution(base: u64, samples: usize) -> Distribution {
             if jitter.is_negative() {
                 base.saturating_sub(spread.saturating_mul(jitter.unsigned_abs()))
             } else {
-                base.saturating_add(spread.saturating_mul(jitter as u64))
+                base.saturating_add(spread.saturating_mul(jitter.unsigned_abs()))
             }
         })
         .collect();

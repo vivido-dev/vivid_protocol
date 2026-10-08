@@ -5,6 +5,13 @@ const MAX_DEPTH: usize = 16;
 const MAX_VALUE_LENGTH: usize = 16 * 1024 * 1024;
 const MAX_CONTAINER_LENGTH: usize = 4096;
 
+/// RFC 8949 §3 additional-information values announcing a 1-, 2-, 4-, or 8-byte argument.
+/// Values below `ARGUMENT_U8` are the argument itself.
+const ARGUMENT_U8: u8 = 24;
+const ARGUMENT_U16: u8 = 25;
+const ARGUMENT_U32: u8 = 26;
+const ARGUMENT_U64: u8 = 27;
+
 #[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub enum Value {
     Unsigned(u64),
@@ -15,6 +22,13 @@ pub enum Value {
     Map(Vec<(u64, Value)>),
     Bool(bool),
     Null,
+}
+
+/// Encodes a signed integer canonically: non-negative values as `Unsigned`, others as `Negative`.
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        u64::try_from(value).map_or(Self::Negative(value), Self::Unsigned)
+    }
 }
 
 /// One unknown entry retained from a canonical CBOR map.
@@ -93,7 +107,6 @@ impl Value {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Self::Unsigned(value) => i64::try_from(*value).ok(),
@@ -166,10 +179,10 @@ impl Encoder {
     }
 
     pub fn i64(&mut self, value: i64) {
-        if value >= 0 {
-            self.u64(value as u64);
-        } else {
-            self.major_length(1, (-1_i128 - i128::from(value)) as u64);
+        match u64::try_from(value) {
+            Ok(value) => self.u64(value),
+            // CBOR major type 1 carries `-1 - n`, which is `!n` and never negative for n < 0.
+            Err(_) => self.major_length(1, (!value).cast_unsigned()),
         }
     }
 
@@ -193,19 +206,21 @@ impl Encoder {
 
     fn major_length(&mut self, major: u8, value: u64) {
         let prefix = major << 5;
-        if value <= 23 {
-            self.bytes.push(prefix | value as u8);
-        } else if value <= u8::MAX as u64 {
-            self.bytes.push(prefix | 24);
-            self.bytes.push(value as u8);
-        } else if value <= u16::MAX as u64 {
-            self.bytes.push(prefix | 25);
-            self.bytes.extend_from_slice(&(value as u16).to_be_bytes());
-        } else if value <= u32::MAX as u64 {
-            self.bytes.push(prefix | 26);
-            self.bytes.extend_from_slice(&(value as u32).to_be_bytes());
+        if let Ok(value) = u8::try_from(value) {
+            if value < ARGUMENT_U8 {
+                self.bytes.push(prefix | value);
+            } else {
+                self.bytes.push(prefix | ARGUMENT_U8);
+                self.bytes.push(value);
+            }
+        } else if let Ok(value) = u16::try_from(value) {
+            self.bytes.push(prefix | ARGUMENT_U16);
+            self.bytes.extend_from_slice(&value.to_be_bytes());
+        } else if let Ok(value) = u32::try_from(value) {
+            self.bytes.push(prefix | ARGUMENT_U32);
+            self.bytes.extend_from_slice(&value.to_be_bytes());
         } else {
-            self.bytes.push(prefix | 27);
+            self.bytes.push(prefix | ARGUMENT_U64);
             self.bytes.extend_from_slice(&value.to_be_bytes());
         }
     }
@@ -406,13 +421,10 @@ pub fn decode_preserving_map<'a>(
     let mut preserved = Vec::with_capacity(length.saturating_sub(known_keys.len()));
     let mut previous = None;
     for _ in 0..length {
-        let key = match decoder.value(1)? {
-            Value::Unsigned(key) => key,
-            _ => {
-                return Err(DecodeError(
-                    "CBOR map key is not an unsigned integer".into(),
-                ));
-            }
+        let Value::Unsigned(key) = decoder.value(1)? else {
+            return Err(DecodeError(
+                "CBOR map key is not an unsigned integer".into(),
+            ));
         };
         if previous.is_some_and(|previous| previous >= key) {
             return Err(DecodeError("CBOR map keys are not strictly sorted".into()));
@@ -554,21 +566,21 @@ impl Decoder<'_> {
             }
             25 => {
                 let value = u64::from(u16::from_be_bytes(self.take(2)?.try_into().unwrap()));
-                if value <= u8::MAX as u64 {
+                if u8::try_from(value).is_ok() {
                     return Err(DecodeError("non-shortest CBOR integer encoding".into()));
                 }
                 Ok(value)
             }
             26 => {
                 let value = u64::from(u32::from_be_bytes(self.take(4)?.try_into().unwrap()));
-                if value <= u16::MAX as u64 {
+                if u16::try_from(value).is_ok() {
                     return Err(DecodeError("non-shortest CBOR integer encoding".into()));
                 }
                 Ok(value)
             }
             27 => {
                 let value = u64::from_be_bytes(self.take(8)?.try_into().unwrap());
-                if value <= u32::MAX as u64 {
+                if u32::try_from(value).is_ok() {
                     return Err(DecodeError("non-shortest CBOR integer encoding".into()));
                 }
                 Ok(value)
@@ -626,7 +638,7 @@ mod tests {
 
     #[test]
     fn rejects_unsorted_map_keys() {
-        assert!(decode(&[0xa2, 0x01, 0x00, 0x00, 0x00]).is_err());
+        decode(&[0xa2, 0x01, 0x00, 0x00, 0x00]).unwrap_err();
     }
 
     #[test]
@@ -650,7 +662,7 @@ mod tests {
     #[test]
     fn generic_encoder_rejects_unsorted_maps() {
         let value = Value::Map(vec![(1, Value::Unsigned(0)), (0, Value::Unsigned(0))]);
-        assert!(encode(&value).is_err());
+        encode(&value).unwrap_err();
     }
 
     #[test]
@@ -669,9 +681,9 @@ mod tests {
 
     #[test]
     fn rejects_container_lengths_before_large_allocation() {
-        assert!(decode(&[0x99, 0x10, 0x01]).is_err());
-        assert!(decode(&[0x99, 0x10, 0x00]).is_err());
-        assert!(decode(&[0xb9, 0x10, 0x00]).is_err());
+        decode(&[0x99, 0x10, 0x01]).unwrap_err();
+        decode(&[0x99, 0x10, 0x00]).unwrap_err();
+        decode(&[0xb9, 0x10, 0x00]).unwrap_err();
     }
 
     #[test]
@@ -706,7 +718,7 @@ mod tests {
 
     #[test]
     fn preserving_map_rejects_malformed_unknown_value() {
-        assert!(decode_preserving_map(&[0xa2, 0x00, 0x01, 0x02, 0x82, 0xf5], &[0]).is_err());
+        decode_preserving_map(&[0xa2, 0x00, 0x01, 0x02, 0x82, 0xf5], &[0]).unwrap_err();
     }
 
     #[test]
@@ -715,7 +727,7 @@ mod tests {
             key: 1,
             encoded_value: vec![0],
         }];
-        assert!(encode_preserving_map(&[(1, Value::Unsigned(1))], &preserved).is_err());
+        encode_preserving_map(&[(1, Value::Unsigned(1))], &preserved).unwrap_err();
 
         let too_many = (0..=MAX_CONTAINER_LENGTH)
             .map(|key| PreservedField {
@@ -723,6 +735,6 @@ mod tests {
                 encoded_value: vec![0],
             })
             .collect::<Vec<_>>();
-        assert!(encode_preserving_map(&[], &too_many).is_err());
+        encode_preserving_map(&[], &too_many).unwrap_err();
     }
 }

@@ -9,7 +9,7 @@ use std::io;
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const SAMPLES: usize = 960;
 pub const PCM_BYTES: usize = SAMPLES * 2;
-pub const BODY_BYTES: u32 = PCM_BYTES as u32 + 48;
+pub const BODY_BYTES: u32 = crate::const_u32(PCM_BYTES) + 48;
 pub const PACKET_US: u64 = 20_000;
 pub const QUEUE_PACKETS: usize = 10;
 
@@ -35,7 +35,7 @@ pub fn configuration(context_id: u64, surface_id: u64, track_id: u64) -> TrackCo
             sample_rate: SAMPLE_RATE,
             channels: 1,
             channel_mask: 4,
-            maximum_access_unit_bytes: PCM_BYTES as u32,
+            maximum_access_unit_bytes: const { crate::const_u32(PCM_BYTES) },
             codec_string: None,
         }),
         target_latency_us: 40_000,
@@ -147,7 +147,7 @@ mod tests {
         };
         let body = packet.encode().unwrap();
         assert_eq!(body.len(), BODY_BYTES as usize);
-        assert!(InputPacket::decode(&body[..body.len() - 2]).is_err());
+        InputPacket::decode(&body[..body.len() - 2]).unwrap_err();
         assert_eq!(InputPacket::decode(&body).unwrap().pcm, packet.pcm);
     }
 }

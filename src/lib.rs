@@ -40,6 +40,19 @@ pub mod vector;
 pub mod web;
 pub mod wire;
 
+/// Narrows a compile-time size to `u32`, failing const evaluation if it does not fit.
+///
+/// Call it inside `const { ... }` so an oversized constant is a build error, not a runtime panic.
+pub(crate) const fn const_u32(value: usize) -> u32 {
+    assert!(value <= u32::MAX as usize, "size constant exceeds u32");
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the assert above bounds the value"
+    )]
+    let narrowed = value as u32;
+    narrowed
+}
+
 /// Version of the Vivid wire protocol, used by both the connection preface and HELLO/WELCOME.
 pub const VIVID_MAJOR: u8 = 1;
 pub const VIVID_MINOR: u8 = 5;

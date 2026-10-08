@@ -352,7 +352,7 @@ mod tests {
         let secret = Secret32::from_hex(&"a5".repeat(32)).unwrap();
         assert_eq!(secret.expose(), &[0xa5; 32]);
         assert_eq!(format!("{secret:?}"), "Secret32([REDACTED])");
-        assert!(Secret32::from_hex("a5").is_err());
+        Secret32::from_hex("a5").unwrap_err();
     }
 
     #[test]

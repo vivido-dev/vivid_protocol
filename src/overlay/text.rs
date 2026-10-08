@@ -1,5 +1,8 @@
 //! Optional host text measurements and revision-bound platform editor placement.
-use super::*;
+use super::{
+    MessageError, PayloadMap, Rect, Scalar, Value, WindowAddress, array, bad, boolean,
+    decode_rectangle, decode_scalar, nonzero, rectangle, scalar, small, strict, u,
+};
 use crate::vector::{Canvas, Command, Text};
 
 #[path = "styled.rs"]
@@ -216,7 +219,7 @@ impl EditorGeometry {
         let mut values = self.address.payload();
         values.extend([
             (3, u(self.scene_revision)),
-            (4, self.caret.map(rectangle).unwrap_or(Value::Null)),
+            (4, self.caret.map_or(Value::Null, rectangle)),
         ]);
         Ok(values)
     }
@@ -236,6 +239,8 @@ impl EditorGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::Point;
+
     fn request() -> MeasureText {
         MeasureText {
             address: WindowAddress {
@@ -250,7 +255,7 @@ mod tests {
                 family: String::new(),
                 weight: 400,
                 italic: false,
-                color: crate::vector::Color(0xffffffff),
+                color: crate::vector::Color(0xff_ff_ff_ff),
                 max_width: None,
             },
         }
@@ -260,13 +265,13 @@ mod tests {
         let request = request();
         let value = Value::Map(request.payload().unwrap());
         assert_eq!(MeasureText::decode(2, &value).unwrap(), request);
-        assert!(MeasureText::decode(3, &value).is_err());
+        MeasureText::decode(3, &value).unwrap_err();
         let mut oversized = request.clone();
         oversized.text.text = "a".repeat(MAX_MEASURE_TEXT_BYTES + 1);
-        assert!(oversized.payload().is_err());
+        oversized.payload().unwrap_err();
         let mut duplicate = request.payload().unwrap();
         duplicate.push((3, Value::Null));
-        assert!(MeasureText::decode(2, &Value::Map(duplicate)).is_err());
+        MeasureText::decode(2, &Value::Map(duplicate)).unwrap_err();
         for caret in [None, Some(Rect::new(1., 2., 1., 16.).unwrap())] {
             let editor = EditorGeometry {
                 address: request.address,
@@ -278,15 +283,13 @@ mod tests {
                 editor
             );
         }
-        assert!(
-            EditorGeometry {
-                address: request.address,
-                scene_revision: 0,
-                caret: None
-            }
-            .payload()
-            .is_err()
-        );
+        EditorGeometry {
+            address: request.address,
+            scene_revision: 0,
+            caret: None,
+        }
+        .payload()
+        .unwrap_err();
     }
     #[test]
     fn measurements_reject_wrong_owner_geometry_limits_and_unicode_offsets() {
@@ -318,10 +321,10 @@ mod tests {
             context_id: 8,
             ..request.address
         };
-        assert!(TextMeasurement::decode(wrong, &value).is_err());
+        TextMeasurement::decode(wrong, &value).unwrap_err();
         measured.clusters[0].end = 2;
         assert!(measured.validate_text(&request.text.text).is_err());
         measured.clusters = vec![measured.clusters[0].clone(); MAX_TEXT_GEOMETRY + 1];
-        assert!(measured.payload(request.address).is_err());
+        measured.payload(request.address).unwrap_err();
     }
 }

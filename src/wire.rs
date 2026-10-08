@@ -47,7 +47,6 @@ pub enum FlushMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-#[allow(dead_code)]
 pub enum ConnectionKind {
     Control = 0,
     Lane = 1,
@@ -165,7 +164,8 @@ pub enum PrefaceClassification {
 pub fn unsupported_version_record() -> Vec<u8> {
     let body = crate::messages::unsupported_version_error();
     let header = RecordHeader {
-        body_length: body.len() as u32,
+        body_length: u32::try_from(body.len())
+            .expect("the version error body is a few dozen bytes"),
         record_type: crate::messages::ERROR,
         flags: 0,
         object_id: 0,
@@ -1101,7 +1101,7 @@ fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::
                 WriterIo::Sink(sink) => sink.write_vectored(&slices[..slice_count]),
             };
             match result {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 result => break result?,
             }
         };
@@ -1169,7 +1169,7 @@ fn has_correlated_control_envelope(record_type: u16, parts: &[&[u8]]) -> bool {
     let additional = initial & 0x1f;
     let request_id = match additional {
         value @ 0..=23 => u64::from(value),
-        24 => bytes.next().map(u64::from).unwrap_or(0),
+        24 => bytes.next().map_or(0, u64::from),
         25 => read_control_uint(&mut bytes, 2).unwrap_or(0),
         26 => read_control_uint(&mut bytes, 4).unwrap_or(0),
         27 => read_control_uint(&mut bytes, 8).unwrap_or(0),
@@ -1403,15 +1403,15 @@ mod tests {
     fn rejects_invalid_prefaces() {
         let mut preface = encode_preface(ConnectionKind::Control, 1024);
         preface[0] = b'X';
-        assert!(Preface::decode(preface).is_err());
+        Preface::decode(preface).unwrap_err();
 
         let mut preface = encode_preface(ConnectionKind::Control, 1024);
         preface[15] = 1;
-        assert!(Preface::decode(preface).is_err());
+        Preface::decode(preface).unwrap_err();
 
         let mut preface = encode_preface(ConnectionKind::Control, 1024);
         preface[7] = 1;
-        assert!(Preface::decode(preface).is_err());
+        Preface::decode(preface).unwrap_err();
     }
 
     #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -1438,7 +1438,7 @@ mod tests {
         let mut malformed = encode_preface(ConnectionKind::Control, 4096);
         malformed[0] = b'X';
         let mut silent = Vec::new();
-        assert!(accept_preface(malformed, &mut silent).is_err());
+        accept_preface(malformed, &mut silent).unwrap_err();
         assert!(silent.is_empty());
     }
 
@@ -1456,10 +1456,10 @@ mod tests {
         let mut preface = encode_preface(ConnectionKind::Control, 4096);
         preface[5] = VIVID_MINOR.wrapping_sub(1);
         initiator.write_all(&preface).unwrap();
-        let mut received = Vec::new();
-        initiator.read_to_end(&mut received).unwrap();
+        let mut reply = Vec::new();
+        initiator.read_to_end(&mut reply).unwrap();
         server.join().unwrap();
-        assert_eq!(received, unsupported_version_record());
+        assert_eq!(reply, unsupported_version_record());
     }
 
     #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
@@ -1485,7 +1485,7 @@ mod tests {
     #[cfg(any(feature = "native", feature = "native-transport"))]
     fn connection_rejects_reserved_record_flags() {
         let mut connection = Connection::sink(ConnectionKind::Control).unwrap();
-        assert!(connection.write_record(1, 2, 0, &[]).is_err());
+        connection.write_record(1, 2, 0, &[]).unwrap_err();
     }
 
     #[test]
@@ -1494,7 +1494,7 @@ mod tests {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let _connection = Connection::from_streams(
             Box::new(io::empty()),
-            Box::new(SharedBytes(bytes.clone())),
+            Box::new(SharedBytes(Arc::clone(&bytes))),
             ConnectionKind::Track,
         )
         .unwrap();
@@ -1579,9 +1579,10 @@ mod tests {
             // Fill the socket before starting the record write, without relying on buffer sizes.
             filling.set_nonblocking(true).unwrap();
             let deadline = Instant::now() + SETTLE_TIMEOUT;
+            let chunk = vec![0; 65536];
             loop {
                 assert!(Instant::now() < deadline, "socket did not saturate");
-                match filling.write(&[0; 65536]) {
+                match filling.write(&chunk) {
                     Ok(_) => {}
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) => panic!("fill failed: {error}"),
@@ -1618,7 +1619,7 @@ mod tests {
             let result = closed_rx.recv_timeout(SETTLE_TIMEOUT);
             // Always release the worker, including when running this regression against broken code.
             let _ = peer.shutdown(Shutdown::Both);
-            assert!(sender.join().unwrap().is_err());
+            sender.join().unwrap().unwrap_err();
             closer.join().unwrap();
             result
                 .expect("shutdown waited for the blocked write")
@@ -1745,7 +1746,7 @@ mod tests {
             native_shutdown: Arc::new(Mutex::new(None)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(WriterState {
-                io: WriterIo::Live(Box::new(SharedBytes(bytes.clone()))),
+                io: WriterIo::Live(Box::new(SharedBytes(Arc::clone(&bytes)))),
                 closed: false,
                 send_sequence: 0,
                 send_body_limit: 16,
@@ -1796,7 +1797,7 @@ mod tests {
         let vectored_stats = Arc::new(Mutex::new(WriteStats::default()));
         let vectored = test_writer(
             ShortWriter {
-                stats: vectored_stats.clone(),
+                stats: Arc::clone(&vectored_stats),
                 maximum: 3,
             },
             FlushMode::Immediate,
@@ -1811,7 +1812,7 @@ mod tests {
         let contiguous_stats = Arc::new(Mutex::new(WriteStats::default()));
         let contiguous = test_writer(
             ShortWriter {
-                stats: contiguous_stats.clone(),
+                stats: Arc::clone(&contiguous_stats),
                 maximum: usize::MAX,
             },
             FlushMode::Immediate,
@@ -1829,7 +1830,7 @@ mod tests {
         let stats = Arc::new(Mutex::new(WriteStats::default()));
         let writer = test_writer(
             ShortWriter {
-                stats: stats.clone(),
+                stats: Arc::clone(&stats),
                 maximum: usize::MAX,
             },
             FlushMode::Immediate,
@@ -1857,7 +1858,7 @@ mod tests {
         let stats = Arc::new(Mutex::new(WriteStats::default()));
         let writer = test_writer(
             ShortWriter {
-                stats: stats.clone(),
+                stats: Arc::clone(&stats),
                 maximum: usize::MAX,
             },
             FlushMode::Batched,
@@ -1924,7 +1925,7 @@ mod tests {
         };
         let mut untouched = vec![9; 8];
         let capacity = untouched.capacity();
-        assert!(reader.read_record_into(&mut untouched).is_err());
+        reader.read_record_into(&mut untouched).unwrap_err();
         assert_eq!(untouched, vec![9; 8]);
         assert_eq!(untouched.capacity(), capacity);
     }

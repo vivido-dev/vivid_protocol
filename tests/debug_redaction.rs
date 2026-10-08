@@ -1,4 +1,6 @@
 //! `Debug` output of public types never renders key material, tags, proofs, or payload bytes.
+use std::fmt::Write as _;
+
 use vivid_protocol::{
     anchor::AnchorKey,
     auth::{self, Secret32},
@@ -11,7 +13,7 @@ use vivid_protocol::{
 
 /// Distinct, non-repeating bytes so a leak cannot hide behind a coincidental match.
 fn secret<const N: usize>(seed: u8) -> [u8; N] {
-    std::array::from_fn(|index| seed.wrapping_add((index as u8).wrapping_mul(37)))
+    std::array::from_fn(|index| seed.wrapping_add(u8::try_from(index).unwrap().wrapping_mul(37)))
 }
 
 /// Asserts `rendered` holds no recognizable rendering of `bytes`.
@@ -19,7 +21,10 @@ fn assert_redacted(rendered: &str, bytes: &[u8]) {
     let window = &bytes[..bytes.len().min(4)];
     let decimal = format!("{window:?}");
     let decimal = decimal.trim_matches(['[', ']']);
-    let hex: String = window.iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex = window.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    });
     assert!(!rendered.contains(decimal), "{rendered} leaks {decimal}");
     assert!(!rendered.contains(&hex), "{rendered} leaks {hex}");
 }

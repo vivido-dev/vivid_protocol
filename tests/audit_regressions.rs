@@ -49,7 +49,7 @@ fn error_detail_checks_constructor_and_mutated_public_fields() {
             Value::Bytes(vec![7; 32]),
             Value::Null,
         ] {
-            assert!(ErrorDetail::new(vec![(key, bad.clone())]).is_err());
+            ErrorDetail::new(vec![(key, bad.clone())]).unwrap_err();
             let reply = ErrorReply {
                 code: 1,
                 request_id: 1,
@@ -59,7 +59,7 @@ fn error_detail_checks_constructor_and_mutated_public_fields() {
                 fatal: false,
                 diagnostic: String::new(),
             };
-            assert!(reply.encode().is_err());
+            reply.encode().unwrap_err();
             let body = messages::encode_payload(
                 1,
                 vec![
@@ -71,11 +71,11 @@ fn error_detail_checks_constructor_and_mutated_public_fields() {
                 ],
             )
             .unwrap();
-            assert!(messages::parse_error_reply(&body).is_err());
+            messages::parse_error_reply(&body).unwrap_err();
         }
     }
-    assert!(ErrorDetail::new(vec![(10, Value::Unsigned(1))]).is_err());
-    assert!(ErrorDetail::new(vec![(0, Value::Bool(false))]).is_err());
+    ErrorDetail::new(vec![(10, Value::Unsigned(1))]).unwrap_err();
+    ErrorDetail::new(vec![(0, Value::Bool(false))]).unwrap_err();
     for value in 0..=3 {
         assert_eq!(
             ErrorDetail::new(vec![(12, Value::Unsigned(value))]).is_ok(),
@@ -88,7 +88,7 @@ fn error_detail_checks_constructor_and_mutated_public_fields() {
         vec![(1, Value::Unsigned(0)), (0, Value::Unsigned(0))],
         vec![(0, Value::Unsigned(0)), (0, Value::Unsigned(0))],
     ] {
-        assert!(ErrorDetail::new(fields).is_err());
+        ErrorDetail::new(fields).unwrap_err();
     }
     for code in [0, 1, 30, 31, u64::MAX] {
         let reply = ErrorReply {
@@ -190,18 +190,18 @@ fn welcome_authentication_is_checked_on_both_boundaries() {
                     .find(|(field, _)| *field == key)
                     .unwrap()
                     .1 = Value::Unsigned(bad);
-                assert!(Welcome::decode(&envelope.encode().unwrap()).is_err());
+                Welcome::decode(&envelope.encode().unwrap()).unwrap_err();
             }
         }
     }
     welcome.authentication.kind = 99;
-    assert!(welcome.encode(1).is_err());
+    welcome.encode(1).unwrap_err();
     welcome.authentication.kind = 1;
     welcome.authentication.activation_attempt_status = 99;
-    assert!(welcome.encode(1).is_err());
+    welcome.encode(1).unwrap_err();
     welcome.authentication.activation_attempt_status = 0;
     welcome.authentication.lease_state = 0;
-    assert!(welcome.encode(1).is_err());
+    welcome.encode(1).unwrap_err();
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn authentication_errors_are_bounded_and_preserve_valid_transcripts() {
         Hello::decode(&body).unwrap().1.authless_payload().unwrap(),
         hello.authless_payload().unwrap()
     );
-    assert!(hello.encode(0).is_err());
+    hello.encode(0).unwrap_err();
     for key in [0, 5, 6, 7] {
         let mut envelope = messages::decode_control(&body).unwrap();
         envelope
@@ -221,17 +221,17 @@ fn authentication_errors_are_bounded_and_preserve_valid_transcripts() {
             .find(|(field, _)| *field == key)
             .unwrap()
             .1 = Value::Null;
-        assert!(Hello::decode(&envelope.encode().unwrap()).is_err());
+        Hello::decode(&envelope.encode().unwrap()).unwrap_err();
     }
     let mut envelope = messages::decode_control(&body).unwrap();
     envelope.request_id = 0;
-    assert!(Hello::decode(&envelope.encode().unwrap()).is_err());
+    Hello::decode(&envelope.encode().unwrap()).unwrap_err();
     for end in 0..body.len() {
-        assert!(Hello::decode(&body[..end]).is_err());
+        Hello::decode(&body[..end]).unwrap_err();
     }
     let mut invalid = body;
     invalid.push(0);
-    assert!(Hello::decode(&invalid).is_err());
+    Hello::decode(&invalid).unwrap_err();
     let value = Value::Array(vec![
         Value::Bytes(vec![0xab; 32]),
         Value::Text("sensitive".into()),
@@ -255,8 +255,8 @@ fn marker_ids_must_be_hex_digits() {
     let body = &canonical[2..canonical.len() - 2];
     for prefix in ['+', '-', ' ', 'g'] {
         let malformed = body.replace("0000000000000001", &format!("{prefix}000000000000001"));
-        assert!(anchor::parse_marker(&malformed).is_err());
-        assert!(anchor::parse_conpty_marker(&format!("{malformed};VIVID-END")).is_err());
+        anchor::parse_marker(&malformed).unwrap_err();
+        anchor::parse_conpty_marker(&format!("{malformed};VIVID-END")).unwrap_err();
     }
     let valid = anchor::encode_marker(&key, &[1; 16], 0xab, 0xcd).unwrap();
     let upper = valid[2..valid.len() - 2]
@@ -273,9 +273,9 @@ fn malformed_lengths_do_not_panic_on_32_bit_parsers() {
     for count in 1..=8 {
         let mut obu = vec![0x12];
         obu.extend(std::iter::repeat_n(0x80, count));
-        assert!(media::access_unit_is_key("av1", &obu).is_err());
+        media::access_unit_is_key("av1", &obu).unwrap_err();
         *obu.last_mut().unwrap() = 0x7f;
-        assert!(media::access_unit_is_key("av1", &obu).is_err());
+        media::access_unit_is_key("av1", &obu).unwrap_err();
     }
     let mut body = [0; 72];
     for (offset, value) in [(4, 3u32), (40, 1), (56, 1), (60, 1)] {
@@ -285,7 +285,7 @@ fn malformed_lengths_do_not_panic_on_32_bit_parsers() {
         body[68..72].copy_from_slice(&length.to_be_bytes());
         // Zero-length compressed data is parsed structurally; decoding rejects it.
         if length != 0 {
-            assert!(media::parse_full_raster_frame(&body).is_err());
+            media::parse_full_raster_frame(&body).unwrap_err();
         }
     }
 }
@@ -311,7 +311,7 @@ fn aac_layout_numbers_are_not_channel_counts() {
         None,
     ];
     for (config, count) in counts.iter().enumerate().skip(1) {
-        let asc = [0x12, (config as u8) << 3];
+        let asc = [0x12, u8::try_from(config).unwrap() << 3];
         for channels in 1..=24 {
             assert_eq!(
                 media::validate_aac_audio_specific_config(&asc, 44100, channels).is_ok(),
@@ -342,7 +342,7 @@ fn aac_layout_numbers_are_not_channel_counts() {
         let mut scalable = pce.clone();
         scalable[0] = (object_type << 3) | (scalable[0] & 7);
         scalable.push(0); // layerNr follows the byte-aligned PCE, not the GA flags.
-        assert!(media::validate_aac_audio_specific_config(&scalable, 44100, 2).is_ok());
+        media::validate_aac_audio_specific_config(&scalable, 44100, 2).unwrap();
     }
     assert!(media::validate_aac_audio_specific_config(&pce, 44100, 1).is_err());
     for end in 0..pce.len() {
@@ -353,6 +353,19 @@ fn aac_layout_numbers_are_not_channel_counts() {
 #[cfg(any(feature = "native", feature = "native-transport"))]
 #[test]
 fn connection_trace_persists_only_metadata_and_rejects_existing_paths() {
+    struct OverReporting;
+    impl Write for OverReporting {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_vectored(&mut self, b: &[IoSlice<'_>]) -> io::Result<usize> {
+            Ok(b.iter().map(|s| s.len()).sum::<usize>() + 1)
+        }
+    }
+
     use std::io::{self, IoSlice, Write};
     use vivid_protocol::wire::{Connection, ConnectionKind};
     let path = std::env::temp_dir().join(format!(
@@ -397,7 +410,7 @@ fn connection_trace_persists_only_metadata_and_rejects_existing_paths() {
     assert!(text.lines().all(|line| line.starts_with("{\"version\":1,")));
     assert!(!text.contains("private"));
     assert!(!text.as_bytes().windows(32).any(|w| w == [0xab; 32]));
-    assert!(Connection::trace(&path, ConnectionKind::Control).is_err());
+    Connection::trace(&path, ConnectionKind::Control).unwrap_err();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     #[cfg(unix)]
     {
@@ -406,20 +419,8 @@ fn connection_trace_persists_only_metadata_and_rejects_existing_paths() {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-    }
+    };
     std::fs::remove_file(path).unwrap();
-    struct OverReporting;
-    impl Write for OverReporting {
-        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-        fn write_vectored(&mut self, b: &[IoSlice<'_>]) -> io::Result<usize> {
-            Ok(b.iter().map(|s| s.len()).sum::<usize>() + 1)
-        }
-    }
     let mut connection = Connection::from_streams(
         Box::new(io::empty()),
         Box::new(OverReporting),
@@ -427,11 +428,9 @@ fn connection_trace_persists_only_metadata_and_rejects_existing_paths() {
     )
     .unwrap();
     // More than the offered batch, but less than all remaining parts.
-    assert!(
-        connection
-            .write_record_parts(messages::HELLO, 0, 0, &[&[7][..]; 32])
-            .is_err()
-    );
+    connection
+        .write_record_parts(messages::HELLO, 0, 0, &[&[7][..]; 32])
+        .unwrap_err();
 }
 
 #[test]

@@ -172,8 +172,7 @@ impl TraceRecord {
         let request_id = optional_u64(self.request_id);
         let causation_id = self
             .causation_id
-            .map(|value| format!("\"{}\"", hex(&value)))
-            .unwrap_or_else(|| "null".into());
+            .map_or_else(|| "null".into(), |value| format!("\"{}\"", hex(&value)));
         format!(
             concat!(
                 "{{\"version\":{},\"monotonic_ts_us\":{},",
@@ -235,7 +234,10 @@ impl fmt::Debug for TraceEmitter {
 }
 
 impl TraceEmitter {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per trace record column; open guideline item M-INIT-CASCADED"
+    )]
     pub fn emit(
         &self,
         direction: TraceDirection,
@@ -265,7 +267,7 @@ impl TraceEmitter {
             outcome,
         };
         match self.sender.try_send(TraceMessage::Record(record)) {
-            Ok(()) => {}
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(_)) => {
                 let _ = self
                     .dropped
@@ -273,12 +275,14 @@ impl TraceEmitter {
                         Some(value.saturating_add(1))
                     });
             }
-            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
     /// Emit metadata for a control body after extracting only its public request and causation IDs.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per trace record column; open guideline item M-INIT-CASCADED"
+    )]
     pub fn emit_control(
         &self,
         direction: TraceDirection,
@@ -358,9 +362,9 @@ impl TraceGuard {
             hop,
             local_session_hint,
         });
-        let worker_context = context.clone();
-        let worker_dropped = dropped.clone();
-        let worker_callback_shutdown = callback_shutdown.clone();
+        let worker_context = Arc::clone(&context);
+        let worker_dropped = Arc::clone(&dropped);
+        let worker_callback_shutdown = Arc::clone(&callback_shutdown);
         let join = thread::Builder::new()
             .name("vivid-trace".into())
             .spawn(move || {
@@ -421,8 +425,8 @@ impl TraceGuard {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+            options.mode(0o600)
+        };
         let mut writer = BufWriter::new(options.open(path)?);
         Self::callback(component, hop, local_session_hint, move |record| {
             let _ = writer.write_all(record.ndjson_line().as_bytes());
@@ -455,15 +459,13 @@ impl Drop for TraceGuard {
 pub fn control_correlation(
     body: &[u8],
 ) -> (Option<u64>, Option<[u8; messages::CAUSATION_ID_BYTES]>) {
-    messages::decode_control(body)
-        .map(|envelope| {
-            let envelope = zeroize::Zeroizing::new(envelope);
-            (
-                (envelope.request_id != 0).then_some(envelope.request_id),
-                envelope.causation_id,
-            )
-        })
-        .unwrap_or((None, None))
+    messages::decode_control(body).map_or((None, None), |envelope| {
+        let envelope = zeroize::Zeroizing::new(envelope);
+        (
+            (envelope.request_id != 0).then_some(envelope.request_id),
+            envelope.causation_id,
+        )
+    })
 }
 
 pub fn object_kind(record_type: u16, object_id: u64) -> TraceObjectKind {
@@ -546,7 +548,7 @@ mod tests {
         .encode(7)
         .unwrap();
         let records = Arc::new(Mutex::new(Vec::new()));
-        let output = records.clone();
+        let output = Arc::clone(&records);
         let guard = TraceGuard::callback(
             TraceComponent::Protocol,
             TraceHop::Local,
@@ -591,7 +593,7 @@ mod tests {
     #[test]
     fn full_queue_is_nonblocking_and_reports_loss() {
         let records = Arc::new(Mutex::new(Vec::new()));
-        let output = records.clone();
+        let output = Arc::clone(&records);
         let guard = TraceGuard::callback(
             TraceComponent::Protocol,
             TraceHop::Local,
@@ -629,7 +631,7 @@ mod tests {
     #[test]
     fn callback_can_disable_its_own_trace_without_deadlocking() {
         let guard_slot = Arc::new(Mutex::new(None::<TraceGuard>));
-        let callback_slot = guard_slot.clone();
+        let callback_slot = Arc::clone(&guard_slot);
         let (done, completed) = std::sync::mpsc::sync_channel(1);
         let guard = TraceGuard::callback(
             TraceComponent::Protocol,

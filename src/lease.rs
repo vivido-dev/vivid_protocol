@@ -157,7 +157,7 @@ pub enum LeaseState {
 
 #[derive(Clone, PartialEq, Eq)]
 struct Attempt {
-    attempt_id: [u8; 16],
+    id: [u8; 16],
     client_nonce: [u8; 32],
     hello_hash: [u8; 32],
     session_id: u64,
@@ -170,7 +170,7 @@ struct Attempt {
 
 impl Attempt {
     fn exact(&self, attempt_id: &[u8; 16], client_nonce: &[u8; 32], hello_bytes: &[u8]) -> bool {
-        self.attempt_id == *attempt_id
+        self.id == *attempt_id
             && self.client_nonce == *client_nonce
             && self.hello_hash == Sha256::digest(hello_bytes).as_slice()
     }
@@ -255,7 +255,10 @@ impl LeaseMachine {
         self.resume_generation
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per HELLO binding field; open guideline item M-INIT-CASCADED"
+    )]
     pub fn begin_activation(
         &mut self,
         attempt_id: [u8; 16],
@@ -283,7 +286,7 @@ impl LeaseMachine {
                 self.logical_session_id = Some(session_id);
                 self.profile_fingerprint = Some(profile_fingerprint);
                 self.attempt = Some(Attempt {
-                    attempt_id,
+                    id: attempt_id,
                     client_nonce,
                     hello_hash: Sha256::digest(hello_bytes).into(),
                     session_id,
@@ -389,7 +392,10 @@ impl LeaseMachine {
         Ok(self.state)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per HELLO binding field; open guideline item M-INIT-CASCADED"
+    )]
     pub fn begin_resume(
         &mut self,
         expected_generation: ResumeGeneration,
@@ -444,7 +450,7 @@ impl LeaseMachine {
         self.state = LeaseState::Reserved;
         self.revision = next_revision;
         self.attempt = Some(Attempt {
-            attempt_id,
+            id: attempt_id,
             client_nonce,
             hello_hash: Sha256::digest(hello_bytes).into(),
             session_id,

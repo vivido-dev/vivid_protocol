@@ -135,7 +135,7 @@ impl ObservationQueue {
             // Dropping the oldest is what "dropped under bounded writer pressure" means; the gap
             // tells the producer to re-query rather than trust what it last saw.
             let dropped = self.entries.pop_front();
-            let classes = dropped.map(|entry| entry.class).unwrap_or(0);
+            let classes = dropped.map_or(0, |entry| entry.class);
             self.note_loss(classes);
         }
         self.entries.push_back(Entry {

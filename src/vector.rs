@@ -17,6 +17,20 @@ pub const MAX_GRADIENT_STOPS: usize = 64;
 pub const MAX_DASH_ENTRIES: usize = 32;
 /// Hard ceiling for one dash length, corner radius, shadow blur, or spread, in logical pixels.
 pub const MAX_PAINT_EXTENT: f64 = 4096.;
+
+/// 1.0 in `Scalar`'s signed 32.32 fixed-point representation (2^32).
+const FIXED_ONE: f64 = 4_294_967_296.0;
+
+/// Control-point distance, as a fraction of the radius, for a cubic Bézier quarter circle:
+/// 4/3 * (sqrt(2) - 1). Changing it visibly flattens or bulges every rounded shape.
+const BEZIER_CIRCLE_KAPPA: f64 = 0.552_284_749_830_793_6;
+
+/// The largest accepted dash offset: one full extent per dash entry.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "MAX_DASH_ENTRIES is 32, exact in f64"
+)]
+const MAX_DASH_OFFSET: f64 = MAX_PAINT_EXTENT * MAX_DASH_ENTRIES as f64;
 pub const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RETAINED_ASSETS: usize = 256;
 pub const MAX_RETAINED_ASSET_BYTES: usize = 64 * 1024 * 1024;
@@ -271,10 +285,19 @@ impl Scalar {
                 "coordinate is non-finite or exceeds the logical extent limit",
             ));
         }
-        Ok(Self((value * 4294967296.0).round() as i64))
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "|value| <= 1e6, so the scaled value is below 2^53 and fits i64 exactly"
+        )]
+        let raw = (value * FIXED_ONE).round() as i64;
+        Ok(Self(raw))
     }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "constructed values stay below 2^53 in magnitude, so f64 holds them exactly"
+    )]
     pub fn get(self) -> f64 {
-        self.0 as f64 / 4294967296.0
+        self.0 as f64 / FIXED_ONE
     }
     pub const fn raw(self) -> i64 {
         self.0
@@ -407,10 +430,14 @@ impl Path {
     /// left: `[top_left, top_right, bottom_right, bottom_left]`. Over-large radii are scaled
     /// down together by the smallest side ratio, as CSS does, so the outline never overlaps
     /// itself.
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "corner and extent names follow the geometry"
+    )]
     pub fn rounded_rectangle_corners(rect: Rect, radii: Corners) -> Result<Self> {
         rect.validate()?;
         radii.validate()?;
-        let [tl, tr, br, bl] = radii.0.map(|r| r.get());
+        let [tl, tr, br, bl] = radii.0.map(Scalar::get);
         let (w, h) = (rect.width.get(), rect.height.get());
         let fit = (w / (tl + tr))
             .min(w / (bl + br))
@@ -423,7 +450,7 @@ impl Path {
         };
         let x = rect.origin.x.get();
         let y = rect.origin.y.get();
-        let k = 0.5522847498307936;
+        let k = BEZIER_CIRCLE_KAPPA;
         // One quarter arc from a point on one edge to a point on the next, bulging toward the
         // rectangle corner where those edges meet.
         // `f64::signum` answers 1.0 for +0.0, so an axis with no distance toward the corner
@@ -473,7 +500,7 @@ impl Path {
         let cy = rect.origin.y.get() + rect.height.get() / 2.0;
         let rx = rect.width.get() / 2.0;
         let ry = rect.height.get() / 2.0;
-        let k = 0.5522847498307936;
+        let k = BEZIER_CIRCLE_KAPPA;
         let p = Point::new;
         Ok(Self {
             segments: vec![
@@ -550,15 +577,18 @@ pub struct PathBuilder {
 
 impl PathBuilder {
     /// Begin a subpath. A path must start with one, and a `close` applies to the most recent.
+    #[must_use]
     pub fn move_to(self, x: f64, y: f64) -> Self {
         self.point(x, y, Segment::Move)
     }
 
+    #[must_use]
     pub fn line_to(self, x: f64, y: f64) -> Self {
         self.point(x, y, Segment::Line)
     }
 
     /// A quadratic curve through one control point.
+    #[must_use]
     pub fn quad_to(mut self, cx: f64, cy: f64, x: f64, y: f64) -> Self {
         match (Point::new(cx, cy), Point::new(x, y)) {
             (Ok(control), Ok(end)) => self.push(Segment::Quad(control, end)),
@@ -570,6 +600,7 @@ impl PathBuilder {
     }
 
     /// A cubic curve through two control points.
+    #[must_use]
     pub fn cubic_to(mut self, ax: f64, ay: f64, bx: f64, by: f64, x: f64, y: f64) -> Self {
         match (Point::new(ax, ay), Point::new(bx, by), Point::new(x, y)) {
             (Ok(first), Ok(second), Ok(end)) => self.push(Segment::Cubic(first, second, end)),
@@ -581,12 +612,14 @@ impl PathBuilder {
     }
 
     /// Close the current subpath, joining its end back to where it began.
+    #[must_use]
     pub fn close(self) -> Self {
         self.push(Segment::Close)
     }
 
     /// Fill by the even-odd rule rather than by winding, which is what puts a hole in a shape
     /// drawn as two nested subpaths.
+    #[must_use]
     pub fn even_odd(mut self) -> Self {
         self.even_odd = true;
         self
@@ -664,8 +697,12 @@ impl Corners {
         Self::new([radius; 4])
     }
     /// The single radius when all four corners agree, as `draw_blurred_rounded_rect` wants.
+    #[expect(
+        clippy::float_cmp,
+        reason = "exact equality: only bit-identical radii are uniform"
+    )]
     pub fn uniform_value(&self) -> Option<f64> {
-        let [tl, tr, br, bl] = self.0.map(|r| r.get());
+        let [tl, tr, br, bl] = self.0.map(Scalar::get);
         (tl == tr && tr == br && br == bl).then_some(tl)
     }
     pub fn validate(&self) -> Result<()> {
@@ -865,7 +902,7 @@ impl StrokeStyle {
                 .iter()
                 .any(|d| *d <= Scalar::ZERO || d.get() > MAX_PAINT_EXTENT)
             || self.dash_offset < Scalar::ZERO
-            || self.dash_offset.get() > MAX_PAINT_EXTENT * MAX_DASH_ENTRIES as f64
+            || self.dash_offset.get() > MAX_DASH_OFFSET
         {
             return Err(InvalidScene("dash pattern is invalid or out of range"));
         }
@@ -1227,21 +1264,14 @@ impl Canvas {
     }
 }
 
-fn integer(n: i64) -> Value {
-    if n >= 0 {
-        Value::Unsigned(n as u64)
-    } else {
-        Value::Negative(n)
-    }
-}
 fn point(p: Point) -> Value {
-    Value::Array(vec![integer(p.x.raw()), integer(p.y.raw())])
+    Value::Array(vec![Value::from(p.x.raw()), Value::from(p.y.raw())])
 }
 fn rect(r: Rect) -> Value {
     Value::Array(vec![
         point(r.origin),
-        integer(r.width.raw()),
-        integer(r.height.raw()),
+        Value::from(r.width.raw()),
+        Value::from(r.height.raw()),
     ])
 }
 fn path(p: &Path) -> Value {
@@ -1302,7 +1332,7 @@ fn brush(b: &Brush) -> Value {
             let mut v = vec![
                 Value::Unsigned(2),
                 point(*center),
-                integer(radius.raw()),
+                Value::from(radius.raw()),
                 stops(s),
             ];
             if *color_space != ColorSpace::Srgb {
@@ -1318,7 +1348,7 @@ fn brush(b: &Brush) -> Value {
             Value::Unsigned(3),
             Value::Unsigned(*asset),
             transform.map_or(Value::Null, |t| {
-                Value::Array(t.0.iter().map(|x| integer(x.raw())).collect())
+                Value::Array(t.0.iter().map(|x| Value::from(x.raw())).collect())
             }),
             Value::Unsigned(match extend {
                 Extend::Pad => 0,
@@ -1342,12 +1372,14 @@ fn command_value(c: &Command) -> Value {
             point(*origin),
         ],
         Command::Fill(p, b) => vec![Value::Unsigned(0), path(p), brush(b)],
-        Command::Stroke(p, b, w) => vec![Value::Unsigned(1), path(p), brush(b), integer(w.raw())],
+        Command::Stroke(p, b, w) => {
+            vec![Value::Unsigned(1), path(p), brush(b), Value::from(w.raw())]
+        }
         Command::Save => vec![Value::Unsigned(2)],
         Command::Restore => vec![Value::Unsigned(3)],
         Command::Transform(t) => vec![
             Value::Unsigned(4),
-            Value::Array(t.0.iter().map(|x| integer(x.raw())).collect()),
+            Value::Array(t.0.iter().map(|x| Value::from(x.raw())).collect()),
         ],
         Command::Clip(p) => vec![Value::Unsigned(5), path(p)],
         Command::Opacity(o) => vec![Value::Unsigned(6), Value::Unsigned(u64::from(*o))],
@@ -1355,12 +1387,12 @@ fn command_value(c: &Command) -> Value {
             Value::Unsigned(7),
             Value::Text(t.text.clone()),
             point(t.origin),
-            integer(t.size.raw()),
+            Value::from(t.size.raw()),
             Value::Text(t.family.clone()),
             Value::Unsigned(u64::from(t.weight)),
             Value::Bool(t.italic),
             Value::Unsigned(u64::from(t.color.0)),
-            t.max_width.map_or(Value::Null, |w| integer(w.raw())),
+            t.max_width.map_or(Value::Null, |w| Value::from(w.raw())),
         ],
         Command::Image {
             asset,
@@ -1398,18 +1430,25 @@ fn command_value(c: &Command) -> Value {
         Command::Shadow(shadow) => vec![
             Value::Unsigned(11),
             rect(shadow.rect),
-            Value::Array(shadow.radii.0.iter().map(|r| integer(r.raw())).collect()),
+            Value::Array(
+                shadow
+                    .radii
+                    .0
+                    .iter()
+                    .map(|r| Value::from(r.raw()))
+                    .collect(),
+            ),
             Value::Unsigned(u64::from(shadow.color.0)),
             point(shadow.offset),
-            integer(shadow.blur.raw()),
-            integer(shadow.spread.raw()),
+            Value::from(shadow.blur.raw()),
+            Value::from(shadow.spread.raw()),
             Value::Bool(shadow.inset),
         ],
         Command::StyledStroke(p, b, style) => vec![
             Value::Unsigned(12),
             path(p),
             brush(b),
-            integer(style.width.raw()),
+            Value::from(style.width.raw()),
             Value::Unsigned(match style.cap {
                 Cap::Butt => 0,
                 Cap::Round => 1,
@@ -1420,13 +1459,13 @@ fn command_value(c: &Command) -> Value {
                 Join::Bevel => 1,
                 Join::Round => 2,
             }),
-            integer(style.miter_limit.raw()),
+            Value::from(style.miter_limit.raw()),
             if style.dashes.is_empty() {
                 Value::Null
             } else {
-                Value::Array(style.dashes.iter().map(|d| integer(d.raw())).collect())
+                Value::Array(style.dashes.iter().map(|d| Value::from(d.raw())).collect())
             },
-            integer(style.dash_offset.raw()),
+            Value::from(style.dash_offset.raw()),
         ],
     })
 }
@@ -1487,6 +1526,10 @@ fn parse_rect(v: &Value) -> Result<Rect> {
         height: scalar(h)?,
     })
 }
+#[expect(
+    clippy::many_single_char_names,
+    reason = "short names mirror the wire tuple order"
+)]
 fn parse_path(v: &Value) -> Result<Path> {
     let [rule, list] = array(v)? else {
         return Err(InvalidScene("invalid path"));
@@ -1523,7 +1566,9 @@ fn hit_role(v: &Value) -> Result<HitRole> {
         0 => HitRole::Input,
         1 => HitRole::Drag,
         2 => HitRole::Transparent,
-        e @ 17..=31 => HitRole::Resize((e - 16) as u8),
+        e @ 17..=31 => HitRole::Resize(
+            u8::try_from(e - 16).map_err(|_| InvalidScene("unknown hit-region role"))?,
+        ),
         _ => return Err(InvalidScene("invalid hit role")),
     })
 }
@@ -1601,6 +1646,10 @@ fn parse_brush(v: &Value) -> Result<Brush> {
         _ => Err(InvalidScene("unknown or malformed brush")),
     }
 }
+#[expect(
+    clippy::many_single_char_names,
+    reason = "short names mirror the wire tuple order"
+)]
 fn parse_command(v: &Value) -> Result<Command> {
     match array(v)? {
         [Value::Unsigned(0), p, b] => Ok(Command::Fill(parse_path(p)?, parse_brush(b)?)),
@@ -1742,7 +1791,7 @@ mod tests {
         let bytes = frame.encode().unwrap();
         assert_eq!(Frame::decode(&bytes).unwrap(), frame);
         for end in 0..bytes.len() {
-            assert!(Frame::decode(&bytes[..end]).is_err());
+            Frame::decode(&bytes[..end]).unwrap_err();
         }
         let asset = ImageAsset {
             id: u64::MAX,
@@ -1753,11 +1802,11 @@ mod tests {
         let bytes = asset.encode().unwrap();
         assert_eq!(ImageAsset::decode(&bytes).unwrap(), asset);
         for end in 0..bytes.len() {
-            assert!(ImageAsset::decode(&bytes[..end]).is_err());
+            ImageAsset::decode(&bytes[..end]).unwrap_err();
         }
         let mut oversized = bytes;
         oversized[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
-        assert!(ImageAsset::decode(&oversized).is_err());
+        ImageAsset::decode(&oversized).unwrap_err();
     }
     #[test]
     fn negotiated_limits_are_complete_and_applied_to_scenes() {
@@ -1772,16 +1821,16 @@ mod tests {
             .unwrap()
             .push(Command::Restore)
             .unwrap();
-        assert!(canvas.validate_with_limits(&limits).is_ok());
+        canvas.validate_with_limits(&limits).unwrap();
         assert!(canvas.validate_with_limits(&reduced).is_err());
-        assert!(Limits::from_value(&Value::Map(vec![])).is_err());
-        assert!(Limits::new([u64::MAX; 12]).is_err());
+        Limits::from_value(&Value::Map(vec![])).unwrap_err();
+        Limits::new([u64::MAX; 12]).unwrap_err();
     }
     #[test]
     fn clips_are_bounded_even_without_save_commands() {
         let mut canvas = Canvas::new();
         let path = Path::rectangle(Rect::new(0., 0., 10., 10.).unwrap()).unwrap();
-        for _ in 0..MAX_STACK_DEPTH + 1 {
+        for _ in 0..=MAX_STACK_DEPTH {
             canvas.push(Command::Clip(path.clone())).unwrap();
         }
         assert!(canvas.validate().is_err());
@@ -1793,7 +1842,7 @@ mod tests {
         c.shadow(Shadow {
             rect,
             radii: Corners::new([4., 8., 12., 16.]).unwrap(),
-            color: Color(0x11223344),
+            color: Color(0x11_22_33_44),
             offset: Point::new(0., 6.).unwrap(),
             blur: Scalar::new(18.).unwrap(),
             spread: Scalar::new(-2.).unwrap(),
@@ -1826,11 +1875,11 @@ mod tests {
                 stops: vec![
                     GradientStop {
                         offset: 0,
-                        color: Color(0xff0000ff),
+                        color: Color(0xff_00_00_ff),
                     },
                     GradientStop {
                         offset: u16::MAX,
-                        color: Color(0x00ff00ff),
+                        color: Color(0x00_ff_00_ff),
                     },
                 ],
                 color_space: ColorSpace::Oklab,
@@ -1850,11 +1899,11 @@ mod tests {
                     stops: vec![
                         GradientStop {
                             offset: 0,
-                            color: Color(0xff0000ff),
+                            color: Color(0xff_00_00_ff),
                         },
                         GradientStop {
                             offset: u16::MAX,
-                            color: Color(0x0000ffff),
+                            color: Color(0x00_00_ff_ff),
                         },
                     ],
                     color_space: ColorSpace::Srgb,
@@ -1916,7 +1965,7 @@ mod tests {
             },
         ] {
             let mut c = Canvas::new();
-            c.stroke_styled(path.clone(), Brush::Solid(Color(0xffffffff)), style)
+            c.stroke_styled(path.clone(), Brush::Solid(Color(0xff_ff_ff_ff)), style)
                 .unwrap();
             cases.push(c);
         }
@@ -1933,7 +1982,7 @@ mod tests {
         cases.push(c);
         for case in &cases {
             assert!(case.validate().is_err(), "{case:?}");
-            assert!(case.encode().is_err());
+            case.encode().unwrap_err();
         }
     }
 
@@ -1941,7 +1990,7 @@ mod tests {
         Shadow {
             rect,
             radii: Corners::uniform(8.).unwrap(),
-            color: Color(0x00000040),
+            color: Color(0x00_00_00_40),
             offset: Point::new(0., 4.).unwrap(),
             blur: Scalar::new(12.).unwrap(),
             spread: Scalar::ZERO,
@@ -1954,12 +2003,12 @@ mod tests {
         // A presenter that did not negotiate overlay-paint-v1 must never see these commands, and
         // one that did must still refuse a value outside the definitions.
         let scene = b"\x81\x82\x0b";
-        assert!(Canvas::decode(scene).is_err());
+        Canvas::decode(scene).unwrap_err();
         let mut c = Canvas::new();
         let rect = Rect::new(0., 0., 10., 10.).unwrap();
         c.fill(
             Path::rectangle(rect).unwrap(),
-            Brush::Solid(Color(0xffffffff)),
+            Brush::Solid(Color(0xff_ff_ff_ff)),
         )
         .unwrap();
         let encoded = c.encode().unwrap();
@@ -1973,11 +2022,11 @@ mod tests {
                 stops: vec![
                     GradientStop {
                         offset: 0,
-                        color: Color(0xff0000ff),
+                        color: Color(0xff_00_00_ff),
                     },
                     GradientStop {
                         offset: u16::MAX,
-                        color: Color(0x0000ffff),
+                        color: Color(0x00_00_ff_ff),
                     },
                 ],
                 color_space: ColorSpace::Oklab,
@@ -1992,7 +2041,7 @@ mod tests {
             .expect("color space tag");
         let mut hostile = bytes.clone();
         hostile[last] = 7;
-        assert!(Canvas::decode(&hostile).is_err());
+        Canvas::decode(&hostile).unwrap_err();
         assert_eq!(Canvas::decode(&bytes).unwrap(), c2);
         assert_eq!(Canvas::decode(&encoded).unwrap(), c);
     }
@@ -2012,7 +2061,7 @@ mod tests {
         let clamped =
             Path::rounded_rectangle_corners(rect, Corners::new([100., 100., 100., 100.]).unwrap())
                 .unwrap();
-        assert!(clamped.validate().is_ok());
+        clamped.validate().unwrap();
         // Every x remains within the rectangle: the outline never self-intersects horizontally.
         for segment in &clamped.segments {
             let points: &[Point] = match segment {
@@ -2040,11 +2089,11 @@ mod tests {
                 stops: vec![
                     GradientStop {
                         offset: 0,
-                        color: Color(0xff0000ff),
+                        color: Color(0xff_00_00_ff),
                     },
                     GradientStop {
                         offset: u16::MAX,
-                        color: Color(0x0000ffff),
+                        color: Color(0x00_00_ff_ff),
                     },
                 ],
                 color_space: ColorSpace::Srgb,
@@ -2062,20 +2111,18 @@ mod tests {
     }
     #[test]
     fn invalid_commands_and_unbalanced_lists_are_rejected() {
-        assert!(Scalar::new(f64::NAN).is_err());
-        assert!(Scalar::new(f64::INFINITY).is_err());
-        assert!(Rect::new(0.0, 0.0, -1.0, 1.0).is_err());
+        Scalar::new(f64::NAN).unwrap_err();
+        Scalar::new(f64::INFINITY).unwrap_err();
+        Rect::new(0.0, 0.0, -1.0, 1.0).unwrap_err();
         let mut c = Canvas::new();
         c.push(Command::Restore).unwrap();
-        assert!(c.encode().is_err());
-        assert!(
-            Canvas::from_value(&Value::Array(vec![Value::Array(vec![Value::Unsigned(99)])]))
-                .is_err()
-        );
+        c.encode().unwrap_err();
+        Canvas::from_value(&Value::Array(vec![Value::Array(vec![Value::Unsigned(99)])]))
+            .unwrap_err();
     }
     #[test]
     fn scene_limits_apply_before_decoding_and_to_aggregate_text() {
-        assert!(Canvas::decode(&vec![0; MAX_SCENE_BYTES + 1]).is_err());
+        Canvas::decode(&vec![0; MAX_SCENE_BYTES + 1]).unwrap_err();
         let mut c = Canvas::new();
         c.push(Command::Text(Text {
             text: "x".repeat(MAX_TEXT_BYTES + 1),
@@ -2088,7 +2135,7 @@ mod tests {
             max_width: None,
         }))
         .unwrap();
-        assert!(c.encode().is_err());
+        c.encode().unwrap_err();
     }
     #[test]
     fn a_built_path_carries_every_segment_kind_over_the_wire() {
@@ -2106,7 +2153,7 @@ mod tests {
         // Through the wire and back unchanged: a builder is only ergonomics over the same shape.
         let mut canvas = Canvas::new();
         canvas
-            .fill(path.clone(), Brush::Solid(Color(0xff00ffff)))
+            .fill(path.clone(), Brush::Solid(Color(0xff_00_ff_ff)))
             .unwrap();
         let frame = Frame {
             epoch: 1,
@@ -2116,7 +2163,7 @@ mod tests {
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(
             decoded.canvas.commands(),
-            &[Command::Fill(path, Brush::Solid(Color(0xff00ffff)))]
+            &[Command::Fill(path, Brush::Solid(Color(0xff_00_ff_ff)))]
         );
     }
 
@@ -2156,26 +2203,24 @@ mod tests {
         assert!(error.0.contains("coordinate"), "{error}");
 
         // And a later good call does not clear an earlier failure.
-        assert!(
-            Path::builder()
-                .move_to(2e6, 0.)
-                .move_to(0., 0.)
-                .line_to(1., 1.)
-                .build()
-                .is_err()
-        );
+        Path::builder()
+            .move_to(2e6, 0.)
+            .move_to(0., 0.)
+            .line_to(1., 1.)
+            .build()
+            .unwrap_err();
     }
 
     #[test]
     fn a_builder_refuses_a_path_the_wire_would_refuse() {
         // Nothing at all.
-        assert!(Path::builder().build().is_err());
+        Path::builder().build().unwrap_err();
 
         // A segment before any subpath was opened.
-        assert!(Path::builder().line_to(1., 1.).build().is_err());
+        Path::builder().line_to(1., 1.).build().unwrap_err();
 
         // A close with nothing to close.
-        assert!(Path::builder().close().build().is_err());
+        Path::builder().close().build().unwrap_err();
 
         // And the segment ceiling stops the vector growing rather than only failing at the end.
         let mut builder = Path::builder().move_to(0., 0.);
@@ -2183,7 +2228,7 @@ mod tests {
             builder = builder.line_to(1., 1.);
         }
         assert_eq!(builder.len(), MAX_PATH_SEGMENTS);
-        assert!(builder.build().is_err());
+        builder.build().unwrap_err();
     }
 
     #[test]
@@ -2213,7 +2258,7 @@ mod tests {
             .validate()
             .expect("a stroke of a given width validates");
         assert_eq!(StrokeStyle::default().miter_limit, DEFAULT_MITER_LIMIT);
-        assert_eq!(DEFAULT_MITER_LIMIT.get(), 4.);
+        assert_eq!(DEFAULT_MITER_LIMIT, Scalar::new(4.).unwrap());
 
         // A styled stroke built the easy way reaches the wire intact.
         let mut canvas = Canvas::new();
@@ -2224,7 +2269,7 @@ mod tests {
         canvas
             .stroke_styled(
                 Path::rectangle(Rect::new(0., 0., 10., 10.).unwrap()).unwrap(),
-                Brush::Solid(Color(0xffffffff)),
+                Brush::Solid(Color(0xff_ff_ff_ff)),
                 style.clone(),
             )
             .unwrap();

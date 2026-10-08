@@ -260,13 +260,13 @@ mod tests {
             channel_generation: crate::revision::ChannelGeneration::new(4),
         };
         let mut fields = crate::track::need_keyframe_payload(address, 5, PRESENTATION_RESUMED);
-        assert!(NeedKeyframe::decode(&Value::Map(fields.clone())).is_err());
+        NeedKeyframe::decode(&Value::Map(fields.clone())).unwrap_err();
         fields.extend([(7, signed(123)), (8, Value::Unsigned(9))]);
         let request = NeedKeyframe::decode(&Value::Map(fields.clone())).unwrap();
         assert_eq!(request.presentation_pts_us, Some(123));
         assert_eq!(request.hold_serial, Some(9));
         fields.iter_mut().find(|(key, _)| *key == 5).unwrap().1 = Value::Unsigned(2);
-        assert!(NeedKeyframe::decode(&Value::Map(fields)).is_err());
+        NeedKeyframe::decode(&Value::Map(fields)).unwrap_err();
         let mut play = PlayOptions {
             start_pts_us: 123,
             minimum_buffer_us: 1,
@@ -282,9 +282,9 @@ mod tests {
             .find(|(key, _)| *key == 6)
             .unwrap()
             .1 = Value::Unsigned(2 << 32);
-        assert!(PlayOptions::decode(&Value::Map(invalid_fields)).is_err());
+        PlayOptions::decode(&Value::Map(invalid_fields)).unwrap_err();
         play.start_policy = StartPolicy::AfterMinimumBuffer;
-        assert!(play.payload(address).is_err());
+        play.payload(address).unwrap_err();
     }
 
     #[test]
@@ -314,7 +314,7 @@ mod tests {
             assert_eq!(PlaybackHold::decode(&Value::Map(payload)).unwrap(), hold);
         }
         hold.serial = 0;
-        assert!(hold.payload().is_err());
+        hold.payload().unwrap_err();
     }
 
     #[test]
@@ -331,7 +331,7 @@ mod tests {
         };
         let mut fields = hold.payload().unwrap();
         fields.push((8, Value::Bool(true)));
-        assert!(PlaybackHold::decode(&Value::Map(fields)).is_err());
+        PlaybackHold::decode(&Value::Map(fields)).unwrap_err();
         let mut bad = hold;
         bad.position = Some(HeldPosition {
             track_id: 0,
@@ -340,6 +340,6 @@ mod tests {
             pts_us: 0,
             estimated: false,
         });
-        assert!(bad.payload().is_err());
+        bad.payload().unwrap_err();
     }
 }

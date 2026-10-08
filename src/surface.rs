@@ -173,13 +173,12 @@ impl SurfaceDefinition {
             return Err(invalid_value("surface", 10, "has unknown policy bits"));
         }
         match (self.semantic_profile.as_str(), self.coordinate_model) {
-            (GENERIC_CONTENT, CoordinateModel::DesktopLogicalPixels)
-            | (GENERIC_CONTENT, CoordinateModel::Normalized)
-            | (GENERIC_CONTENT, CoordinateModel::CanvasLogicalUnits)
-            | (TERMINAL_CONTENT, CoordinateModel::TerminalContentCells)
-            | (DESKTOP_CONTENT, CoordinateModel::DesktopLogicalPixels)
-            | (CANVAS_CONTENT, CoordinateModel::CanvasLogicalUnits)
-            | (CANVAS_CONTENT, CoordinateModel::Normalized) => {}
+            (GENERIC_CONTENT | DESKTOP_CONTENT, CoordinateModel::DesktopLogicalPixels)
+            | (
+                GENERIC_CONTENT | CANVAS_CONTENT,
+                CoordinateModel::Normalized | CoordinateModel::CanvasLogicalUnits,
+            )
+            | (TERMINAL_CONTENT, CoordinateModel::TerminalContentCells) => {}
             _ => {
                 return Err(invalid_value(
                     "surface",
@@ -360,8 +359,8 @@ pub struct DesktopSurfaceParameters {
 impl DesktopSurfaceParameters {
     pub fn encode(&self) -> PayloadMap {
         vec![
-            (0, signed(i64::from(self.captured_origin_x))),
-            (1, signed(i64::from(self.captured_origin_y))),
+            (0, Value::from(i64::from(self.captured_origin_x))),
+            (1, Value::from(i64::from(self.captured_origin_y))),
             (
                 2,
                 Value::Array(self.topology.iter().map(OutputDescriptor::encode).collect()),
@@ -448,14 +447,6 @@ impl DesktopSurfaceParameters {
     }
 }
 
-fn signed(value: i64) -> Value {
-    if value >= 0 {
-        Value::Unsigned(value as u64)
-    } else {
-        Value::Negative(value)
-    }
-}
-
 fn required_i32(map: &StrictMap<'_>, key: u64) -> Result<i32, MessageError> {
     map.required(key)?
         .as_i64()
@@ -532,7 +523,7 @@ mod desktop_parameter_tests {
             topology: Vec::new(),
             ..parameters()
         };
-        assert!(headless.validate().is_ok());
+        headless.validate().unwrap();
     }
 
     #[test]
@@ -546,7 +537,7 @@ mod desktop_parameter_tests {
     fn unknown_keys_are_rejected() {
         let mut map = parameters().encode();
         map.push((5, Value::Unsigned(0)));
-        assert!(DesktopSurfaceParameters::decode(&map).is_err());
+        DesktopSurfaceParameters::decode(&map).unwrap_err();
     }
 }
 

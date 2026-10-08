@@ -46,6 +46,10 @@ pub const DEFAULT_WATCHDOG_US: u64 = 2_000_000;
 
 /// Everything the presenter knows about whether it *may* grant input right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent presenter conditions, each reported as-is"
+)]
 pub struct Eligibility {
     /// The presentation target has keyboard focus.
     pub focused: bool,
@@ -528,15 +532,13 @@ mod tests {
                 Monotonic::from_micros(1_000_000),
             )
             .unwrap();
-        assert!(
-            grant
-                .apply(
-                    &binding(2, INPUT_CLASS_KEYBOARD),
-                    &eligible(),
-                    Monotonic::from_micros(1_000_000)
-                )
-                .is_err()
-        );
+        grant
+            .apply(
+                &binding(2, INPUT_CLASS_KEYBOARD),
+                &eligible(),
+                Monotonic::from_micros(1_000_000),
+            )
+            .unwrap_err();
     }
 
     #[test]
@@ -645,19 +647,15 @@ mod tests {
         let mut grant = InputGrant::new();
         let mut fast = binding(1, INPUT_CLASS_KEYBOARD);
         fast.requested_watchdog_us = 1;
-        assert!(
-            grant
-                .apply(&fast, &eligible(), Monotonic::from_micros(1_000_000))
-                .is_err()
-        );
+        grant
+            .apply(&fast, &eligible(), Monotonic::from_micros(1_000_000))
+            .unwrap_err();
 
         let mut slow = binding(1, INPUT_CLASS_KEYBOARD);
         slow.requested_watchdog_us = u64::MAX;
-        assert!(
-            grant
-                .apply(&slow, &eligible(), Monotonic::from_micros(1_000_000))
-                .is_err()
-        );
+        grant
+            .apply(&slow, &eligible(), Monotonic::from_micros(1_000_000))
+            .unwrap_err();
     }
 
     #[test]

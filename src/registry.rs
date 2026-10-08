@@ -327,6 +327,10 @@ impl fmt::Display for ProfileError {
 
 impl std::error::Error for ProfileError {}
 
+#[expect(
+    clippy::match_same_arms,
+    reason = "one arm per profile mirrors the registry prerequisite table"
+)]
 pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
     match profile {
         CORE_CONTROL => Some(&[]),

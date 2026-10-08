@@ -631,7 +631,7 @@ impl InputEvent {
                 // Four elements is plain motion or a release; six adds the click count and
                 // pressure. Five is deliberately not a valid arity.
                 let a: &[Value] = match payload.as_array() {
-                    Some(a @ [_, _, _, _]) | Some(a @ [_, _, _, _, _, _]) => a,
+                    Some(a @ ([_, _, _, _] | [_, _, _, _, _, _])) => a,
                     _ => return Err(bad(5, "pointer payload has an unexpected arity")),
                 };
                 let button = if a[2] == Value::Null {
@@ -777,12 +777,7 @@ impl SetSemantics {
         self.semantics
             .validate()
             .map_err(|_| bad(4, "invalid semantic tree"))?;
-        let nodes = self
-            .semantics
-            .nodes
-            .iter()
-            .map(node_value)
-            .collect::<Result<Vec<_>, MessageError>>()?;
+        let nodes = self.semantics.nodes.iter().map(node_value).collect();
         let mut fields = self.address.payload();
         fields.push((3, u(self.semantics.scene_revision)));
         fields.push((4, Value::Array(nodes)));
@@ -810,7 +805,7 @@ impl SetSemantics {
     }
 }
 
-fn node_value(node: &SemanticNode) -> Result<Value, MessageError> {
+fn node_value(node: &SemanticNode) -> Value {
     let mut fields = vec![
         (0, u(node.id)),
         (1, u(node.role.index())),
@@ -859,7 +854,7 @@ fn node_value(node: &SemanticNode) -> Result<Value, MessageError> {
             Value::Array(node.children.iter().map(|c| u(u64::from(*c))).collect()),
         ));
     }
-    Ok(Value::Map(fields))
+    Value::Map(fields)
 }
 
 fn parse_node(value: &Value) -> Result<SemanticNode, MessageError> {
@@ -1206,12 +1201,7 @@ fn array<const N: usize>(value: &Value, key: u64) -> Result<&[Value; N], Message
         .ok_or(bad(key, "invalid array length or type"))
 }
 fn scalar(value: Scalar) -> Value {
-    let raw = value.raw();
-    if raw < 0 {
-        Value::Negative(raw)
-    } else {
-        u(raw as u64)
-    }
+    Value::from(value.raw())
 }
 fn decode_scalar(value: &Value, key: u64) -> Result<Scalar, MessageError> {
     Scalar::from_raw(
@@ -1300,10 +1290,10 @@ mod tests {
         assert_eq!(SetWindow::decode(owner(1), 2, &value).unwrap(), set);
         let other = SetWindow::decode(owner(2), 2, &value).unwrap();
         assert_eq!(other.options.parent.unwrap().context.session, owner(2));
-        assert!(set.payload(owner(2)).is_err());
-        assert!(SetWindow::decode(owner(1), 3, &value).is_err());
+        set.payload(owner(2)).unwrap_err();
+        SetWindow::decode(owner(1), 3, &value).unwrap_err();
         set.options.parent = Some(address().identity(owner(1)).unwrap());
-        assert!(set.payload(owner(1)).is_err());
+        set.payload(owner(1)).unwrap_err();
     }
 
     #[test]
@@ -1311,14 +1301,14 @@ mod tests {
         let original = request().payload(owner(1)).unwrap();
         let mut duplicate = original.clone();
         duplicate.insert(1, duplicate[0].clone());
-        assert!(SetWindow::decode(owner(1), 2, &Value::Map(duplicate)).is_err());
+        SetWindow::decode(owner(1), 2, &Value::Map(duplicate)).unwrap_err();
         let mut unknown = original.clone();
         unknown.push((90, Value::Null));
-        assert!(SetWindow::decode(owner(1), 2, &Value::Map(unknown)).is_err());
+        SetWindow::decode(owner(1), 2, &Value::Map(unknown)).unwrap_err();
         let mut bad_size = original;
         bad_size.iter_mut().find(|(k, _)| *k == 4).unwrap().1 =
             Value::Array(vec![u(0), u(0), u(0), u(1)]);
-        assert!(SetWindow::decode(owner(1), 2, &Value::Map(bad_size)).is_err());
+        SetWindow::decode(owner(1), 2, &Value::Map(bad_size)).unwrap_err();
     }
 
     #[test]
@@ -1360,10 +1350,10 @@ mod tests {
             };
             let value = encoded(record.payload().unwrap());
             assert_eq!(SubmissionOutcome::decode(2, &value).unwrap(), record);
-            assert!(SubmissionOutcome::decode(3, &value).is_err());
+            SubmissionOutcome::decode(3, &value).unwrap_err();
             let mut malformed = record.payload().unwrap();
             malformed.iter_mut().find(|(k, _)| *k == 7).unwrap().1 = u(2);
-            assert!(SubmissionOutcome::decode(2, &Value::Map(malformed)).is_err());
+            SubmissionOutcome::decode(2, &Value::Map(malformed)).unwrap_err();
         }
         let update = ViewportChanged {
             revision: u64::MAX,
@@ -1373,22 +1363,20 @@ mod tests {
             ViewportChanged::decode(0, &encoded(update.payload().unwrap())).unwrap(),
             update
         );
-        assert!(ViewportChanged::decode(2, &encoded(update.payload().unwrap())).is_err());
-        assert!(
-            ViewportChanged {
-                revision: 0,
-                ..update
-            }
-            .payload()
-            .is_err()
-        );
+        ViewportChanged::decode(2, &encoded(update.payload().unwrap())).unwrap_err();
+        ViewportChanged {
+            revision: 0,
+            ..update
+        }
+        .payload()
+        .unwrap_err();
         let release = crate::vector::AssetRelease { id: u64::MAX };
         assert_eq!(
             crate::vector::AssetRelease::decode(&release.encode().unwrap()).unwrap(),
             release
         );
-        assert!(crate::vector::AssetRelease::decode(&[0; 8]).is_err());
-        assert!(crate::vector::AssetRelease::decode(&[1; 9]).is_err());
+        crate::vector::AssetRelease::decode(&[0; 8]).unwrap_err();
+        crate::vector::AssetRelease::decode(&[1; 9]).unwrap_err();
         for action in [
             WindowAction::Close,
             WindowAction::Focus,
@@ -1423,22 +1411,20 @@ mod tests {
             Renew::decode(0, &encoded(renew.payload().unwrap())).unwrap(),
             renew
         );
-        assert!(
-            Renew {
-                watchdog_us: u64::MAX,
-                ..renew
-            }
-            .payload()
-            .is_err()
-        );
-        assert!(Renew::decode(2, &encoded(renew.payload().unwrap())).is_err());
+        Renew {
+            watchdog_us: u64::MAX,
+            ..renew
+        }
+        .payload()
+        .unwrap_err();
+        Renew::decode(2, &encoded(renew.payload().unwrap())).unwrap_err();
     }
 
     #[test]
     fn a_default_environment_is_one_a_host_could_already_publish() {
         // A host starts with defaults and learns its own font later; a default that failed
         // validation would revoke the lane before that happened.
-        assert!(Environment::default().validate().is_ok());
+        Environment::default().validate().unwrap();
     }
 
     #[test]
@@ -1522,7 +1508,7 @@ mod tests {
         // The struct encoding is not a place to smuggle a zero identity.
         let mut zero = minimal;
         zero.semantics.nodes[0].id = 0;
-        assert!(zero.payload().is_err());
+        zero.payload().unwrap_err();
     }
 
     #[test]
@@ -1558,7 +1544,7 @@ mod tests {
                 action: crate::overlay::AccessibleAction::Click,
             },
         };
-        assert!(zero.payload().is_err());
+        zero.payload().unwrap_err();
     }
 
     #[test]
@@ -1620,10 +1606,10 @@ mod tests {
                 ..sample_environment()
             },
         ] {
-            assert!(base(environment).payload().is_err());
+            base(environment).payload().unwrap_err();
         }
         // A first-rate interval for a 60 Hz display is fine.
-        assert!(base(sample_environment()).payload().is_ok());
+        base(sample_environment()).payload().unwrap();
     }
 
     fn sample_environment() -> Environment {
@@ -1670,7 +1656,7 @@ mod tests {
                 address: address(),
                 text,
             };
-            assert!(request.payload().is_err());
+            request.payload().unwrap_err();
         }
     }
 
@@ -1862,7 +1848,7 @@ mod tests {
                 ]),
             ),
         ]);
-        assert!(InputEvent::decode(2, &hostile).is_err());
+        InputEvent::decode(2, &hostile).unwrap_err();
     }
 
     #[test]
@@ -1877,16 +1863,14 @@ mod tests {
                 (5, payload),
             ])
         };
-        assert!(
-            InputEvent::decode(
-                2,
-                &prefix(
-                    4,
-                    Value::Text("x".repeat(super::super::MAX_EVENT_TEXT_BYTES + 1))
-                )
-            )
-            .is_err()
-        );
+        InputEvent::decode(
+            2,
+            &prefix(
+                4,
+                Value::Text("x".repeat(super::super::MAX_EVENT_TEXT_BYTES + 1)),
+            ),
+        )
+        .unwrap_err();
         for (start, end) in [(1, 2), (0, 1), (2, 0), (0, u64::MAX)] {
             let value = prefix(
                 5,
@@ -1895,24 +1879,22 @@ mod tests {
                     Value::Array(vec![u(start), u(end)]),
                 ]),
             );
-            assert!(InputEvent::decode(2, &value).is_err());
+            InputEvent::decode(2, &value).unwrap_err();
         }
-        assert!(
-            InputEvent::decode(
-                2,
-                &prefix(
-                    3,
-                    Value::Array(vec![
-                        u(u64::MAX),
-                        Value::Bool(true),
-                        Value::Bool(false),
-                        u(0)
-                    ])
-                )
-            )
-            .is_err()
-        );
-        assert!(InputEvent::decode(2, &prefix(8, Value::Bool(false))).is_err());
-        assert!(InputEvent::decode(2, &prefix(90, Value::Null)).is_err());
+        InputEvent::decode(
+            2,
+            &prefix(
+                3,
+                Value::Array(vec![
+                    u(u64::MAX),
+                    Value::Bool(true),
+                    Value::Bool(false),
+                    u(0),
+                ]),
+            ),
+        )
+        .unwrap_err();
+        InputEvent::decode(2, &prefix(8, Value::Bool(false))).unwrap_err();
+        InputEvent::decode(2, &prefix(90, Value::Null)).unwrap_err();
     }
 }

@@ -16,8 +16,34 @@ use crate::{
     resource::ResourceContract,
 };
 
-pub use crate::identity::{NodeIdentity, SurfaceIdentity, TrackIdentity};
-pub use crate::registry::record::*;
+// Record types are re-exported by name so that each assignment reaches this module
+// deliberately; add new registry::record constants here as well.
+pub use crate::registry::record::{
+    ABORT_TXN, ACCEPT_FILE_DROP, ACTIVATE_TRACK, ADVANCE_CHANNEL, ADVANCE_FILE_TRANSFER,
+    ANCHOR_GONE, ANCHOR_READY, ANCHOR_STATUS, AUDIO_PACKET, BEGIN_TXN, BLOB_CHUNK, BUFFER_SUBMIT,
+    CANCEL_FILE_DROP, CANCEL_WAIT, CAPS_CHANGED, CHANNEL_ACCEPTED, CHANNEL_ADVANCED, CHANNEL_EOS,
+    CHANNEL_OPEN, COMMIT_TXN, CONTEXT_CHANGED, CONTEXT_READY, CREATE_CONTEXT, CREATE_NODE,
+    CREATE_SESSION_LEASE, CREATE_SURFACE, CREATE_TRACK, DELETE_NODE, DESTROY_SURFACE,
+    DESTROY_TRACK, DRAIN, ERROR, FILE_DATA, FILE_DROP_ACCEPTED, FILE_DROP_BOUND,
+    FILE_DROP_CANCELLED, FILE_DROP_OFFER, FILE_DROP_STATUS, FILE_FINISH, FILE_RESULT,
+    FILE_TRANSFER_ABORT, FILE_TRANSFER_ACCEPTED, FILE_TRANSFER_ADVANCED, FILE_TRANSFER_OPEN, FLUSH,
+    GOODBYE, HELLO, IMAGE_DATA, INPUT_BOUND, INPUT_LEASE_RENEW, INPUT_RESET, INPUT_REVOKED,
+    KEY_INPUT, LANE_ACCEPTED, LANE_OPEN, MAX_CHANNEL_DATA, MAX_FILE_DATA, MEASURE_OVERLAY_TEXT,
+    MEASURE_OVERLAY_TEXT_BATCH, NEED_FULL_FRAME, NEED_KEYFRAME, OBSERVATION_GAP, OK,
+    OVERLAY_ACTION, OVERLAY_ENV_CHANGED, OVERLAY_INPUT_CAPTURE, OVERLAY_INPUT_EVENT,
+    OVERLAY_INPUT_RENEW, OVERLAY_STATUS, OVERLAY_SUBMISSION_OUTCOME, OVERLAY_TEXT_BATCH_MEASURED,
+    OVERLAY_TEXT_MEASURED, OVERLAY_VIEWPORT_CHANGED, OVERLAY_WINDOW_READY, PAUSE, PING, PLAY,
+    PLAYBACK_HOLD, PLAYBACK_STATE, POINTER_AXIS, POINTER_BUTTON, POINTER_MOTION, PONG,
+    PROBE_TRACK_CONFIG, QUERY_ANCHOR, QUERY_FILE_DROP, QUERY_OVERLAY, QUERY_SCENE, QUERY_SESSION,
+    QUERY_SURFACE, QUERY_TRACK, RASTER_FRAME, RELEASE_OVERLAY_TEXT_LAYOUTS, REVOKE_CONTEXT,
+    REVOKE_SESSION_LEASE, SCENE_CHANGED, SCENE_PRESENTED, SCENE_STATUS, SESSION_LEASE_CHANGED,
+    SESSION_LEASE_READY, SESSION_STATUS, SET_AUDIO_GAIN, SET_FILE_DROP_BINDING, SET_INPUT_BINDING,
+    SET_OBSERVATION, SET_OVERLAY_CLIPBOARD, SET_OVERLAY_EDITOR, SET_OVERLAY_SEMANTICS,
+    SET_OVERLAY_WINDOW, SURFACE_CHANGED, SURFACE_READY, SURFACE_STATUS, TARGET_CHANGED,
+    TRACK_ACTIVATED, TRACK_CHANGED, TRACK_LOST, TRACK_READY, TRACK_STATUS, TRACK_SUPPORT,
+    UPDATE_NODE, UPDATE_SURFACE, VECTOR_ASSET, VECTOR_ASSET_RELEASE, VECTOR_FRAME, VIDEO_FRAGMENT,
+    VIDEO_PACKET, WAIT_SATISFIED, WAIT_TRACK, WELCOME,
+};
 
 pub const IDEMPOTENCY_KEY_BYTES: usize = 16;
 pub const CAUSATION_ID_BYTES: usize = 16;
@@ -299,7 +325,7 @@ impl fmt::Debug for HelloAuthentication {
                 .field("attempt_id", attempt_id)
                 .field(
                     "proof_of_possession",
-                    &proof_of_possession.as_ref().map(|value| value.len()),
+                    &proof_of_possession.as_ref().map(std::vec::Vec::len),
                 )
                 .finish(),
             Self::Resume {
@@ -325,7 +351,7 @@ impl fmt::Debug for HelloAuthentication {
 impl Drop for HelloAuthentication {
     fn drop(&mut self) {
         match self {
-            Self::Root { proof } => proof.zeroize(),
+            Self::Root { proof } | Self::Resume { proof, .. } => proof.zeroize(),
             Self::LeaseActivation {
                 proof_of_possession,
                 ..
@@ -334,7 +360,6 @@ impl Drop for HelloAuthentication {
                     proof.zeroize();
                 }
             }
-            Self::Resume { proof, .. } => proof.zeroize(),
         }
     }
 }
@@ -1207,13 +1232,13 @@ impl ChannelOpen {
 }
 
 pub fn validate_header_object(header_object_id: u64, payload_id: u64) -> Result<(), MessageError> {
-    if header_object_id != payload_id {
+    if header_object_id == payload_id {
+        Ok(())
+    } else {
         Err(MessageError::HeaderObjectMismatch {
             header: header_object_id,
             payload: payload_id,
         })
-    } else {
-        Ok(())
     }
 }
 
@@ -1528,11 +1553,11 @@ impl ValueMapExt for Value {
 mod tests {
     use super::*;
     use crate::{
-        CONTROL_MAX_RECORD_BODY, auth,
+        CONTROL_MAX_RECORD_BODY,
         registry::{DESKTOP_SURFACE, LIVE_MEDIA},
-        resource::ResourceContract,
         wire::{ConnectionKind, encode_preface},
     };
+    use std::fmt::Write as _;
 
     fn root_hello() -> Hello {
         Hello {
@@ -1688,7 +1713,7 @@ mod tests {
             (parsed.context_id, parsed.surface_id, parsed.track_id),
             (2, 3, 4)
         );
-        assert!(ChannelOpen::decode(5, &channel_body).is_err());
+        ChannelOpen::decode(5, &channel_body).unwrap_err();
     }
 
     #[test]
@@ -1725,6 +1750,9 @@ mod tests {
     }
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        bytes.iter().fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
     }
 }

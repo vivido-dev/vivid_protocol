@@ -54,6 +54,10 @@ impl AudioGain {
         Some(Self((u64::from(percent) << 32) / 100))
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a presentation ratio; f32 precision is the intent"
+    )]
     pub fn as_f32(self) -> f32 {
         self.0 as f32 / (1_u64 << 32) as f32
     }
@@ -261,8 +265,8 @@ impl VideoConfiguration {
             (2, Value::Bytes(self.extradata.clone())),
             (3, Value::Unsigned(u64::from(self.coded_width))),
             (4, Value::Unsigned(u64::from(self.coded_height))),
-            (5, Value::from_i64(i64::from(self.profile))),
-            (6, Value::from_i64(i64::from(self.level))),
+            (5, Value::from(i64::from(self.profile))),
+            (6, Value::from(i64::from(self.level))),
             (7, Value::Unsigned(0)),
             (8, Value::Unsigned(u64::from(self.maximum_reorder_depth))),
             (9, Value::Text("source-timebase-us".into())),
@@ -1043,10 +1047,10 @@ impl Default for TrackState {
 }
 
 fn dimension(schema: &'static str, key: u64, value: u32) -> Result<(), MessageError> {
-    if !(1..=8192).contains(&value) {
-        Err(invalid_value(schema, key, "is outside 1..=8192"))
-    } else {
+    if (1..=8192).contains(&value) {
         Ok(())
+    } else {
+        Err(invalid_value(schema, key, "is outside 1..=8192"))
     }
 }
 
@@ -1057,20 +1061,6 @@ fn required_i32(map: &StrictMap<'_>, key: u64) -> Result<i32, MessageError> {
         .ok_or_else(|| invalid_value("track configuration", key, "is not an integer"))?;
     i32::try_from(value)
         .map_err(|_| invalid_value("track configuration", key, "does not fit in i32"))
-}
-
-trait SignedValue {
-    fn from_i64(value: i64) -> Self;
-}
-
-impl SignedValue for Value {
-    fn from_i64(value: i64) -> Self {
-        if value >= 0 {
-            Self::Unsigned(value as u64)
-        } else {
-            Self::Negative(value)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1262,7 +1252,7 @@ mod tests {
     #[test]
     fn strict_raster_track_configuration_round_trips() {
         let configuration = TrackConfiguration {
-            direction: Default::default(),
+            direction: TrackDirection::default(),
             context_id: 1,
             surface_id: 2,
             track_id: 3,
@@ -1299,7 +1289,7 @@ mod tests {
         opus_head.extend_from_slice(&[1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]);
         let maximum_record_body = media::audio_body_len(4_096).unwrap();
         let configuration = TrackConfiguration {
-            direction: Default::default(),
+            direction: TrackDirection::default(),
             context_id: 1,
             surface_id: 2,
             track_id: 3,

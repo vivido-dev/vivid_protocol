@@ -1,6 +1,6 @@
-//! Bounded recovery of the printable anchor envelope from ConPTY's VT output.
+//! Bounded recovery of the printable anchor envelope from `ConPTY`'s VT output.
 //!
-//! At the bottom of the screen ConPTY splits a soft-wrapped write with CR LF and sometimes
+//! At the bottom of the screen `ConPTY` splits a soft-wrapped write with CR LF and sometimes
 //! CUP and a repaint of the last glyph. These bytes describe the marker's own glyphs,
 //! not application terminal movement.
 //! Remove only those known transport insertions, then apply the ordinary marker grammar.
@@ -25,7 +25,7 @@ pub enum Scan {
     Invalid,
 }
 
-/// Inspect a candidate starting at `V`, including a prefix or suffix split by a ConPTY wrap.
+/// Inspect a candidate starting at `V`, including a prefix or suffix split by a `ConPTY` wrap.
 /// Invalid input must be preserved byte-for-byte by the caller; never normalize arbitrary VT.
 pub fn scan(bytes: &[u8]) -> Scan {
     let input = &bytes[..bytes.len().min(MAX_TRANSPORT_BYTES)];
@@ -110,8 +110,8 @@ enum Cursor {
     Invalid,
 }
 
-/// Only the absolute row/column CUP emitted after ConPTY's wrap is transport syntax.
-/// Bound decimal parameters to the positive signed-16-bit ConPTY geometry range.
+/// Only the absolute row/column CUP emitted after `ConPTY`'s wrap is transport syntax.
+/// Bound decimal parameters to the positive signed-16-bit `ConPTY` geometry range.
 fn wrap_cursor(bytes: &[u8]) -> Cursor {
     if bytes.len() < 2 {
         return Cursor::Incomplete;

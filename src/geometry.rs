@@ -132,10 +132,10 @@ impl NodeGeometry {
     pub fn encode(&self) -> PayloadMap {
         vec![
             (0, Value::Unsigned(self.space as u64)),
-            (1, signed(self.rect.x)),
-            (2, signed(self.rect.y)),
-            (3, signed(self.rect.width)),
-            (4, signed(self.rect.height)),
+            (1, Value::from(self.rect.x)),
+            (2, Value::from(self.rect.y)),
+            (3, Value::from(self.rect.width)),
+            (4, Value::from(self.rect.height)),
         ]
     }
 
@@ -201,10 +201,10 @@ pub fn decode_clip(map: &PayloadMap) -> Result<FixedRect, MessageError> {
 
 pub fn encode_clip(rect: FixedRect) -> PayloadMap {
     vec![
-        (0, signed(rect.x)),
-        (1, signed(rect.y)),
-        (2, signed(rect.width)),
-        (3, signed(rect.height)),
+        (0, Value::from(rect.x)),
+        (1, Value::from(rect.y)),
+        (2, Value::from(rect.width)),
+        (3, Value::from(rect.height)),
     ]
 }
 
@@ -484,14 +484,6 @@ fn required_i64(map: &StrictMap<'_>, key: u64, schema: &'static str) -> Result<i
         .ok_or_else(|| invalid_value(schema, key, "must be an integer"))
 }
 
-fn signed(value: i64) -> Value {
-    if value >= 0 {
-        Value::Unsigned(value as u64)
-    } else {
-        Value::Negative(value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,16 +539,16 @@ mod tests {
     fn normalized_geometry_outside_the_unit_square_is_rejected() {
         let mut node = NodeGeometry::full_target();
         node.rect.x = 1;
-        assert!(NodeGeometry::decode(&node.encode()).is_err());
+        NodeGeometry::decode(&node.encode()).unwrap_err();
     }
 
     #[test]
     fn non_positive_extents_are_rejected() {
         let mut node = logical(0, 0, 4, 4);
         node.rect.width = 0;
-        assert!(NodeGeometry::decode(&node.encode()).is_err());
+        NodeGeometry::decode(&node.encode()).unwrap_err();
         node.rect.width = -FIXED_ONE;
-        assert!(NodeGeometry::decode(&node.encode()).is_err());
+        NodeGeometry::decode(&node.encode()).unwrap_err();
     }
 
     #[test]
@@ -565,7 +557,7 @@ mod tests {
             space: CoordinateSpace::TargetLogical,
             rect: FixedRect::new(i64::MAX - 1, 0, 8, 8),
         };
-        assert!(NodeGeometry::decode(&node.encode()).is_err());
+        NodeGeometry::decode(&node.encode()).unwrap_err();
     }
 
     #[test]
@@ -575,18 +567,19 @@ mod tests {
             rect: FixedRect::unit(),
         };
         // A target this wide cannot exist, but the transform must refuse rather than wrap.
-        assert!(node.project(TargetExtent::new(u32::MAX, u32::MAX)).is_err());
+        node.project(TargetExtent::new(u32::MAX, u32::MAX))
+            .unwrap_err();
     }
 
     #[test]
     fn unknown_coordinate_space_and_extra_keys_are_rejected() {
         let mut map = NodeGeometry::full_target().encode();
         map[0].1 = Value::Unsigned(9);
-        assert!(NodeGeometry::decode(&map).is_err());
+        NodeGeometry::decode(&map).unwrap_err();
 
         let mut extra = NodeGeometry::full_target().encode();
         extra.push((5, Value::Unsigned(0)));
-        assert!(NodeGeometry::decode(&extra).is_err());
+        NodeGeometry::decode(&extra).unwrap_err();
     }
 
     #[test]
@@ -684,7 +677,7 @@ mod tests {
     #[test]
     fn a_point_on_the_far_edge_is_outside_the_surface() {
         let mapping = mapping(Rotation::None);
-        assert!(mapping.validate_point(1919 << 32, 1079 << 32).is_ok());
+        mapping.validate_point(1919 << 32, 1079 << 32).unwrap();
         // Desktop §7 is strict: `x < width << 32`, so the width itself is out.
         assert!(mapping.validate_point(1920 << 32, 0).is_err());
         assert!(mapping.validate_point(0, 1080 << 32).is_err());
@@ -753,7 +746,7 @@ mod tests {
             captured_origin_x: i32::MAX,
             ..mapping(Rotation::None)
         };
-        assert!(mapping.to_os_logical(1919 << 32, 0).is_err());
+        mapping.to_os_logical(1919 << 32, 0).unwrap_err();
     }
 
     #[test]
@@ -772,7 +765,7 @@ mod tests {
 
     #[test]
     fn rotation_rejects_an_unregistered_angle() {
-        assert!(Rotation::try_from(45).is_err());
+        Rotation::try_from(45).unwrap_err();
         assert_eq!(Rotation::try_from(270).unwrap(), Rotation::TwoSeventy);
     }
 
@@ -780,7 +773,7 @@ mod tests {
     fn clip_round_trips_and_rejects_empty_extents() {
         let clip = FixedRect::new(-5, -6, 20, 30);
         assert_eq!(decode_clip(&encode_clip(clip)).unwrap(), clip);
-        assert!(decode_clip(&encode_clip(FixedRect::new(0, 0, 0, 4))).is_err());
-        assert!(decode_clip(&encode_clip(FixedRect::new(0, 0, 4, -1))).is_err());
+        decode_clip(&encode_clip(FixedRect::new(0, 0, 0, 4))).unwrap_err();
+        decode_clip(&encode_clip(FixedRect::new(0, 0, 4, -1))).unwrap_err();
     }
 }

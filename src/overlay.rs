@@ -455,7 +455,7 @@ struct Hover {
 
 #[derive(Debug, Default)]
 pub struct Windows {
-    windows: BTreeMap<SurfaceIdentity, Window>,
+    entries: BTreeMap<SurfaceIdentity, Window>,
     stack: Vec<SurfaceIdentity>,
     focus: Option<SurfaceIdentity>,
     hover: Option<Hover>,
@@ -469,7 +469,7 @@ pub struct Windows {
 
 impl Windows {
     pub fn get(&self, id: SurfaceIdentity) -> Option<&Window> {
-        self.windows.get(&id)
+        self.entries.get(&id)
     }
     pub fn focus(&self) -> Option<SurfaceIdentity> {
         self.focus
@@ -502,7 +502,7 @@ impl Windows {
     pub fn visible(&self) -> impl Iterator<Item = &Window> {
         self.stack
             .iter()
-            .filter_map(|id| self.windows.get(id))
+            .filter_map(|id| self.entries.get(id))
             .filter(|w| self.effectively_visible(w.identity))
     }
     pub fn create(
@@ -517,7 +517,7 @@ impl Windows {
                 "window identity and generation must be nonzero",
             ));
         }
-        if self.windows.contains_key(&id) {
+        if self.entries.contains_key(&id) {
             return Err(InvalidScene("window already exists"));
         }
         if self.overflowed.contains(&id.context.session) {
@@ -528,9 +528,9 @@ impl Windows {
         {
             return Err(InvalidScene("overlay owner limit exceeded"));
         }
-        if self.windows.len() >= MAX_WINDOWS
+        if self.entries.len() >= MAX_WINDOWS
             || self
-                .windows
+                .entries
                 .keys()
                 .filter(|key| key.context.session == id.context.session)
                 .count()
@@ -539,7 +539,7 @@ impl Windows {
             return Err(InvalidScene("window limit exceeded"));
         }
         if let Some(parent) = options.parent {
-            if parent.context.session != id.context.session || !self.windows.contains_key(&parent) {
+            if parent.context.session != id.context.session || !self.entries.contains_key(&parent) {
                 return Err(InvalidScene("invalid parent owner or lifecycle"));
             }
         }
@@ -560,7 +560,7 @@ impl Windows {
         {
             return Err(InvalidScene("popup must descend from the active modal"));
         }
-        self.windows.insert(
+        self.entries.insert(
             id,
             Window {
                 identity: id,
@@ -585,7 +585,7 @@ impl Windows {
         scene_revision: u64,
     ) -> Result<(), InvalidScene> {
         let window = self
-            .windows
+            .entries
             .get_mut(&id)
             .ok_or(InvalidScene("window does not exist"))?;
         if window.generation != generation
@@ -612,7 +612,7 @@ impl Windows {
             .identity(owner)
             .map_err(|_| InvalidScene("invalid window identity"))?;
         let old = self
-            .windows
+            .entries
             .get(&id)
             .ok_or(InvalidScene("window does not exist"))?;
         if old.generation != action.address.generation || old.revision != action.expected_revision {
@@ -661,7 +661,7 @@ impl Windows {
                     .collect();
                 self.stack.retain(|key| !group.contains(key));
                 let index = self
-                    .windows
+                    .entries
                     .get(&id)
                     .and_then(|w| w.options.parent)
                     .and_then(|p| self.stack.iter().position(|key| *key == p))
@@ -672,7 +672,7 @@ impl Windows {
             wire::WindowAction::Close => unreachable!("close handled before advancing revision"),
         }
         let window = self
-            .windows
+            .entries
             .get_mut(&id)
             .ok_or(InvalidScene("window lost during action"))?;
         window.revision = next;
@@ -709,7 +709,7 @@ impl Windows {
     ) -> Result<u64, InvalidScene> {
         options.validate()?;
         let old = self
-            .windows
+            .entries
             .get(&id)
             .ok_or(InvalidScene("window does not exist"))?;
         if old.generation != generation || old.revision != revision {
@@ -741,7 +741,7 @@ impl Windows {
         let showing =
             !old.options.visible && options.visible && options.mode != WindowMode::Floating;
         let w = self
-            .windows
+            .entries
             .get_mut(&id)
             .ok_or(InvalidScene("window does not exist"))?;
         w.options = options;
@@ -780,7 +780,7 @@ impl Windows {
             if id == parent {
                 return true;
             }
-            let Some(next) = self.windows.get(&id).and_then(|w| w.options.parent) else {
+            let Some(next) = self.entries.get(&id).and_then(|w| w.options.parent) else {
                 return false;
             };
             id = next;
@@ -789,7 +789,7 @@ impl Windows {
     }
     fn effectively_visible(&self, mut id: SurfaceIdentity) -> bool {
         for _ in 0..MAX_WINDOWS {
-            let Some(w) = self.windows.get(&id) else {
+            let Some(w) = self.entries.get(&id) else {
                 return false;
             };
             if !w.options.visible {
@@ -867,7 +867,7 @@ impl Windows {
             self.change_focus(None);
         }
         self.emit(id, Event::Dismissed(reason));
-        self.windows.remove(&id);
+        self.entries.remove(&id);
         self.stack.retain(|key| *key != id);
         self.focus_history.retain(|key| *key != id);
     }
@@ -883,7 +883,7 @@ impl Windows {
         self.events.remove(&owner);
         self.focus_history.retain(|id| id.context.session != owner);
         for id in ids {
-            self.windows.remove(&id);
+            self.entries.remove(&id);
             self.stack.retain(|key| *key != id);
         }
         if self
@@ -903,7 +903,7 @@ impl Windows {
             self.overflowed.insert(id.context.session);
             return;
         }
-        let Some(w) = self.windows.get(&id) else {
+        let Some(w) = self.entries.get(&id) else {
             return;
         };
         let e = WindowEvent {
@@ -955,7 +955,7 @@ impl Windows {
     pub fn take_event(&mut self, owner: SessionIdentity) -> Option<WindowEvent> {
         let queue = self.events.get_mut(&owner)?;
         let event = queue.pop_front();
-        if queue.is_empty() && !self.windows.keys().any(|key| key.context.session == owner) {
+        if queue.is_empty() && !self.entries.keys().any(|key| key.context.session == owner) {
             self.events.remove(&owner);
         }
         event
@@ -969,7 +969,7 @@ impl Windows {
             return Err(InvalidScene("pointer capture requires eligible focus"));
         }
         let w = self
-            .windows
+            .entries
             .get(&id)
             .ok_or(InvalidScene("window does not exist"))?;
         self.capture = Some(Capture {
@@ -1017,7 +1017,7 @@ impl Windows {
                 }
             )
             && self
-                .windows
+                .entries
                 .get(&id)
                 .is_some_and(|w| w.options.mode != WindowMode::Floating)
         {
@@ -1043,7 +1043,7 @@ impl Windows {
             .copied()
             .filter(|id| self.eligible(*id))
             .find_map(|id| {
-                let window = self.windows.get(&id)?;
+                let window = self.entries.get(&id)?;
                 if !window.options.bounds.contains(position) {
                     return None;
                 }
@@ -1146,7 +1146,7 @@ impl Windows {
         if button.is_some_and(|(_, down)| down) {
             let _ = self.request_focus(id);
             if matches!(target.role, HitRole::Drag | HitRole::Resize(_))
-                && let Some(w) = self.windows.get(&id)
+                && let Some(w) = self.entries.get(&id)
             {
                 self.capture = Some(Capture {
                     window: id,
@@ -1189,7 +1189,7 @@ impl Windows {
             .copied()
             .filter(|id| self.eligible(*id))
             .find_map(|id| {
-                let w = self.windows.get(&id)?;
+                let w = self.entries.get(&id)?;
                 if !w.options.bounds.contains(position) {
                     return None;
                 }
@@ -1263,11 +1263,15 @@ impl Windows {
     }
 
     fn local(&self, id: SurfaceIdentity, p: Point) -> Option<Point> {
-        let r = self.windows.get(&id)?.options.bounds;
+        let r = self.entries.get(&id)?.options.bounds;
         Point::new(p.x.get() - r.origin.x.get(), p.y.get() - r.origin.y.get()).ok()
     }
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "pointer geometry reads as math"
+    )]
     fn gesture(&mut self, c: Capture, p: Point, settled: bool) {
-        let Some(w) = self.windows.get(&c.window) else {
+        let Some(w) = self.entries.get(&c.window) else {
             return;
         };
         let dx = p.x.get() - c.start.x.get();
@@ -1308,7 +1312,7 @@ impl Windows {
             self.close(c.window, DismissReason::Closed);
             return;
         };
-        if let Some(w) = self.windows.get_mut(&c.window) {
+        if let Some(w) = self.entries.get_mut(&c.window) {
             w.options.bounds = bounds;
             w.revision = revision;
         }
@@ -1476,11 +1480,9 @@ mod tests {
         let order: Vec<_> = state.visible().map(|w| w.identity).collect();
         assert_eq!(order, [b, a, popup]);
         assert_eq!(state.get(b).unwrap().revision, 1);
-        assert!(
-            state
-                .apply_action(a.context.session, action, viewport)
-                .is_err()
-        );
+        state
+            .apply_action(a.context.session, action, viewport)
+            .unwrap_err();
         assert_eq!(
             state.visible().map(|w| w.identity).collect::<Vec<_>>(),
             order
@@ -1857,7 +1859,7 @@ mod tests {
         let nodes = (0..chain)
             .map(|index| {
                 let children = if index + 1 < chain {
-                    vec![(index + 1) as u32]
+                    vec![u32::try_from(index + 1).unwrap()]
                 } else {
                     Vec::new()
                 };
@@ -2060,7 +2062,7 @@ mod tests {
         let mut s = Windows::default();
         s.create(b, 1, options(WindowMode::Floating)).unwrap();
         s.create(a, 1, options(WindowMode::Modal)).unwrap();
-        for _ in 0..MAX_PENDING_EVENTS + 1 {
+        for _ in 0..=MAX_PENDING_EVENTS {
             s.keyboard(
                 Event::Key {
                     physical: 1,

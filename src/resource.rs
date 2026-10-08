@@ -103,6 +103,7 @@ impl ResourceContract {
         self.values[resource as usize] = value;
     }
 
+    #[must_use]
     pub fn component_min(&self, other: &Self) -> Self {
         let mut values = [0; RESOURCE_COUNT];
         for (index, value) in values.iter_mut().enumerate() {
@@ -330,18 +331,18 @@ mod tests {
         // Waiting exactly that long must be enough, not one token short.
         bucket.replenish(Duration::from_millis(250)).unwrap();
         assert_eq!(bucket.time_until(250), Ok(None));
-        assert!(bucket.charge(250).is_ok());
+        bucket.charge(250).unwrap();
     }
 
     #[test]
     fn a_charge_larger_than_the_bucket_is_refused_rather_than_waited_out() {
         let bucket = TokenBucket::new(1_000, 1_000);
-        assert!(bucket.time_until(1_001).is_err());
+        bucket.time_until(1_001).unwrap_err();
         // A bucket that earns nothing can never admit a charge it does not already hold.
         let mut idle = TokenBucket::new(0, 10);
         assert_eq!(idle.time_until(10), Ok(None));
         idle.charge(10).unwrap();
-        assert!(idle.time_until(1).is_err());
+        idle.time_until(1).unwrap_err();
     }
 
     #[test]

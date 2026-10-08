@@ -21,6 +21,10 @@ enum Phase {
 }
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "model state mirrors independent protocol flags"
+)]
 struct DropState {
     phase: Phase,
     generation: u8,
@@ -155,8 +159,7 @@ fn apply(mut model: Model, owner: usize, transition: Transition) -> Option<Model
             state.result_cached = true;
         }
         // Losing a terminal reply preserves the cached outcome for QUERY/retry reconciliation.
-        Transition::LoseResultReply if state.result_cached => {}
-        Transition::Query if state.result_cached => {}
+        Transition::LoseResultReply | Transition::Query if state.result_cached => {}
         Transition::Cancel
             if matches!(
                 state.phase,

@@ -1,0 +1,10 @@
+# This crate names trait-method parameters descriptively (`formatter`, `buffer`) rather than with
+# std's abbreviations; `..` keeps clippy's defaults.
+allow-renamed-params-for = [
+  "..",
+  "core::alloc::GlobalAlloc",
+  "core::fmt::Debug",
+  "core::fmt::Display",
+  "std::io::Read",
+  "std::io::Write",
+]

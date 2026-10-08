@@ -150,7 +150,7 @@ pub fn video_body_len(max_access_unit_bytes: u32) -> Result<u32, SizeError> {
         return Err(SizeError::Empty);
     }
     let bytes = max_access_unit_bytes
-        .checked_add(VIDEO_PACKET_PREFIX_SIZE as u32)
+        .checked_add(const { crate::const_u32(VIDEO_PACKET_PREFIX_SIZE) })
         .ok_or(SizeError::Overflow)?;
     if bytes > HARD_MAX_RECORD_BODY {
         Err(SizeError::TooLarge)
@@ -164,7 +164,7 @@ pub fn audio_body_len(max_access_unit_bytes: u32) -> Result<u32, SizeError> {
         return Err(SizeError::Empty);
     }
     let bytes = max_access_unit_bytes
-        .checked_add(AUDIO_PACKET_PREFIX_SIZE as u32)
+        .checked_add(const { crate::const_u32(AUDIO_PACKET_PREFIX_SIZE) })
         .ok_or(SizeError::Overflow)?;
     if bytes > HARD_MAX_RECORD_BODY {
         Err(SizeError::TooLarge)
@@ -198,6 +198,7 @@ impl MediaSequence {
 }
 
 /// Debug output reports the payload length, never the encoded media bytes.
+#[derive(Clone, Copy)]
 pub struct VideoPacket<'a> {
     pub epoch: u32,
     pub packet_id: u64,
@@ -209,6 +210,7 @@ pub struct VideoPacket<'a> {
 }
 
 /// Debug output reports the payload length, never the encoded media bytes.
+#[derive(Clone, Copy)]
 pub struct AudioPacket<'a> {
     pub epoch: u32,
     pub packet_id: u64,
@@ -359,7 +361,7 @@ fn raster_full_frame_prefix_inner(
         )
     })?;
     data_len
-        .checked_add((RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE) as u32)
+        .checked_add(const { crate::const_u32(RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE) })
         .filter(|length| *length <= HARD_MAX_RECORD_BODY)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raster frame too large"))?;
 
@@ -442,7 +444,10 @@ pub fn raster_frame_body_with_compression(
     Ok(body)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the RASTER_FRAME delta prefix fields; open guideline item M-INIT-CASCADED"
+)]
 pub fn raster_delta_frame_body(
     epoch: u32,
     frame_id: u64,
@@ -722,6 +727,19 @@ pub fn parse_delta_raster_frame(
     source_height: u32,
     effective_operation_limit: u32,
 ) -> io::Result<ParsedRasterDeltaFrame<'_>> {
+    struct ValidatedOperation {
+        kind: u32,
+        destination_x: u32,
+        destination_y: u32,
+        width: u32,
+        height: u32,
+        source_x: u32,
+        source_y: u32,
+        payload_start: usize,
+        payload_end: usize,
+        expected_length: usize,
+    }
+
     validate_delta_operation_limit(effective_operation_limit, io::ErrorKind::InvalidData)?;
     if source_width == 0 || source_height == 0 {
         return Err(invalid("delta source dimensions are empty"));
@@ -755,19 +773,6 @@ pub fn parse_delta_raster_frame(
         .filter(|offset| *offset <= body.len())
         .ok_or_else(|| invalid("raster delta operation array exceeds its body"))?;
     let compressed = flags & RASTER_FRAME_ZSTD != 0;
-
-    struct ValidatedOperation {
-        kind: u32,
-        destination_x: u32,
-        destination_y: u32,
-        width: u32,
-        height: u32,
-        source_x: u32,
-        source_y: u32,
-        payload_start: usize,
-        payload_end: usize,
-        expected_length: usize,
-    }
 
     let mut validated = Vec::with_capacity(count as usize);
     let mut payload_offset = payload_start;
@@ -973,7 +978,7 @@ fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
         .read_to_end(&mut output)?;
     if output.len() != expected
         || !decoder.decoder.is_finished()
-        || decoder.decoder.bytes_read_from_source() as usize != pixels.len()
+        || u64::try_from(pixels.len()) != Ok(decoder.decoder.bytes_read_from_source())
     {
         return Err(invalid(
             "zstd raster has wrong output size or trailing data",
@@ -1172,7 +1177,7 @@ impl<'a> AscBitReader<'a> {
             self.read_bits(5)?;
         }
         let padding = (8 - self.position % 8) % 8;
-        self.read_bits(padding as u32)?;
+        self.read_bits(u32::try_from(padding).expect("byte-alignment padding is below 8"))?;
         let comment_bytes = self.read_bits(8)?;
         for _ in 0..comment_bytes {
             self.read_bits(8)?;
@@ -1952,7 +1957,7 @@ mod tests {
             [raster_prefix.as_slice(), pixels.as_slice()].concat(),
             raster_body
         );
-        assert!(raster_full_frame_prefix(5, 13, 3, 2, pixels.len() - 1).is_err());
+        raster_full_frame_prefix(5, 13, 3, 2, pixels.len() - 1).unwrap_err();
     }
 
     #[test]
@@ -1979,8 +1984,8 @@ mod tests {
 
     #[test]
     fn audio_packets_reject_malformed_headers_and_reused_ids() {
-        assert!(parse_audio_packet(&[0; 47]).is_err());
-        assert!(parse_audio_packet(&[0; 48]).is_err());
+        parse_audio_packet(&[0; 47]).unwrap_err();
+        parse_audio_packet(&[0; 48]).unwrap_err();
         let mut body = audio_packet_body(AudioPacket {
             epoch: 1,
             packet_id: 1,
@@ -1993,10 +1998,10 @@ mod tests {
         })
         .unwrap();
         body[7] = 1;
-        assert!(parse_audio_packet(&body).is_err());
+        parse_audio_packet(&body).unwrap_err();
 
         let mut sequence = MediaSequence::default();
-        assert!(sequence.accept(1, 1).is_ok());
+        sequence.accept(1, 1).unwrap();
         assert!(sequence.accept(1, 1).is_err());
         assert!(sequence.accept(2, 0).is_err());
     }
@@ -2105,7 +2110,9 @@ mod tests {
                 assert_eq!(rgba.as_ref(), &[7; 16]);
                 assert!(matches!(rgba, Cow::Owned(_)));
             }
-            _ => panic!("second operation should be an overwrite"),
+            ParsedRasterDeltaOperation::Copy { .. } => {
+                panic!("second operation should be an overwrite")
+            }
         }
 
         let mut concatenated = body;
@@ -2114,7 +2121,7 @@ mod tests {
         let length = u32::from_be_bytes(concatenated[108..112].try_into().unwrap())
             + u32::try_from(second.len()).unwrap();
         concatenated[108..112].copy_from_slice(&length.to_be_bytes());
-        assert!(parse_delta_raster_frame(&concatenated, 4, 3, 2).is_err());
+        parse_delta_raster_frame(&concatenated, 4, 3, 2).unwrap_err();
     }
 
     #[test]
@@ -2122,22 +2129,22 @@ mod tests {
         let baseline = mixed_delta_body(false);
         let mut malformed = baseline.clone();
         malformed[4..8].copy_from_slice(&(RASTER_FRAME_FULL | RASTER_FRAME_DELTA).to_be_bytes());
-        assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
+        parse_delta_raster_frame(&malformed, 4, 3, 4).unwrap_err();
 
         let mut malformed = baseline.clone();
         malformed[16..24].copy_from_slice(&0_u64.to_be_bytes());
-        assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
+        parse_delta_raster_frame(&malformed, 4, 3, 4).unwrap_err();
 
         let mut malformed = baseline.clone();
         malformed[44..48].copy_from_slice(&1_u32.to_be_bytes());
-        assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
+        parse_delta_raster_frame(&malformed, 4, 3, 4).unwrap_err();
 
         let mut malformed = baseline.clone();
         malformed[40..44].copy_from_slice(&0_u32.to_be_bytes());
-        assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
-        assert!(parse_delta_raster_frame(&baseline, 4, 3, 1).is_err());
-        assert!(parse_delta_raster_frame(&baseline, 4, 3, 17).is_err());
-        assert!(parse_delta_raster_frame(&baseline[..79], 4, 3, 4).is_err());
+        parse_delta_raster_frame(&malformed, 4, 3, 4).unwrap_err();
+        parse_delta_raster_frame(&baseline, 4, 3, 1).unwrap_err();
+        parse_delta_raster_frame(&baseline, 4, 3, 17).unwrap_err();
+        parse_delta_raster_frame(&baseline[..79], 4, 3, 4).unwrap_err();
     }
 
     #[test]
@@ -2161,11 +2168,11 @@ mod tests {
 
         let mut overwrite_reserved = baseline.clone();
         overwrite_reserved[100..104].copy_from_slice(&1_u32.to_be_bytes());
-        assert!(parse_delta_raster_frame(&overwrite_reserved, 4, 3, 4).is_err());
+        parse_delta_raster_frame(&overwrite_reserved, 4, 3, 4).unwrap_err();
 
         let mut copy_payload = baseline.clone();
         copy_payload[76..80].copy_from_slice(&1_u32.to_be_bytes());
-        assert!(parse_delta_raster_frame(&copy_payload, 4, 3, 4).is_err());
+        parse_delta_raster_frame(&copy_payload, 4, 3, 4).unwrap_err();
     }
 
     #[test]
@@ -2174,11 +2181,11 @@ mod tests {
         for length in [15_u32, 17, u32::MAX] {
             let mut malformed = baseline.clone();
             malformed[108..112].copy_from_slice(&length.to_be_bytes());
-            assert!(parse_delta_raster_frame(&malformed, 4, 3, 4).is_err());
+            parse_delta_raster_frame(&malformed, 4, 3, 4).unwrap_err();
         }
         let mut trailing = baseline;
         trailing.push(0);
-        assert!(parse_delta_raster_frame(&trailing, 4, 3, 4).is_err());
+        parse_delta_raster_frame(&trailing, 4, 3, 4).unwrap_err();
     }
 
     #[test]
@@ -2198,23 +2205,21 @@ mod tests {
             (1, 1, 1, 1, 0),
             (1, 1, 1, 1, 17),
         ] {
-            assert!(
-                raster_delta_frame_body(
-                    0,
-                    frame,
-                    base,
-                    0,
-                    0,
-                    width,
-                    height,
-                    limit,
-                    &[overwrite],
-                    false,
-                )
-                .is_err()
-            );
+            raster_delta_frame_body(
+                0,
+                frame,
+                base,
+                0,
+                0,
+                width,
+                height,
+                limit,
+                &[overwrite],
+                false,
+            )
+            .unwrap_err();
         }
-        assert!(raster_delta_frame_body(0, 1, 1, 0, 0, 1, 1, 1, &[], false).is_err());
+        raster_delta_frame_body(0, 1, 1, 0, 0, 1, 1, 1, &[], false).unwrap_err();
         let wrong_length = RasterDeltaOperation::Overwrite {
             x: 0,
             y: 0,
@@ -2222,17 +2227,17 @@ mod tests {
             height: 1,
             rgba: &[0; 3],
         };
-        assert!(raster_delta_frame_body(0, 1, 1, 0, 0, 1, 1, 1, &[wrong_length], false).is_err());
+        raster_delta_frame_body(0, 1, 1, 0, 0, 1, 1, 1, &[wrong_length], false).unwrap_err();
     }
 
     #[test]
     fn raster_body_limits_are_exact() {
-        assert!(rgba8_raw_frame_body_len(4095, 4095).is_ok());
+        rgba8_raw_frame_body_len(4095, 4095).unwrap();
         assert_eq!(
             rgba8_raw_frame_body_len(4096, 4096),
             Err(SizeError::TooLarge)
         );
-        assert!(rgba8_raw_frame_body_len(8192, 1).is_ok());
+        rgba8_raw_frame_body_len(8192, 1).unwrap();
     }
 
     #[test]
@@ -2254,7 +2259,7 @@ mod tests {
         let compressed_length = u32::try_from(body.len() - 72).unwrap();
         body[68..72].copy_from_slice(&compressed_length.to_be_bytes());
         let parsed = parse_full_raster_frame(&body).unwrap();
-        assert!(decode_raster_pixels(parsed).is_err());
+        decode_raster_pixels(parsed).unwrap_err();
     }
 
     #[test]
@@ -2270,11 +2275,11 @@ mod tests {
         })
         .unwrap();
         packet[4..8].copy_from_slice(&(VIDEO_PACKET_KEY | VIDEO_PACKET_DELTA).to_be_bytes());
-        assert!(parse_video_packet(&packet).is_err());
+        parse_video_packet(&packet).unwrap_err();
 
         let mut raster = raster_frame_body(1, 1, 1, 1, &[0; 4]).unwrap();
         raster[4..8].copy_from_slice(&(RASTER_FRAME_FULL | 4).to_be_bytes());
-        assert!(parse_full_raster_frame(&raster).is_err());
+        parse_full_raster_frame(&raster).unwrap_err();
     }
 
     #[test]
@@ -2362,53 +2367,61 @@ mod h264_annexb_tests {
         // Two SPS then one PPS, hand-built because avcc_from_annexb only emits one of each.
         let mut avcc = vec![1, 0x64, 0x00, 0x29, 0xff, 0xe2];
         for _ in 0..2 {
-            avcc.extend_from_slice(&(sps().len() as u16).to_be_bytes());
+            avcc.extend_from_slice(&u16::try_from(sps().len()).unwrap().to_be_bytes());
             avcc.extend_from_slice(&sps());
         }
         avcc.push(1);
-        avcc.extend_from_slice(&(pps().len() as u16).to_be_bytes());
+        avcc.extend_from_slice(&u16::try_from(pps().len()).unwrap().to_be_bytes());
         avcc.extend_from_slice(&pps());
         let annexb = annexb_from_avcc(&avcc).unwrap();
         assert_eq!(annexb_nals(&annexb).len(), 3);
     }
 
     #[test]
+    #[expect(
+        clippy::similar_names,
+        reason = "SPS/PPS variants are the subject of the test"
+    )]
     fn rejects_malformed_avcc() {
         let avcc = avcc_extradata();
         // Zero SPS count.
         let mut no_sps = avcc.clone();
         no_sps[5] = 0xe0;
-        assert!(annexb_from_avcc(&no_sps).is_err());
+        annexb_from_avcc(&no_sps).unwrap_err();
         // Zero PPS count: the PPS count byte follows the single SPS.
         let mut no_pps = avcc.clone();
         let pps_count_index = 6 + 2 + sps().len();
         no_pps[pps_count_index] = 0;
-        assert!(annexb_from_avcc(&no_pps).is_err());
+        annexb_from_avcc(&no_pps).unwrap_err();
         // Truncated parameter-set body.
-        assert!(annexb_from_avcc(&avcc[..avcc.len() - 2]).is_err());
+        annexb_from_avcc(&avcc[..avcc.len() - 2]).unwrap_err();
         // Wrong configuration version.
         let mut wrong_version = avcc.clone();
         wrong_version[0] = 2;
-        assert!(annexb_from_avcc(&wrong_version).is_err());
+        annexb_from_avcc(&wrong_version).unwrap_err();
         // Too short to carry a header at all.
-        assert!(annexb_from_avcc(&[1, 0x64, 0, 0x29, 0xff]).is_err());
+        annexb_from_avcc(&[1, 0x64, 0, 0x29, 0xff]).unwrap_err();
     }
 
     #[test]
+    #[expect(
+        clippy::similar_names,
+        reason = "SPS/PPS variants are the subject of the test"
+    )]
     fn rejects_extradata_missing_a_parameter_set() {
         let mut only_sps = vec![0, 0, 0, 1];
         only_sps.extend_from_slice(&sps());
-        assert!(avcc_from_annexb(&only_sps).is_err());
+        avcc_from_annexb(&only_sps).unwrap_err();
         let mut only_pps = vec![0, 0, 0, 1];
         only_pps.extend_from_slice(&pps());
-        assert!(avcc_from_annexb(&only_pps).is_err());
-        assert!(avcc_from_annexb(&[]).is_err());
+        avcc_from_annexb(&only_pps).unwrap_err();
+        avcc_from_annexb(&[]).unwrap_err();
     }
 
     #[test]
     fn rejects_oversized_extradata() {
         let oversized = vec![1_u8; MAX_H264_EXTRADATA + 1];
-        assert!(h264_decoder_description(&oversized).is_err());
+        h264_decoder_description(&oversized).unwrap_err();
     }
 
     #[test]
@@ -2433,7 +2446,7 @@ mod h264_annexb_tests {
     fn ensure_annexb_converts_length_prefixed_units() {
         let mut avcc_unit = Vec::new();
         for nal in [sps(), pps()] {
-            avcc_unit.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            avcc_unit.extend_from_slice(&u32::try_from(nal.len()).unwrap().to_be_bytes());
             avcc_unit.extend_from_slice(&nal);
         }
         let normalized = ensure_annexb(&avcc_unit).unwrap();
@@ -2444,17 +2457,17 @@ mod h264_annexb_tests {
     #[test]
     fn ensure_annexb_rejects_rather_than_mangles() {
         // Empty.
-        assert!(ensure_annexb(&[]).is_err());
+        ensure_annexb(&[]).unwrap_err();
         // A length prefix that overruns the buffer.
-        assert!(ensure_annexb(&[0x00, 0x00, 0x10, 0x00, 0x67, 0x64]).is_err());
+        ensure_annexb(&[0x00, 0x00, 0x10, 0x00, 0x67, 0x64]).unwrap_err();
         // A zero-length NAL unit.
-        assert!(ensure_annexb(&[0x00, 0x00, 0x00, 0x00]).is_err());
+        ensure_annexb(&[0x00, 0x00, 0x00, 0x00]).unwrap_err();
         // A trailing remainder too short to be another length prefix.
         let mut trailing = Vec::new();
-        trailing.extend_from_slice(&(sps().len() as u32).to_be_bytes());
+        trailing.extend_from_slice(&u32::try_from(sps().len()).unwrap().to_be_bytes());
         trailing.extend_from_slice(&sps());
         trailing.extend_from_slice(&[0x00, 0x02]);
-        assert!(ensure_annexb(&trailing).is_err());
+        ensure_annexb(&trailing).unwrap_err();
     }
 
     #[test]

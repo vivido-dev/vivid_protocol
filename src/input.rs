@@ -232,8 +232,8 @@ impl InputEvent {
                 y,
                 ..
             } => {
-                payload.push((5, signed(horizontal)));
-                payload.push((6, signed(vertical)));
+                payload.push((5, Value::from(horizontal)));
+                payload.push((6, Value::from(vertical)));
                 payload.push((7, Value::Unsigned(x)));
                 payload.push((8, Value::Unsigned(y)));
             }
@@ -564,14 +564,6 @@ fn required_i64(map: &StrictMap<'_>, key: u64) -> Result<i64, MessageError> {
         .ok_or_else(|| invalid_value("input event", key, "is not an integer"))
 }
 
-fn signed(value: i64) -> Value {
-    if value >= 0 {
-        Value::Unsigned(value as u64)
-    } else {
-        Value::Negative(value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,15 +626,13 @@ mod tests {
             };
             let before = failed.clone();
             for _ in 0..2 {
-                assert!(
-                    failed
-                        .apply_binding(binding(2), INPUT_CLASS_KEYBOARD, 1_000_000, time)
-                        .is_err()
-                );
+                failed
+                    .apply_binding(binding(2), INPUT_CLASS_KEYBOARD, 1_000_000, time)
+                    .unwrap_err();
                 assert_unchanged(&failed, &before);
             }
             if boundary != 0 {
-                assert!(failed.revoke().is_err());
+                failed.revoke().unwrap_err();
                 assert_unchanged(&failed, &before);
             } else {
                 assert!(matches!(
@@ -749,9 +739,7 @@ mod tests {
         gate.apply_binding(binding(2), INPUT_CLASS_KEYBOARD, 1_000_000, now)
             .unwrap();
         gate.revoke().unwrap();
-        assert!(
-            gate.apply_binding(binding(1), INPUT_CLASS_KEYBOARD, 1_000_000, now)
-                .is_err()
-        );
+        gate.apply_binding(binding(1), INPUT_CLASS_KEYBOARD, 1_000_000, now)
+            .unwrap_err();
     }
 }

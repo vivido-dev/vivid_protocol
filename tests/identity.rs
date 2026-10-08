@@ -8,19 +8,19 @@ const PRESENTER: PresenterInstanceId = PresenterInstanceId([1; 16]);
 
 #[test]
 fn every_level_rejects_a_zero_id() {
-    assert!(SessionIdentity::new(PRESENTER, 0).is_err());
+    SessionIdentity::new(PRESENTER, 0).unwrap_err();
     let session = SessionIdentity::new(PRESENTER, 1).unwrap();
-    assert!(session.context(0).is_err());
+    session.context(0).unwrap_err();
     let context = session.context(2).unwrap();
-    assert!(context.surface(0).is_err());
-    assert!(context.node(0).is_err());
-    assert!(context.transaction(0).is_err());
-    assert!(context.anchor(0).is_err());
-    assert!(context.lease(0).is_err());
+    context.surface(0).unwrap_err();
+    context.node(0).unwrap_err();
+    context.transaction(0).unwrap_err();
+    context.anchor(0).unwrap_err();
+    context.lease(0).unwrap_err();
     let surface = context.surface(3).unwrap();
-    assert!(surface.track(0).is_err());
+    surface.track(0).unwrap_err();
     let track = surface.track(4).unwrap();
-    assert!(track.channel(ChannelGeneration::ZERO).is_err());
+    track.channel(ChannelGeneration::ZERO).unwrap_err();
 }
 
 #[test]

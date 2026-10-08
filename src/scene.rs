@@ -4,10 +4,9 @@ use std::collections::BTreeMap;
 
 use crate::{
     cbor::Value,
-    identity::SessionIdentity,
+    identity::{NodeIdentity, SessionIdentity},
     messages::{
-        MessageError, NodeIdentity, PayloadMap, StrictMap, invalid_value, require_nonzero,
-        validate_header_object,
+        MessageError, PayloadMap, StrictMap, invalid_value, require_nonzero, validate_header_object,
     },
     revision::{SceneRevision, TargetGeneration},
 };
@@ -69,7 +68,7 @@ impl SceneNode {
             (4, Value::Map(self.geometry.clone())),
             (5, Value::Unsigned(self.fit as u64)),
             (6, Value::Unsigned(u64::from(self.linear_sampling))),
-            (7, signed(self.z_index)),
+            (7, Value::from(self.z_index)),
             (8, Value::Unsigned(0)),
             (9, Value::Bool(self.visible)),
             (10, Value::Unsigned(u64::from(self.opacity))),
@@ -354,14 +353,6 @@ impl Scene {
     }
 }
 
-fn signed(value: i64) -> Value {
-    if value >= 0 {
-        Value::Unsigned(value as u64)
-    } else {
-        Value::Negative(value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,7 +388,7 @@ mod tests {
         scene.begin(2, 1).unwrap();
         scene.create(2, 1, node(2, 2)).unwrap();
         scene.create(2, 1, node(2, 2)).unwrap();
-        assert!(scene.commit(2, 1, TargetGeneration::ONE, None).is_err());
+        scene.commit(2, 1, TargetGeneration::ONE, None).unwrap_err();
         assert_eq!(scene.revision(), SceneRevision::ZERO);
         assert!(scene.node(node_identity(2)).is_none());
     }

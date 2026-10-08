@@ -1,5 +1,8 @@
 //! Portable styled paragraphs and atomic, optionally retained measurement batches.
-use super::*;
+use super::{
+    MAX_MEASURE_TEXT_BYTES, MAX_TEXT_GEOMETRY, MessageError, PayloadMap, Scalar, TextMeasurement,
+    Value, WindowAddress, array, bad, boolean, decode_scalar, scalar, small, strict, u,
+};
 use crate::vector::Color;
 
 /// Font family names are bounded everywhere they cross the wire, including in the environment
@@ -53,14 +56,10 @@ impl Typography {
     }
     fn value(&self) -> Value {
         Value::Array(vec![
-            u(if self.overflow == TextOverflow::Clip {
-                0
-            } else {
-                1
-            }),
+            u(u64::from(self.overflow != TextOverflow::Clip)),
             scalar(self.letter_spacing),
             scalar(self.word_spacing),
-            self.line_height.map(scalar).unwrap_or(Value::Null),
+            self.line_height.map_or(Value::Null, scalar),
             Value::Bool(self.ligatures),
             Value::Bool(self.kerning),
         ])
@@ -113,7 +112,7 @@ impl Default for TextStyle {
             family: String::new(),
             weight: 400,
             italic: false,
-            color: Color(0xffffffff),
+            color: Color(0xff_ff_ff_ff),
             underline: false,
             strikethrough: false,
         }
@@ -201,7 +200,7 @@ impl StyledText {
             .collect();
         let mut values = vec![
             Value::Array(runs),
-            self.max_width.map(scalar).unwrap_or(Value::Null),
+            self.max_width.map_or(Value::Null, scalar),
             u(match self.alignment {
                 TextAlignment::Start => 0,
                 TextAlignment::Center => 1,
@@ -209,7 +208,7 @@ impl StyledText {
                 TextAlignment::Justify => 3,
             }),
             Value::Bool(self.wrap),
-            self.max_lines.map(|n| u(n.into())).unwrap_or(Value::Null),
+            self.max_lines.map_or(Value::Null, |n| u(n.into())),
         ];
         if self.typography != Typography::default() {
             values.push(self.typography.value());
@@ -443,6 +442,8 @@ impl ReleaseLayouts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::{Canvas, Command, Point};
+
     #[test]
     fn typography_is_optional_bounded_and_roundtrips_without_changing_legacy_paragraphs() {
         let mut text = StyledText::new("hello", TextStyle::default());
@@ -458,13 +459,13 @@ mod tests {
         };
         assert_eq!(StyledText::decode(&text.value().unwrap()).unwrap(), text);
         text.max_width = None;
-        assert!(text.value().is_err());
+        text.value().unwrap_err();
         text.max_width = Some(Scalar::ONE);
         text.typography.letter_spacing = Scalar::new(-1.).unwrap();
-        assert!(text.value().is_err());
+        text.value().unwrap_err();
         text.typography.letter_spacing = Scalar::ZERO;
         text.typography.line_height = Some(Scalar::ZERO);
-        assert!(text.value().is_err());
+        text.value().unwrap_err();
     }
     #[test]
     fn batches_roundtrip_and_enforce_aggregate_limits() {
@@ -490,26 +491,22 @@ mod tests {
             MeasureBatch::decode(2, &Value::Map(request.payload().unwrap())).unwrap(),
             request
         );
-        assert!(
-            MeasureBatch {
-                texts: vec![text.clone(); MAX_TEXT_BATCH + 1],
-                ..request.clone()
-            }
-            .payload()
-            .is_err()
-        );
+        MeasureBatch {
+            texts: vec![text.clone(); MAX_TEXT_BATCH + 1],
+            ..request.clone()
+        }
+        .payload()
+        .unwrap_err();
         let large = StyledText::new("x".repeat(2049), TextStyle::default());
-        assert!(
-            MeasureBatch {
-                texts: vec![large.clone(), large],
-                ..request.clone()
-            }
-            .payload()
-            .is_err()
-        );
+        MeasureBatch {
+            texts: vec![large.clone(), large],
+            ..request.clone()
+        }
+        .payload()
+        .unwrap_err();
         let mut invalid = text;
         invalid.max_lines = Some(0);
-        assert!(invalid.value().is_err());
+        invalid.value().unwrap_err();
         let release = ReleaseLayouts {
             address,
             ids: vec![u64::MAX, 1],
@@ -518,14 +515,12 @@ mod tests {
             ReleaseLayouts::decode(2, &Value::Map(release.payload().unwrap())).unwrap(),
             release
         );
-        assert!(
-            ReleaseLayouts {
-                ids: vec![1, 1],
-                ..release
-            }
-            .payload()
-            .is_err()
-        );
+        ReleaseLayouts {
+            ids: vec![1, 1],
+            ..release
+        }
+        .payload()
+        .unwrap_err();
         let mut canvas = Canvas::new();
         canvas
             .push(Command::TextLayout {

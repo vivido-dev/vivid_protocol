@@ -1222,7 +1222,7 @@ pub fn file_data_prefix(
         .filter(|length| *length != 0)
         .ok_or_else(|| invalid_io("file data length is zero or exceeds u32"))?;
     data_length
-        .checked_add(FILE_DATA_PREFIX_SIZE as u32)
+        .checked_add(const { crate::const_u32(FILE_DATA_PREFIX_SIZE) })
         .filter(|length| *length <= HARD_MAX_RECORD_BODY)
         .ok_or_else(|| invalid_io("file data body exceeds the hard record limit"))?;
     let mut prefix = [0_u8; FILE_DATA_PREFIX_SIZE];
@@ -1486,7 +1486,9 @@ fn validate_binding_limits(
             "has invalid pending or active limits",
         ));
     }
-    if record_body <= FILE_DATA_PREFIX_SIZE as u32 || record_body > HARD_MAX_RECORD_BODY {
+    if record_body <= const { crate::const_u32(FILE_DATA_PREFIX_SIZE) }
+        || record_body > HARD_MAX_RECORD_BODY
+    {
         return Err(invalid_value(schema, 8, "has an invalid record-body limit"));
     }
     validate_deadline(schema, 9, acceptance_timeout_us)?;
@@ -1499,7 +1501,9 @@ fn validate_credit(
     maximum_records: u64,
     schema: &'static str,
 ) -> Result<(), MessageError> {
-    if record_body <= FILE_DATA_PREFIX_SIZE as u32 || record_body > HARD_MAX_RECORD_BODY {
+    if record_body <= const { crate::const_u32(FILE_DATA_PREFIX_SIZE) }
+        || record_body > HARD_MAX_RECORD_BODY
+    {
         return Err(invalid_value(schema, 8, "has an invalid record-body limit"));
     }
     if maximum_body_bytes == 0 && maximum_records == 0 {
@@ -1516,14 +1520,14 @@ fn validate_credit(
 }
 
 fn validate_deadline(schema: &'static str, key: u64, timeout_us: u64) -> Result<(), MessageError> {
-    if !(MIN_FILE_DROP_DEADLINE_US..=MAX_FILE_DROP_DEADLINE_US).contains(&timeout_us) {
+    if (MIN_FILE_DROP_DEADLINE_US..=MAX_FILE_DROP_DEADLINE_US).contains(&timeout_us) {
+        Ok(())
+    } else {
         Err(invalid_value(
             schema,
             key,
             "is outside the finite timeout range",
         ))
-    } else {
-        Ok(())
     }
 }
 
@@ -1636,7 +1640,7 @@ mod tests {
         let other_before = other.current();
         for allow in [true, false] {
             for _ in 0..2 {
-                assert!(gate.apply(binding(2), allow).is_err());
+                gate.apply(binding(2), allow).unwrap_err();
                 assert_eq!(gate.latest, before.latest);
                 assert_eq!(gate.generation, before.generation);
                 assert_eq!(gate.current, before.current);
@@ -1710,8 +1714,8 @@ mod tests {
             gate.apply(disabled, true).unwrap(),
             FileDropBindingOutcome::Disabled
         );
-        let replay = gate.apply(gate.latest.clone().unwrap(), true).unwrap();
-        let FileDropBindingOutcome::ExactRetry(reply) = replay else {
+        let outcome = gate.apply(gate.latest.clone().unwrap(), true).unwrap();
+        let FileDropBindingOutcome::ExactRetry(reply) = outcome else {
             panic!("disable retry did not replay its named reply")
         };
         assert_eq!(reply.grant_generation, FileDropGrantGeneration::ZERO);
@@ -1897,8 +1901,8 @@ mod tests {
 
         let mut unknown = binding(1).payload().unwrap();
         unknown.push((99, Value::Unsigned(1)));
-        assert!(FileDropBinding::decode(0, &Value::Map(unknown)).is_err());
-        assert!(FileTransferAccepted::decode(&[0xa1, 0x18, 0x00, 0x01]).is_err());
+        FileDropBinding::decode(0, &Value::Map(unknown)).unwrap_err();
+        FileTransferAccepted::decode(&[0xa1, 0x18, 0x00, 0x01]).unwrap_err();
     }
 
     #[test]
@@ -1936,7 +1940,7 @@ mod tests {
         ));
         let mut changed = binding(1);
         changed.maximum_file_bytes += 1;
-        assert!(first.apply(changed, true).is_err());
+        first.apply(changed, true).unwrap_err();
         assert!(second.current().is_some());
     }
 
@@ -1956,8 +1960,8 @@ mod tests {
         ] {
             assert!(validate_suggested_name(name).is_err(), "accepted {name:?}");
         }
-        assert!(validate_suggested_name("-option").is_ok());
-        assert!(validate_suggested_name("résumé.txt").is_ok());
+        validate_suggested_name("-option").unwrap();
+        validate_suggested_name("résumé.txt").unwrap();
     }
 
     #[test]
@@ -1970,7 +1974,7 @@ mod tests {
                     state ^= state << 13;
                     state ^= state >> 7;
                     state ^= state << 17;
-                    *byte = state as u8;
+                    *byte = state.to_le_bytes()[0];
                 }
                 let _ = FileTransferOpen::decode(&bytes);
                 let _ = FileTransferAccepted::decode(&bytes);
@@ -2054,11 +2058,9 @@ mod tests {
             FileResultCode::IoError,
         ] {
             // A failure result also carries no final name, so both guards must hold.
-            assert!(
-                committed(Some("/home/u/report.txt"), "", code)
-                    .encode()
-                    .is_err()
-            );
+            committed(Some("/home/u/report.txt"), "", code)
+                .encode()
+                .unwrap_err();
         }
     }
 
@@ -2091,11 +2093,9 @@ mod tests {
             );
         }
         let long = format!("/{}/report.txt", "d".repeat(MAX_COMMITTED_PATH_BYTES));
-        assert!(
-            committed(Some(&long), "report.txt", FileResultCode::Committed)
-                .encode()
-                .is_err()
-        );
+        committed(Some(&long), "report.txt", FileResultCode::Committed)
+            .encode()
+            .unwrap_err();
     }
 
     #[test]
@@ -2106,7 +2106,7 @@ mod tests {
             FileResultCode::Committed,
         );
         let body = good.encode().unwrap();
-        assert!(FileResult::decode(&body).is_ok());
+        FileResult::decode(&body).unwrap();
 
         // Hand-rolled records that `encode` would never produce still have to be rejected.
         let relative = encode_raw(vec![
@@ -2118,7 +2118,7 @@ mod tests {
             (5, Value::Text("home/u/report.txt".into())),
         ])
         .unwrap();
-        assert!(FileResult::decode(&relative).is_err());
+        FileResult::decode(&relative).unwrap_err();
 
         let wrong_type = encode_raw(vec![
             (0, Value::Unsigned(4)),
@@ -2129,7 +2129,7 @@ mod tests {
             (5, Value::Bytes(b"/home/u/report.txt".to_vec())),
         ])
         .unwrap();
-        assert!(FileResult::decode(&wrong_type).is_err());
+        FileResult::decode(&wrong_type).unwrap_err();
 
         let unknown_key = encode_raw(vec![
             (0, Value::Unsigned(4)),
@@ -2140,6 +2140,6 @@ mod tests {
             (6, Value::Text("/home/u/report.txt".into())),
         ])
         .unwrap();
-        assert!(FileResult::decode(&unknown_key).is_err());
+        FileResult::decode(&unknown_key).unwrap_err();
     }
 }

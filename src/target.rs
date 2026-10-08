@@ -45,8 +45,8 @@ impl OutputDescriptor {
     pub fn encode(&self) -> Value {
         Value::Map(vec![
             (0, Value::Unsigned(self.output_id)),
-            (1, signed(i64::from(self.origin_x))),
-            (2, signed(i64::from(self.origin_y))),
+            (1, Value::from(i64::from(self.origin_x))),
+            (2, Value::from(i64::from(self.origin_y))),
             (3, Value::Unsigned(u64::from(self.width))),
             (4, Value::Unsigned(u64::from(self.height))),
             (5, Value::Unsigned(u64::from(self.scale_numerator))),
@@ -118,8 +118,8 @@ impl DesktopTarget {
 
     pub fn encode(&self) -> PayloadMap {
         vec![
-            (0, signed(i64::from(self.origin_x))),
-            (1, signed(i64::from(self.origin_y))),
+            (0, Value::from(i64::from(self.origin_x))),
+            (1, Value::from(i64::from(self.origin_y))),
             (2, Value::Unsigned(u64::from(self.width))),
             (3, Value::Unsigned(u64::from(self.height))),
             (
@@ -343,14 +343,6 @@ fn required_i32(map: &StrictMap<'_>, key: u64) -> Result<i32, MessageError> {
         .ok_or_else(|| invalid_value("desktop target", key, "must fit in a signed 32-bit integer"))
 }
 
-fn signed(value: i64) -> Value {
-    if value >= 0 {
-        Value::Unsigned(value as u64)
-    } else {
-        Value::Negative(value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,11 +439,11 @@ mod tests {
 
         let mut empty = single();
         empty.outputs[0].width = 0;
-        assert!(DesktopTarget::decode(&empty.encode()).is_err());
+        DesktopTarget::decode(&empty.encode()).unwrap_err();
 
         let mut zero_scale = single();
         zero_scale.outputs[0].scale_denominator = 0;
-        assert!(DesktopTarget::decode(&zero_scale.encode()).is_err());
+        DesktopTarget::decode(&zero_scale.encode()).unwrap_err();
     }
 
     #[test]
@@ -460,7 +452,7 @@ mod tests {
             outputs: Vec::new(),
             ..single()
         };
-        assert!(headless.validate().is_ok());
+        headless.validate().unwrap();
     }
 
     #[test]
@@ -560,7 +552,7 @@ mod tests {
         let mut state = DesktopTargetState::new(single()).unwrap();
         let mut broken = dual();
         broken.outputs[1].primary = true;
-        assert!(state.offer(broken).is_err());
+        state.offer(broken).unwrap_err();
         assert_eq!(state.current(), &single());
         assert_eq!(state.generation(), TargetGeneration::ONE);
     }
@@ -576,6 +568,6 @@ mod tests {
     fn decoding_rejects_unknown_keys() {
         let mut map = single().encode();
         map.push((7, Value::Unsigned(0)));
-        assert!(DesktopTarget::decode(&map).is_err());
+        DesktopTarget::decode(&map).unwrap_err();
     }
 }

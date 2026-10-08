@@ -314,6 +314,10 @@ struct OwnerB {
 }
 
 #[derive(Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "model state mirrors independent protocol flags"
+)]
 struct Model {
     // Owner A: the real machines, paired presenter-side and producer-side.
     lease: Rc<LeaseMachine>,
@@ -491,7 +495,7 @@ impl Model {
         }
     }
 
-    fn disabled_binding(&self, epoch: u64) -> InputBinding {
+    fn disabled_binding(epoch: u64) -> InputBinding {
         InputBinding {
             producer_epoch: InputEpoch::new(epoch),
             context_id: 0,
@@ -503,7 +507,7 @@ impl Model {
         }
     }
 
-    fn key_event(&self, tuple: InputTuple, pressed: bool) -> InputEvent {
+    fn key_event(tuple: InputTuple, pressed: bool) -> InputEvent {
         InputEvent::Key {
             binding: tuple,
             usage: 0x04,
@@ -592,6 +596,10 @@ impl Model {
     /// any one state. Keeping this predicate conservative preserves exhaustive exploration: a
     /// `true` may still be rejected by `fire`, while `false` means the branch's leading guard is
     /// known to reject it.
+    #[expect(
+        clippy::match_same_arms,
+        reason = "one arm per transition keeps the guard table readable"
+    )]
     fn may_fire(&self, kind: T, report: &Report) -> bool {
         let lease_state = self.lease.state();
         let resume_generation = self.lease.resume_generation().get();
@@ -873,12 +881,12 @@ impl Model {
                             }
                         }
                         _ => {
-                            if outcome != Ok(LeaseState::Suspended) {
+                            if outcome == Ok(LeaseState::Suspended) {
+                                report.cases.insert(Case::ChargedWhileSuspended);
+                            } else {
                                 violations.push(format!(
                                     "an unclean post-admission loss did not suspend: {outcome:?}"
                                 ));
-                            } else {
-                                report.cases.insert(Case::ChargedWhileSuspended);
                             }
                         }
                     }
@@ -1013,11 +1021,11 @@ impl Model {
                     }
                     next.charged = false;
                     next.teardown_transports();
-                    if next.other_probe() != probe {
+                    if next.other_probe() == probe {
+                        report.cases.insert(Case::TwoOwnersIsolated);
+                    } else {
                         violations
                             .push("one owner's teardown disturbed the other's state".to_owned());
-                    } else {
-                        report.cases.insert(Case::TwoOwnersIsolated);
                     }
                     Some(())
                 }
@@ -1325,7 +1333,7 @@ impl Model {
                     if self.last_binding.is_none() || self.epoch >= MAX_EPOCH {
                         return None;
                     }
-                    let binding = next.disabled_binding(self.epoch + 1);
+                    let binding = Model::disabled_binding(self.epoch + 1);
                     match next.grant.apply(&binding, &next.eligibility(), next.now()) {
                         Ok(GrantOutcome::Disabled) => {}
                         other => violations.push(format!("a disable was not disabled: {other:?}")),
@@ -1372,7 +1380,8 @@ impl Model {
                             // eligibility rule, not a retry failure.
                         }
                         other => {
-                            violations.push(format!("an exact retry was not recognised: {other:?}"))
+                            violations
+                                .push(format!("an exact retry was not recognised: {other:?}"));
                         }
                     }
                     Some(())
@@ -1485,7 +1494,7 @@ impl Model {
                         return None;
                     }
                     let tuple = next.current_tuple();
-                    let event = next.key_event(tuple, pressed);
+                    let event = Model::key_event(tuple, pressed);
                     let surface_generation = SurfaceGeneration::new(next.surface_generation);
                     match next.gate.authorize(event, surface_generation, next.now()) {
                         Ok(()) => {
@@ -1528,7 +1537,7 @@ impl Model {
                 }
                 T::EventOldTuple => {
                     let tuple = self.retired_tuple?;
-                    let event = next.key_event(tuple, true);
+                    let event = Model::key_event(tuple, true);
                     let surface_generation = SurfaceGeneration::new(next.surface_generation);
                     if next
                         .gate
@@ -1546,7 +1555,7 @@ impl Model {
                     let mut tuple = next.current_tuple();
                     tuple.surface_generation =
                         SurfaceGeneration::new(if self.surface_generation == 1 { 2 } else { 1 });
-                    let event = next.key_event(tuple, true);
+                    let event = Model::key_event(tuple, true);
                     if next
                         .gate
                         .authorize(
@@ -1601,7 +1610,7 @@ impl Model {
                     ) {
                         Ok(BindingOutcome::Enabled(_)) => next.other.bound = true,
                         other => {
-                            violations.push(format!("the other owner's binding failed: {other:?}"))
+                            violations.push(format!("the other owner's binding failed: {other:?}"));
                         }
                     }
                     Some(())
@@ -1626,7 +1635,7 @@ impl Model {
                     // whose IDs are identical. It may pass only when the other owner
                     // independently granted that exact tuple — anything else is a leak.
                     let tuple = self.current_tuple();
-                    let event = next.key_event(tuple, true);
+                    let event = Model::key_event(tuple, true);
                     let outcome = next.other.gate.authorize(
                         event,
                         SurfaceGeneration::new(next.surface_generation),
@@ -1705,7 +1714,7 @@ fn check_invariants(state: &Model, via: T, report: &mut Report) {
     // exception is the watchdog race: time passes between the deadline and the revocation,
     // and the watchdog transition is what unsticks the held set.
     if state.held {
-        let event = state.key_event(state.current_tuple(), false);
+        let event = Model::key_event(state.current_tuple(), false);
         if state
             .gate
             .authorize(
