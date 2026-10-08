@@ -1,4 +1,4 @@
-use std::io;
+use std::{fmt, io};
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use crate::trace::{self, TraceComponent, TraceDirection, TraceGuard, TraceHop, TraceOutcome};
@@ -391,6 +391,20 @@ pub struct ConnectionWriter {
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
+impl fmt::Debug for ConnectionWriter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never lock here: a blocked transport write holds the state mutex.
+        formatter
+            .debug_struct("ConnectionWriter")
+            .field(
+                "shutdown_requested",
+                &self.shutdown_requested.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(feature = "native", feature = "native-transport"))]
 enum NativeShutdown {
     Tcp(TcpStream),
     #[cfg(unix)]
@@ -656,13 +670,39 @@ pub struct ConnectionReader {
     receive_body_limit: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(feature = "native", feature = "native-transport"))]
+impl fmt::Debug for ConnectionReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectionReader")
+            .field("receive_sequence", &self.receive_sequence)
+            .field("receive_body_limit", &self.receive_body_limit)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Debug output reports the body length, never body bytes that may carry tags or media.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BorrowedRecord<'a> {
     pub record_type: u16,
     pub flags: u16,
     pub object_id: u64,
     pub sequence: u64,
     pub body: &'a [u8],
+}
+
+impl fmt::Debug for BorrowedRecord<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_record(
+            formatter,
+            "BorrowedRecord",
+            self.record_type,
+            self.flags,
+            self.object_id,
+            self.sequence,
+            self.body.len(),
+        )
+    }
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -751,6 +791,7 @@ impl ConnectionReader {
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
+#[derive(Debug)]
 pub struct Connection {
     reader: Option<ConnectionReader>,
     writer: ConnectionWriter,
@@ -1156,12 +1197,46 @@ fn flush_writer(io: &mut WriterIo) -> io::Result<()> {
     }
 }
 
+/// Debug output reports the body length, never body bytes that may carry tags or media.
 pub struct Record {
     pub record_type: u16,
     pub flags: u16,
     pub object_id: u64,
     pub sequence: u64,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for Record {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_record(
+            formatter,
+            "Record",
+            self.record_type,
+            self.flags,
+            self.object_id,
+            self.sequence,
+            self.body.len(),
+        )
+    }
+}
+
+fn debug_record(
+    formatter: &mut fmt::Formatter<'_>,
+    name: &str,
+    record_type: u16,
+    flags: u16,
+    object_id: u64,
+    sequence: u64,
+    body_len: usize,
+) -> fmt::Result {
+    formatter
+        .debug_struct(name)
+        .field("record_type", &format_args!("{record_type:#06x}"))
+        .field("flags", &flags)
+        .field("object_id", &object_id)
+        .field("sequence", &sequence)
+        .field("body_len", &body_len)
+        .finish()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::anchor::AnchorKey;
+use crate::{anchor::AnchorKey, file_drop::FileTransferOpen, messages::ChannelOpen};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -250,70 +250,47 @@ pub fn lane_tag(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn channel_tag(
-    session_channel_key: &[u8; 32],
-    session_id: u64,
-    context_id: u64,
-    surface_id: u64,
-    track_id: u64,
-    channel_generation: u64,
-    track_kind: u32,
-    lane: u32,
-    client_nonce: &[u8; 16],
-) -> [u8; 16] {
+/// Computes the `CHANNEL_OPEN` tag over every binding field of `open` except the tag itself.
+pub(crate) fn channel_tag(session_channel_key: &[u8; 32], open: &ChannelOpen) -> [u8; 16] {
     truncate_tag(hmac_parts(
         session_channel_key,
         &[
             b"VIVID-CHANNEL-1",
-            &session_id.to_be_bytes(),
-            &context_id.to_be_bytes(),
-            &surface_id.to_be_bytes(),
-            &track_id.to_be_bytes(),
-            &channel_generation.to_be_bytes(),
-            &track_kind.to_be_bytes(),
-            &lane.to_be_bytes(),
-            client_nonce,
+            &open.session_id.to_be_bytes(),
+            &open.context_id.to_be_bytes(),
+            &open.surface_id.to_be_bytes(),
+            &open.track_id.to_be_bytes(),
+            &open.channel_generation.to_be_bytes(),
+            &(open.track_kind as u32).to_be_bytes(),
+            &(open.lane as u32).to_be_bytes(),
+            &open.client_nonce,
         ],
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn file_transfer_tag(
+/// Computes the `FILE_TRANSFER_OPEN` tag over every binding field of `open` except the tag.
+pub(crate) fn file_transfer_tag(
     session_channel_key: &[u8; 32],
-    session_id: u64,
-    context_id: u64,
-    surface_id: u64,
-    producer_epoch: u64,
-    grant_generation: u64,
-    surface_generation: u64,
-    drop_id: u64,
-    transfer_id: u64,
-    transfer_generation: u64,
-    resume_offset: u64,
-    maximum_record_body: u32,
-    maximum_body_bytes: u64,
-    maximum_records: u64,
-    client_nonce: &[u8; 16],
+    open: &FileTransferOpen,
 ) -> [u8; 16] {
     truncate_tag(hmac_parts(
         session_channel_key,
         &[
             b"VIVID-FILE-TRANSFER-1",
-            &session_id.to_be_bytes(),
-            &context_id.to_be_bytes(),
-            &surface_id.to_be_bytes(),
-            &producer_epoch.to_be_bytes(),
-            &grant_generation.to_be_bytes(),
-            &surface_generation.to_be_bytes(),
-            &drop_id.to_be_bytes(),
-            &transfer_id.to_be_bytes(),
-            &transfer_generation.to_be_bytes(),
-            &resume_offset.to_be_bytes(),
-            &maximum_record_body.to_be_bytes(),
-            &maximum_body_bytes.to_be_bytes(),
-            &maximum_records.to_be_bytes(),
-            client_nonce,
+            &open.session_id.to_be_bytes(),
+            &open.context_id.to_be_bytes(),
+            &open.surface_id.to_be_bytes(),
+            &open.producer_epoch.get().to_be_bytes(),
+            &open.grant_generation.get().to_be_bytes(),
+            &open.surface_generation.get().to_be_bytes(),
+            &open.drop_id.to_be_bytes(),
+            &open.transfer_id.to_be_bytes(),
+            &open.transfer_generation.get().to_be_bytes(),
+            &open.resume_offset.to_be_bytes(),
+            &open.maximum_record_body.to_be_bytes(),
+            &open.maximum_body_bytes.to_be_bytes(),
+            &open.maximum_records.to_be_bytes(),
+            &open.client_nonce,
         ],
     ))
 }
@@ -363,6 +340,12 @@ fn unhex(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        messages::{LaneClass, TrackKind},
+        revision::{
+            FileDropEpoch, FileDropGrantGeneration, FileTransferGeneration, SurfaceGeneration,
+        },
+    };
 
     #[test]
     fn secret_hex_is_exact_and_redacted() {
@@ -388,23 +371,27 @@ mod tests {
     fn file_transfer_tag_scopes_every_binding_generation() {
         let key = [0x5a; 32];
         let tag = |producer_epoch, grant_generation, surface_generation| {
-            file_transfer_tag(
-                &key,
-                1,
-                2,
-                3,
-                producer_epoch,
-                grant_generation,
-                surface_generation,
-                4,
-                5,
-                1,
-                0,
-                4096,
-                8192,
-                2,
-                &[6; 16],
-            )
+            let mut open = FileTransferOpen {
+                session_id: 1,
+                context_id: 2,
+                surface_id: 3,
+                producer_epoch: FileDropEpoch::new(producer_epoch),
+                grant_generation: FileDropGrantGeneration::new(grant_generation),
+                surface_generation: SurfaceGeneration::new(surface_generation),
+                drop_id: 4,
+                transfer_id: 5,
+                transfer_generation: FileTransferGeneration::new(1),
+                resume_offset: 0,
+                maximum_record_body: 4096,
+                maximum_body_bytes: 8192,
+                maximum_records: 2,
+                client_nonce: [6; 16],
+                authentication_tag: [0; 16],
+            };
+            open.sign(&key);
+            assert!(open.verify(&key));
+            assert!(!open.verify(&[0x5b; 32]));
+            open.authentication_tag
         };
         let baseline = tag(7, 8, 9);
         assert_ne!(baseline, tag(10, 8, 9));
@@ -446,10 +433,25 @@ mod tests {
             lane_tag(keys.channel_key(), 4, 1, 1, &[8; 16]),
             from_hex("af23a5f078c30ace874f32f79f097a0b")
         );
+        let mut open = ChannelOpen {
+            session_id: 4,
+            context_id: 5,
+            surface_id: 6,
+            track_id: 7,
+            channel_generation: 1,
+            track_kind: TrackKind::Video,
+            lane: LaneClass::Realtime,
+            client_nonce: [9; 16],
+            authentication_tag: [0; 16],
+        };
+        open.sign(keys.channel_key());
         assert_eq!(
-            channel_tag(keys.channel_key(), 4, 5, 6, 7, 1, 1, 2, &[9; 16]),
+            open.authentication_tag,
             from_hex("076d75b4ec9c6d04a3c3ac29bbd513ef")
         );
+        assert!(open.verify(keys.channel_key()));
+        open.track_id = 8;
+        assert!(!open.verify(keys.channel_key()));
     }
 
     fn from_hex<const N: usize>(value: &str) -> [u8; N] {

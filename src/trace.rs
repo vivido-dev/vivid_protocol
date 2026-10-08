@@ -4,6 +4,7 @@
 //! transport metadata to a bounded queue; formatting and file or callback delivery happen on a
 //! separate worker so diagnostics cannot delay the data plane.
 
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -222,6 +223,17 @@ pub struct TraceEmitter {
     dropped: Arc<AtomicU64>,
 }
 
+impl fmt::Debug for TraceEmitter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TraceEmitter")
+            .field("component", &self.context.component)
+            .field("hop", &self.context.hop)
+            .field("dropped", &self.dropped.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 impl TraceEmitter {
     #[allow(clippy::too_many_arguments)]
     pub fn emit(
@@ -257,7 +269,7 @@ impl TraceEmitter {
             Err(TrySendError::Full(_)) => {
                 let _ = self
                     .dropped
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                         Some(value.saturating_add(1))
                     });
             }
@@ -318,6 +330,16 @@ pub struct TraceGuard {
     emitter: TraceEmitter,
     join: Option<JoinHandle<()>>,
     callback_shutdown: Arc<AtomicBool>,
+}
+
+impl fmt::Debug for TraceGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TraceGuard")
+            .field("emitter", &self.emitter)
+            .field("worker_running", &self.join.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TraceGuard {

@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::revision::{ChannelGeneration, GrantGeneration, InputEpoch, SurfaceGeneration};
+use crate::revision::ChannelGeneration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentityError(&'static str);
@@ -18,66 +18,70 @@ impl std::error::Error for IdentityError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PresenterInstanceId(pub [u8; 16]);
 
+/// A live session on one presenter instance.
+///
+/// Fields are crate-private so code outside this crate builds every identity in this module
+/// through the checked, nonzero constructors; a struct literal cannot smuggle in a zero ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionIdentity {
-    pub presenter: PresenterInstanceId,
-    pub session_id: u64,
+    pub(crate) presenter: PresenterInstanceId,
+    pub(crate) session_id: u64,
 }
 
+/// A context owned by one session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContextIdentity {
-    pub session: SessionIdentity,
-    pub context_id: u64,
+    pub(crate) session: SessionIdentity,
+    pub(crate) context_id: u64,
 }
 
+/// A surface owned by one context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SurfaceIdentity {
-    pub context: ContextIdentity,
-    pub surface_id: u64,
+    pub(crate) context: ContextIdentity,
+    pub(crate) surface_id: u64,
 }
 
+/// A track owned by one surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TrackIdentity {
-    pub surface: SurfaceIdentity,
-    pub track_id: u64,
+    pub(crate) surface: SurfaceIdentity,
+    pub(crate) track_id: u64,
 }
 
+/// One nonzero channel generation of a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChannelIdentity {
-    pub track: TrackIdentity,
-    pub generation: ChannelGeneration,
+    pub(crate) track: TrackIdentity,
+    pub(crate) generation: ChannelGeneration,
 }
 
+/// A scene node owned by one context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeIdentity {
-    pub context: ContextIdentity,
-    pub node_id: u64,
+    pub(crate) context: ContextIdentity,
+    pub(crate) node_id: u64,
 }
 
+/// A scene transaction owned by one context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransactionIdentity {
-    pub context: ContextIdentity,
-    pub transaction_id: u64,
+    pub(crate) context: ContextIdentity,
+    pub(crate) transaction_id: u64,
 }
 
+/// A terminal anchor owned by one context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AnchorIdentity {
-    pub context: ContextIdentity,
-    pub anchor_id: u64,
+    pub(crate) context: ContextIdentity,
+    pub(crate) anchor_id: u64,
 }
 
+/// A lease owned by one context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LeaseIdentity {
-    pub context: ContextIdentity,
-    pub lease_id: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct InputGrantIdentity {
-    pub surface: SurfaceIdentity,
-    pub producer_epoch: InputEpoch,
-    pub surface_generation: SurfaceGeneration,
-    pub grant_generation: GrantGeneration,
+    pub(crate) context: ContextIdentity,
+    pub(crate) lease_id: u64,
 }
 
 impl SessionIdentity {
@@ -86,6 +90,14 @@ impl SessionIdentity {
             presenter,
             session_id: nonzero("session ID", session_id)?,
         })
+    }
+
+    pub const fn presenter(&self) -> PresenterInstanceId {
+        self.presenter
+    }
+
+    pub const fn session_id(&self) -> u64 {
+        self.session_id
     }
 
     pub fn context(self, context_id: u64) -> Result<ContextIdentity, IdentityError> {
@@ -97,6 +109,14 @@ impl SessionIdentity {
 }
 
 impl ContextIdentity {
+    pub const fn session(&self) -> SessionIdentity {
+        self.session
+    }
+
+    pub const fn context_id(&self) -> u64 {
+        self.context_id
+    }
+
     pub fn surface(self, surface_id: u64) -> Result<SurfaceIdentity, IdentityError> {
         Ok(SurfaceIdentity {
             context: self,
@@ -134,6 +154,14 @@ impl ContextIdentity {
 }
 
 impl SurfaceIdentity {
+    pub const fn context(&self) -> ContextIdentity {
+        self.context
+    }
+
+    pub const fn surface_id(&self) -> u64 {
+        self.surface_id
+    }
+
     pub fn track(self, track_id: u64) -> Result<TrackIdentity, IdentityError> {
         Ok(TrackIdentity {
             surface: self,
@@ -143,6 +171,14 @@ impl SurfaceIdentity {
 }
 
 impl TrackIdentity {
+    pub const fn surface(&self) -> SurfaceIdentity {
+        self.surface
+    }
+
+    pub const fn track_id(&self) -> u64 {
+        self.track_id
+    }
+
     pub fn channel(self, generation: ChannelGeneration) -> Result<ChannelIdentity, IdentityError> {
         generation
             .require_nonzero()
@@ -152,6 +188,39 @@ impl TrackIdentity {
             generation,
         })
     }
+}
+
+impl ChannelIdentity {
+    pub const fn track(&self) -> TrackIdentity {
+        self.track
+    }
+
+    pub const fn generation(&self) -> ChannelGeneration {
+        self.generation
+    }
+}
+
+macro_rules! context_child_accessors {
+    ($($name:ident => $id:ident),* $(,)?) => {
+        $(
+            impl $name {
+                pub const fn context(&self) -> ContextIdentity {
+                    self.context
+                }
+
+                pub const fn $id(&self) -> u64 {
+                    self.$id
+                }
+            }
+        )*
+    };
+}
+
+context_child_accessors! {
+    NodeIdentity => node_id,
+    TransactionIdentity => transaction_id,
+    AnchorIdentity => anchor_id,
+    LeaseIdentity => lease_id,
 }
 
 fn nonzero(label: &'static str, value: u64) -> Result<u64, IdentityError> {

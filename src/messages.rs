@@ -1148,6 +1148,21 @@ impl Drop for ChannelOpen {
 }
 
 impl ChannelOpen {
+    /// Sets `authentication_tag` from `session_channel_key` and every other field.
+    ///
+    /// Sign after the binding fields are final; any later field change invalidates the tag.
+    pub fn sign(&mut self, session_channel_key: &[u8; 32]) {
+        self.authentication_tag = auth::channel_tag(session_channel_key, self);
+    }
+
+    /// Checks `authentication_tag` against `session_channel_key` in constant time.
+    pub fn verify(&self, session_channel_key: &[u8; 32]) -> bool {
+        auth::verify_tag(
+            &auth::channel_tag(session_channel_key, self),
+            &self.authentication_tag,
+        )
+    }
+
     pub fn payload(&self) -> PayloadMap {
         vec![
             (0, Value::Unsigned(self.session_id)),
@@ -1202,9 +1217,20 @@ pub fn validate_header_object(header_object_id: u64, payload_id: u64) -> Result<
     }
 }
 
+/// Debug output reports the schema and entry count, never decoded values that may carry proofs.
 pub struct StrictMap<'a> {
     schema: &'static str,
     entries: &'a [(u64, Value)],
+}
+
+impl fmt::Debug for StrictMap<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StrictMap")
+            .field("schema", &self.schema)
+            .field("entries", &self.entries.len())
+            .finish()
+    }
 }
 
 impl<'a> StrictMap<'a> {

@@ -1,4 +1,4 @@
-use std::{borrow::Cow, io};
+use std::{borrow::Cow, fmt, io};
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 use std::io::Cursor;
@@ -197,6 +197,7 @@ impl MediaSequence {
     }
 }
 
+/// Debug output reports the payload length, never the encoded media bytes.
 pub struct VideoPacket<'a> {
     pub epoch: u32,
     pub packet_id: u64,
@@ -207,6 +208,7 @@ pub struct VideoPacket<'a> {
     pub data: &'a [u8],
 }
 
+/// Debug output reports the payload length, never the encoded media bytes.
 pub struct AudioPacket<'a> {
     pub epoch: u32,
     pub packet_id: u64,
@@ -216,6 +218,37 @@ pub struct AudioPacket<'a> {
     pub trim_start_samples: u32,
     pub trim_end_samples: u32,
     pub data: &'a [u8],
+}
+
+impl fmt::Debug for VideoPacket<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VideoPacket")
+            .field("epoch", &self.epoch)
+            .field("packet_id", &self.packet_id)
+            .field("pts_us", &self.pts_us)
+            .field("dts_us", &self.dts_us)
+            .field("duration_us", &self.duration_us)
+            .field("key", &self.key)
+            .field("data_len", &self.data.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for AudioPacket<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AudioPacket")
+            .field("epoch", &self.epoch)
+            .field("packet_id", &self.packet_id)
+            .field("pts_us", &self.pts_us)
+            .field("dts_us", &self.dts_us)
+            .field("duration_us", &self.duration_us)
+            .field("trim_start_samples", &self.trim_start_samples)
+            .field("trim_end_samples", &self.trim_end_samples)
+            .field("data_len", &self.data.len())
+            .finish()
+    }
 }
 
 pub fn audio_packet_prefix(packet: &AudioPacket<'_>) -> io::Result<[u8; AUDIO_PACKET_PREFIX_SIZE]> {

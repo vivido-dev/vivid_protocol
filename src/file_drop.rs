@@ -3,7 +3,7 @@
 use std::io;
 
 use crate::{
-    HARD_MAX_RECORD_BODY,
+    HARD_MAX_RECORD_BODY, auth,
     cbor::{self, Value},
     messages::{
         MessageError, PayloadMap, StrictMap, invalid_value, require_nonzero, validate_header_object,
@@ -852,6 +852,21 @@ pub struct FileTransferOpen {
 }
 
 impl FileTransferOpen {
+    /// Sets `authentication_tag` from `session_channel_key` and every other field.
+    ///
+    /// Sign after the binding fields are final; any later field change invalidates the tag.
+    pub fn sign(&mut self, session_channel_key: &[u8; 32]) {
+        self.authentication_tag = auth::file_transfer_tag(session_channel_key, self);
+    }
+
+    /// Checks `authentication_tag` against `session_channel_key` in constant time.
+    pub fn verify(&self, session_channel_key: &[u8; 32]) -> bool {
+        auth::verify_tag(
+            &auth::file_transfer_tag(session_channel_key, self),
+            &self.authentication_tag,
+        )
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
         self.validate()?;
         encode_raw(vec![
