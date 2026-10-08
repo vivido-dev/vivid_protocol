@@ -142,10 +142,10 @@ impl ChannelOpenState {
     }
 
     pub fn transport_lost(&mut self, generation: ChannelGeneration) {
-        if let Some(accepted) = &mut self.accepted {
-            if accepted.generation == generation {
-                accepted.transport_live = false;
-            }
+        if let Some(accepted) = &mut self.accepted
+            && accepted.generation == generation
+        {
+            accepted.transport_live = false;
         }
     }
 

@@ -257,7 +257,7 @@ impl LeaseMachine {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "one argument per HELLO binding field; open guideline item M-INIT-CASCADED"
+        reason = "one argument per HELLO binding field; see docs/RUST-GUIDELINES-REVIEW.md"
     )]
     pub fn begin_activation(
         &mut self,
@@ -394,7 +394,7 @@ impl LeaseMachine {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "one argument per HELLO binding field; open guideline item M-INIT-CASCADED"
+        reason = "one argument per HELLO binding field; see docs/RUST-GUIDELINES-REVIEW.md"
     )]
     pub fn begin_resume(
         &mut self,

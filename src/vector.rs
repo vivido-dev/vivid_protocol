@@ -1156,10 +1156,10 @@ impl Canvas {
                     if *id == 0 || !hits.insert(*id) {
                         return Err(InvalidScene("hit region IDs must be nonzero and unique"));
                     }
-                    if let HitRole::Resize(edges) = role {
-                        if *edges == 0 || *edges > 15 {
-                            return Err(InvalidScene("invalid resize edges"));
-                        }
+                    if let HitRole::Resize(edges) = role
+                        && (*edges == 0 || *edges > 15)
+                    {
+                        return Err(InvalidScene("invalid resize edges"));
                     }
                     Some(path)
                 }

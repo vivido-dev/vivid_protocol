@@ -588,13 +588,12 @@ impl Hello {
             }
         }
         for profile in &self.optional_profiles {
-            if let Some(prerequisites) = registry::prerequisites(profile) {
-                if prerequisites
+            if let Some(prerequisites) = registry::prerequisites(profile)
+                && prerequisites
                     .iter()
                     .any(|prerequisite| !offered.contains(prerequisite))
-                {
-                    return Err(invalid("HELLO", 3, "is not prerequisite-closed"));
-                }
+            {
+                return Err(invalid("HELLO", 3, "is not prerequisite-closed"));
             }
         }
         if self.maximum_control_body == 0 || self.maximum_control_body > HARD_MAX_RECORD_BODY {

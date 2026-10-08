@@ -538,10 +538,10 @@ impl Windows {
         {
             return Err(InvalidScene("window limit exceeded"));
         }
-        if let Some(parent) = options.parent {
-            if parent.context.session != id.context.session || !self.entries.contains_key(&parent) {
-                return Err(InvalidScene("invalid parent owner or lifecycle"));
-            }
+        if let Some(parent) = options.parent
+            && (parent.context.session != id.context.session || !self.entries.contains_key(&parent))
+        {
+            return Err(InvalidScene("invalid parent owner or lifecycle"));
         }
         if options.visible
             && options.mode == WindowMode::Modal
@@ -1082,13 +1082,13 @@ impl Windows {
             clicks,
             pressure,
         } = report;
-        if let Some((button_id, down)) = button {
-            if self.swallowed_buttons.contains(&button_id) {
-                if !down {
-                    self.swallowed_buttons.remove(&button_id);
-                }
-                return true;
+        if let Some((button_id, down)) = button
+            && self.swallowed_buttons.contains(&button_id)
+        {
+            if !down {
+                self.swallowed_buttons.remove(&button_id);
             }
+            return true;
         }
         if let Some(capture) = self.capture {
             if !self.eligible(capture.window) {
@@ -1124,14 +1124,15 @@ impl Windows {
             .filter(|w| w.options.mode == WindowMode::Popup && self.eligible(w.identity))
             .last()
             .map(|w| (w.identity, w.options.bounds));
-        if let Some((id, bounds)) = popup {
-            if button.is_some_and(|(_, down)| down) && !bounds.contains(position) {
-                if let Some((button_id, _)) = button {
-                    self.swallowed_buttons.insert(button_id);
-                }
-                self.close(id, DismissReason::OutsidePress);
-                return true;
+        if let Some((id, bounds)) = popup
+            && button.is_some_and(|(_, down)| down)
+            && !bounds.contains(position)
+        {
+            if let Some((button_id, _)) = button {
+                self.swallowed_buttons.insert(button_id);
             }
+            self.close(id, DismissReason::OutsidePress);
+            return true;
         }
         let Some((id, local, target)) = self.target_at(position, &hit) else {
             // Leaving every window is a hover transition like any other.

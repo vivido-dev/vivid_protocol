@@ -1174,10 +1174,10 @@ fn nonzero(value: u64, key: u64) -> Result<u64, MessageError> {
 }
 fn strict<'a>(value: &'a Value, keys: &[u64]) -> Result<StrictMap<'a>, MessageError> {
     let map = StrictMap::new(SCHEMA, value, keys)?;
-    if let Value::Map(entries) = value {
-        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-            return Err(bad(0, "keys must be unique and ordered"));
-        }
+    if let Value::Map(entries) = value
+        && entries.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+    {
+        return Err(bad(0, "keys must be unique and ordered"));
     }
     Ok(map)
 }

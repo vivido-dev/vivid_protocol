@@ -446,7 +446,7 @@ pub fn raster_frame_body_with_compression(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "mirrors the RASTER_FRAME delta prefix fields; open guideline item M-INIT-CASCADED"
+    reason = "mirrors the RASTER_FRAME delta prefix fields; see docs/RUST-GUIDELINES-REVIEW.md"
 )]
 pub fn raster_delta_frame_body(
     epoch: u32,

@@ -2,7 +2,7 @@
 name = "vivid_protocol"
 version = "1.5.11"
 edition = "2024"
-rust-version = "1.87.0"
+rust-version = "1.95.0"
 license = "Apache-2.0"
 description = "Wire types, state models, and deterministic codecs for Vivid Protocol 1.5"
 readme = "README.md"
@@ -88,12 +88,12 @@ unused_result_ok = "warn"
 too_long_first_doc_paragraph = "warn"
 # May cause issues with structured logging otherwise.
 literal_string_with_formatting_args = "allow"
-# Deferred to the documentation pass: about 350 fallible public functions still lack the
-# `# Errors` / `# Panics` sections these lints require.
+# Open documentation finding (docs/RUST-GUIDELINES-REVIEW.md): about 350 fallible public
+# functions still lack the `# Errors` / `# Panics` sections these lints require.
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
-# Deferred to the typed-error redesign: codecs report malformed input as a fresh, labelled error
-# and deliberately drop the integer-conversion error that detected it.
+# Open typed-error finding (docs/RUST-GUIDELINES-REVIEW.md): codecs report malformed input as a
+# fresh, labelled error and deliberately drop the integer-conversion error that detected it.
 map_err_ignore = "allow"
 # `Result`-returning APIs are already `#[must_use]`; marking every pure accessor adds noise
 # without catching real misuse in a codec crate.

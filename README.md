@@ -101,7 +101,7 @@ interoperability rules, read the normative multipart
 
 ## Compatibility
 
-This crate implements Vivid Protocol 1.5 and requires Rust 1.87 or newer. Protocol support is
+This crate implements Vivid Protocol 1.5 and requires Rust 1.95 or newer. Protocol support is
 negotiated by coherent named profiles; the preface selects the exact wire version.
 
 ## Contributing

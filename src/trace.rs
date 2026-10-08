@@ -236,7 +236,7 @@ impl fmt::Debug for TraceEmitter {
 impl TraceEmitter {
     #[expect(
         clippy::too_many_arguments,
-        reason = "one argument per trace record column; open guideline item M-INIT-CASCADED"
+        reason = "one argument per trace record column; see docs/RUST-GUIDELINES-REVIEW.md"
     )]
     pub fn emit(
         &self,
@@ -271,7 +271,7 @@ impl TraceEmitter {
             Err(TrySendError::Full(_)) => {
                 let _ = self
                     .dropped
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                         Some(value.saturating_add(1))
                     });
             }
@@ -281,7 +281,7 @@ impl TraceEmitter {
     /// Emit metadata for a control body after extracting only its public request and causation IDs.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one argument per trace record column; open guideline item M-INIT-CASCADED"
+        reason = "one argument per trace record column; see docs/RUST-GUIDELINES-REVIEW.md"
     )]
     pub fn emit_control(
         &self,
