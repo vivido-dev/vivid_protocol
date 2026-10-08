@@ -1,3 +1,26 @@
+//! Binary layouts for media records and validation of codec initialization data.
+//!
+//! Media travels on track channels as fixed big-endian prefixes followed by payload bytes:
+//!
+//! - **Video and audio packets** carry a 48-byte prefix (epoch, packet ID, presentation and decode
+//!   timestamps, duration, and video key-frame flags or audio trim counts) and one encoded access
+//!   unit. [`video_packet_body`] and [`audio_packet_body`] build them;
+//!   [`parse_video_packet`] and [`parse_audio_packet`] borrow them back out of a received body.
+//! - **Raster frames** carry RGBA8 pixels, either a full frame or a delta of overwrite and copy
+//!   operations against an earlier frame, optionally zstd-compressed. [`raster_frame_body`],
+//!   [`raster_delta_frame_body`], [`parse_full_raster_frame`], and [`parse_delta_raster_frame`]
+//!   handle them; [`decode_raster_pixels`] decompresses.
+//!
+//! The `*_body_len` functions compute body sizes with checked arithmetic and reject anything above
+//! [`HARD_MAX_RECORD_BODY`], so a peer's declared dimensions cannot force an oversized allocation.
+//!
+//! The rest of the module validates what a track declares before any decoder sees it: portable
+//! codec/packetization pairs, AAC, Opus, Vorbis, and FLAC headers, and H.264 parameter sets in
+//! both avcC and Annex B form.
+//!
+//! zstd compression needs the `native` feature; wasm32 builds decode with a pure-Rust zstd
+//! implementation instead.
+
 use std::{borrow::Cow, fmt, io};
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
@@ -122,6 +145,12 @@ impl std::fmt::Display for SizeError {
 
 impl std::error::Error for SizeError {}
 
+/// Returns the RGBA8 byte length of a `width` by `height` image.
+///
+/// # Errors
+///
+/// Returns [`SizeError::Empty`] when either dimension is zero, [`SizeError::Overflow`] when the
+/// product overflows, and [`SizeError::TooLarge`] when it does not fit in `u32`.
 pub fn rgba8_pixel_len(width: u32, height: u32) -> Result<u32, SizeError> {
     if width == 0 || height == 0 {
         return Err(SizeError::Empty);
@@ -133,6 +162,12 @@ pub fn rgba8_pixel_len(width: u32, height: u32) -> Result<u32, SizeError> {
         .and_then(|bytes| u32::try_from(bytes).map_err(|_| SizeError::TooLarge))
 }
 
+/// Returns the body length of an uncompressed full-frame raster of `width` by `height`.
+///
+/// # Errors
+///
+/// Returns [`SizeError::Empty`] for a zero dimension, [`SizeError::Overflow`] when the length
+/// overflows, and [`SizeError::TooLarge`] when it exceeds [`HARD_MAX_RECORD_BODY`].
 pub fn rgba8_raw_frame_body_len(width: u32, height: u32) -> Result<u32, SizeError> {
     let bytes = u64::from(rgba8_pixel_len(width, height)?)
         .checked_add((RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE) as u64)
@@ -145,6 +180,13 @@ pub fn rgba8_raw_frame_body_len(width: u32, height: u32) -> Result<u32, SizeErro
     }
 }
 
+/// Returns the largest video packet body for `max_access_unit_bytes` of payload.
+///
+/// # Errors
+///
+/// Returns [`SizeError::Empty`] when `max_access_unit_bytes` is zero, [`SizeError::Overflow`] when
+/// adding the prefix overflows, and [`SizeError::TooLarge`] when the body exceeds
+/// [`HARD_MAX_RECORD_BODY`].
 pub fn video_body_len(max_access_unit_bytes: u32) -> Result<u32, SizeError> {
     if max_access_unit_bytes == 0 {
         return Err(SizeError::Empty);
@@ -159,6 +201,13 @@ pub fn video_body_len(max_access_unit_bytes: u32) -> Result<u32, SizeError> {
     }
 }
 
+/// Returns the largest audio packet body for `max_access_unit_bytes` of payload.
+///
+/// # Errors
+///
+/// Returns [`SizeError::Empty`] when `max_access_unit_bytes` is zero, [`SizeError::Overflow`] when
+/// adding the prefix overflows, and [`SizeError::TooLarge`] when the body exceeds
+/// [`HARD_MAX_RECORD_BODY`].
 pub fn audio_body_len(max_access_unit_bytes: u32) -> Result<u32, SizeError> {
     if max_access_unit_bytes == 0 {
         return Err(SizeError::Empty);
@@ -180,6 +229,12 @@ pub struct MediaSequence {
 }
 
 impl MediaSequence {
+    /// Records a received media ID and epoch, enforcing their ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when `id` is zero or not greater than the last ID, or
+    /// `epoch` is lower than the last epoch.
     pub fn accept(&mut self, id: u64, epoch: u32) -> io::Result<()> {
         if id == 0 || id <= self.last_id {
             return Err(invalid("media ID is zero or not strictly increasing"));
@@ -253,6 +308,11 @@ impl fmt::Debug for AudioPacket<'_> {
     }
 }
 
+/// Builds the 48-byte audio packet prefix for `packet`.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
 pub fn audio_packet_prefix(packet: &AudioPacket<'_>) -> io::Result<[u8; AUDIO_PACKET_PREFIX_SIZE]> {
     packet
         .data
@@ -273,6 +333,11 @@ pub fn audio_packet_prefix(packet: &AudioPacket<'_>) -> io::Result<[u8; AUDIO_PA
     Ok(prefix)
 }
 
+/// Builds a complete audio packet body: prefix and access unit.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
 pub fn audio_packet_body(packet: AudioPacket<'_>) -> io::Result<Vec<u8>> {
     let prefix = audio_packet_prefix(&packet)?;
     let capacity = prefix.len() + packet.data.len();
@@ -282,6 +347,11 @@ pub fn audio_packet_body(packet: AudioPacket<'_>) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Builds the 48-byte video packet prefix for `packet`.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
 pub fn video_packet_prefix(packet: &VideoPacket<'_>) -> io::Result<[u8; VIDEO_PACKET_PREFIX_SIZE]> {
     packet
         .data
@@ -310,6 +380,11 @@ pub fn video_packet_prefix(packet: &VideoPacket<'_>) -> io::Result<[u8; VIDEO_PA
     Ok(prefix)
 }
 
+/// Builds a complete video packet body: prefix and access unit.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
 pub fn video_packet_body(packet: VideoPacket<'_>) -> io::Result<Vec<u8>> {
     let prefix = video_packet_prefix(&packet)?;
     let capacity = prefix.len() + packet.data.len();
@@ -319,6 +394,12 @@ pub fn video_packet_body(packet: VideoPacket<'_>) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Builds the prefix of an uncompressed full-frame raster whose pixels follow separately.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when a dimension is zero, `data_len` is not four bytes
+/// per pixel, or the body would exceed [`HARD_MAX_RECORD_BODY`].
 pub fn raster_full_frame_prefix(
     epoch: u32,
     frame_id: u64,
@@ -387,6 +468,12 @@ fn raster_full_frame_prefix_inner(
     Ok(prefix)
 }
 
+/// Builds an uncompressed full-frame raster body from `rgba`.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when a dimension is zero, `rgba` is not exactly four
+/// bytes per pixel, or the body would exceed [`HARD_MAX_RECORD_BODY`].
 pub fn raster_frame_body(
     epoch: u32,
     frame_id: u64,
@@ -397,6 +484,14 @@ pub fn raster_frame_body(
     raster_frame_body_with_compression(epoch, frame_id, width, height, rgba, false)
 }
 
+/// Builds a full-frame raster body, zstd-compressing the pixels when `compress` is set.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when a dimension is zero, `rgba` is not exactly four
+/// bytes per pixel, or the body would exceed [`HARD_MAX_RECORD_BODY`];
+/// [`io::ErrorKind::Unsupported`] when compression is requested without the `native` feature or on
+/// wasm32; and [`io::ErrorKind::InvalidData`] when compression fails.
 pub fn raster_frame_body_with_compression(
     epoch: u32,
     frame_id: u64,
@@ -448,6 +543,15 @@ pub fn raster_frame_body_with_compression(
     clippy::too_many_arguments,
     reason = "mirrors the RASTER_FRAME delta prefix fields; see docs/RUST-GUIDELINES-REVIEW.md"
 )]
+/// Builds a raster delta body that patches frame `base_frame_id` with `operations`.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when the operation limit is outside 1 through 16, a
+/// frame or base ID is zero, a source dimension is zero, the operation count exceeds the limit, an
+/// overwrite's pixels do not match its rectangle, or the body would exceed
+/// [`HARD_MAX_RECORD_BODY`]; [`io::ErrorKind::Unsupported`] when compression is requested without
+/// the `native` feature or on wasm32.
 pub fn raster_delta_frame_body(
     epoch: u32,
     frame_id: u64,
@@ -624,6 +728,12 @@ pub fn raster_delta_frame_body(
     Ok(body)
 }
 
+/// Borrows the fields and access unit out of a received video packet body.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `body` is shorter than its 48-byte prefix, the
+/// reserved field or flags are invalid, or the side data does not fit in the body.
 pub fn parse_video_packet(body: &[u8]) -> io::Result<ParsedVideoPacket<'_>> {
     if body.len() < VIDEO_PACKET_PREFIX_SIZE {
         return Err(invalid("video packet is shorter than its 48-byte prefix"));
@@ -652,6 +762,12 @@ pub fn parse_video_packet(body: &[u8]) -> io::Result<ParsedVideoPacket<'_>> {
     })
 }
 
+/// Borrows the fields and access unit out of a received audio packet body.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `body` is shorter than its 48-byte prefix, carries
+/// no access unit, or has nonzero reserved flags.
 pub fn parse_audio_packet(body: &[u8]) -> io::Result<ParsedAudioPacket<'_>> {
     if body.len() < AUDIO_PACKET_PREFIX_SIZE {
         return Err(invalid("audio packet is shorter than its 48-byte prefix"));
@@ -674,6 +790,13 @@ pub fn parse_audio_packet(body: &[u8]) -> io::Result<ParsedAudioPacket<'_>> {
     })
 }
 
+/// Borrows a received full-frame raster body, checking its single rectangle.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `body` is shorter than one rectangle, uses an
+/// unsupported layout or flags, or its pixel data does not fit the body or match the declared
+/// dimensions.
 pub fn parse_full_raster_frame(body: &[u8]) -> io::Result<ParsedRasterFrame<'_>> {
     let header_length = RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE;
     if body.len() < header_length {
@@ -721,6 +844,15 @@ pub fn parse_full_raster_frame(body: &[u8]) -> io::Result<ParsedRasterFrame<'_>>
     })
 }
 
+/// Borrows a received raster delta body against a `source_width` by `source_height` frame.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when the operation limit is outside 1 through 16, a
+/// source dimension is zero, the header is short, has unsupported flags, a zero base frame ID, or
+/// nonzero reserved fields, the operation count exceeds the limit, an operation has an unknown
+/// kind, an empty or out-of-bounds rectangle, or a payload that does not fit, or the body has
+/// trailing bytes.
 pub fn parse_delta_raster_frame(
     body: &[u8],
     source_width: u32,
@@ -890,6 +1022,14 @@ pub fn parse_delta_raster_frame(
     })
 }
 
+/// Returns a full frame's RGBA pixels, decompressing them when the frame is zstd-compressed.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when the dimensions overflow, the zstd stream is invalid,
+/// uses skippable frames, a dictionary, or trailing frames, or decompresses to the wrong size.
+/// Returns [`io::ErrorKind::Unsupported`] for compressed frames without the `native` feature
+/// outside wasm32.
 pub fn decode_raster_pixels(frame: ParsedRasterFrame<'_>) -> io::Result<Vec<u8>> {
     let expected = rgba8_pixel_len(frame.width, frame.height)
         .map_err(|_| invalid("raster dimensions overflow"))? as usize;
@@ -1023,6 +1163,14 @@ pub fn valid_audio_packetization(codec: &str, packetization: &str) -> bool {
     }
 }
 
+/// Validates audio initialization data for a portable codec and packetization.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when the codec and packetization are not a portable pair,
+/// `extradata` exceeds 64 KiB, or it fails the codec's own check: [`validate_opus_head`],
+/// [`validate_vorbis_headers`], [`validate_flac_streaminfo`], or
+/// [`validate_aac_audio_specific_config`].
 pub fn validate_audio_initialization(
     codec: &str,
     packetization: &str,
@@ -1049,6 +1197,12 @@ const AAC_SAMPLE_RATES: [u32; 13] = [
 
 /// Validate ASC rate and channel metadata, not the codec-specific tools or full decoder support.
 /// Configuration zero requires a complete General Audio program configuration element (PCE).
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `config` is truncated, has a null object type or
+/// invalid sampling frequency, carries an invalid or unsupported channel configuration, or
+/// disagrees with `sample_rate` or `channels`.
 pub fn validate_aac_audio_specific_config(
     config: &[u8],
     sample_rate: u32,
@@ -1206,6 +1360,13 @@ impl<'a> AscBitReader<'a> {
     }
 }
 
+/// Validates an `OpusHead` against the declared sample rate and channel count.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `sample_rate` is not 48 kHz, the header is short or
+/// lacks its signature, the version or channel count is unsupported, or the channel mapping is
+/// invalid for its family.
 pub fn validate_opus_head(head: &[u8], sample_rate: u32, channels: u16) -> io::Result<()> {
     if sample_rate != 48_000 || head.len() < 19 || &head[..8] != b"OpusHead" {
         return Err(invalid(
@@ -1245,6 +1406,12 @@ pub fn validate_opus_head(head: &[u8], sample_rate: u32, channels: u16) -> io::R
     }
 }
 
+/// Validates Xiph-laced Vorbis headers against the declared sample rate and channel count.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when the headers are not three-header Xiph lacing, are
+/// truncated or overflow, have invalid signatures, or disagree with `sample_rate` or `channels`.
 pub fn validate_vorbis_headers(private: &[u8], sample_rate: u32, channels: u16) -> io::Result<()> {
     if private.first() != Some(&2) {
         return Err(invalid(
@@ -1275,7 +1442,7 @@ pub fn validate_vorbis_headers(private: &[u8], sample_rate: u32, channels: u16) 
         || !setup.starts_with(b"\x05vorbis")
         || identification[7..11] != [0, 0, 0, 0]
         || u16::from(identification[11]) != channels
-        || u32::from_le_bytes(identification[12..16].try_into().unwrap()) != sample_rate
+        || u32::from_le_bytes(crate::array_at(identification, 12)) != sample_rate
         || !(6..=13).contains(&small_block)
         || !(small_block..=13).contains(&large_block)
         || identification[29] != 1
@@ -1344,6 +1511,13 @@ fn xiph_laced_length(bytes: &[u8], cursor: &mut usize) -> io::Result<usize> {
     }
 }
 
+/// Validates a raw 34-byte FLAC `STREAMINFO` against the declared sample rate and channels.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `streaminfo` is not 34 bytes, the block sizes are
+/// invalid, the sample rate is zero or differs from `sample_rate`, the channel count differs from
+/// `channels`, or the bit depth is outside 4 through 32.
 pub fn validate_flac_streaminfo(
     streaminfo: &[u8],
     sample_rate: u32,
@@ -1354,9 +1528,9 @@ pub fn validate_flac_streaminfo(
             "FLAC initialization is not a raw 34-byte STREAMINFO",
         ));
     }
-    let minimum_block = u16::from_be_bytes(streaminfo[0..2].try_into().unwrap());
-    let maximum_block = u16::from_be_bytes(streaminfo[2..4].try_into().unwrap());
-    let packed = u64::from_be_bytes(streaminfo[10..18].try_into().unwrap());
+    let minimum_block = u16::from_be_bytes(crate::array_at(streaminfo, 0));
+    let maximum_block = u16::from_be_bytes(crate::array_at(streaminfo, 2));
+    let packed = u64::from_be_bytes(crate::array_at(streaminfo, 10));
     let header_rate = ((packed >> 44) & 0x000f_ffff) as u32;
     let header_channels = ((packed >> 41) & 0x7) as u16 + 1;
     let bits_per_sample = ((packed >> 36) & 0x1f) as u8 + 1;
@@ -1372,6 +1546,12 @@ pub fn validate_flac_streaminfo(
     Ok(())
 }
 
+/// Checks that `data` is a plausible access unit for a portable codec and packetization.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `data` is empty, the pair is not portable, an H.264
+/// or HEVC unit is not Annex B, or an AV1 unit sets the OBU forbidden bit.
 pub fn validate_portable_packetization(
     codec: &str,
     packetization: &str,
@@ -1379,9 +1559,6 @@ pub fn validate_portable_packetization(
 ) -> io::Result<()> {
     if data.is_empty() {
         return Err(invalid("portable access unit is empty"));
-    }
-    if !is_portable_packetization(codec, packetization) {
-        return Err(invalid("unsupported portable codec/packetization pair"));
     }
     match (codec, packetization) {
         ("h264", "h264-annexb-au-v1") | ("hevc", "hevc-annexb-au-v1") => {
@@ -1395,12 +1572,17 @@ pub fn validate_portable_packetization(
                 return Err(invalid("AV1 OBU forbidden bit is set"));
             }
         }
-        _ => unreachable!("pair was checked above"),
+        _ => return Err(invalid("unsupported portable codec/packetization pair")),
     }
     Ok(())
 }
 
 /// Determine random-access status from the portable codec syntax rather than container metadata.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `data` is empty or malformed for `codec`, or `codec`
+/// is not a portable codec.
 pub fn access_unit_is_key(codec: &str, data: &[u8]) -> io::Result<bool> {
     if data.is_empty() {
         return Err(invalid("portable access unit is empty"));
@@ -1590,6 +1772,11 @@ pub struct H264DecoderDescription {
 }
 
 /// Derive the decoder description from an encoder's extradata, in either avcC or Annex-B form.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `extradata` is neither a valid avcC configuration
+/// nor Annex B parameter sets with an SPS and a PPS, or the configuration is oversized.
 pub fn h264_decoder_description(extradata: &[u8]) -> io::Result<H264DecoderDescription> {
     let avcc = if extradata.first() == Some(&1) {
         if extradata.len() < 7 || extradata.len() > MAX_H264_EXTRADATA {
@@ -1616,6 +1803,11 @@ pub fn h264_decoder_description(extradata: &[u8]) -> io::Result<H264DecoderDescr
 /// A buffer that is neither well-formed Annex-B nor well-formed AVCC is rejected rather than
 /// passed through: sending a mangled access unit produces a silent green picture at the
 /// presenter, while an error here names the encoder that produced it on the very first frame.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `unit` is empty or is neither Annex B nor
+/// well-formed length-prefixed NAL units.
 pub fn ensure_annexb(unit: &[u8]) -> io::Result<Cow<'_, [u8]>> {
     if unit.is_empty() {
         return Err(annexb_invalid("access unit is empty"));
@@ -1678,6 +1870,11 @@ pub fn with_parameter_sets(parameter_sets: &[u8], unit: &[u8]) -> Vec<u8> {
 }
 
 /// Convert an avcC decoder configuration into Annex-B parameter sets.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `avcc` is short, has the wrong version, or lacks a
+/// valid SPS or PPS.
 pub fn annexb_from_avcc(avcc: &[u8]) -> io::Result<Vec<u8>> {
     if avcc.len() < 7 || avcc[0] != 1 {
         return Err(annexb_invalid("avcC decoder configuration is invalid"));
@@ -1751,6 +1948,11 @@ fn take_avcc_nal<'a>(avcc: &'a [u8], cursor: &mut usize) -> io::Result<&'a [u8]>
 }
 
 /// Build an avcC decoder configuration from Annex-B parameter sets.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `extradata` lacks an SPS or a PPS, or the
+/// configuration would be oversized.
 pub fn avcc_from_annexb(extradata: &[u8]) -> io::Result<Vec<u8>> {
     let nals = annexb_nals(extradata);
     let sps = nals

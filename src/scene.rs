@@ -50,6 +50,11 @@ pub struct SceneNode {
 }
 
 impl SceneNode {
+    /// Checks that the node's owning context, node, and surface IDs are nonzero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when any of the four IDs is zero.
     pub fn validate(&self) -> Result<(), MessageError> {
         require_nonzero("scene node", 0, self.owning_context_id)?;
         require_nonzero("scene node", 1, self.node_id)?;
@@ -58,6 +63,11 @@ impl SceneNode {
         Ok(())
     }
 
+    /// Encodes the node as a `CREATE_NODE` or `UPDATE_NODE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`SceneNode::validate`].
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.validate()?;
         let mut fields = vec![
@@ -79,6 +89,14 @@ impl SceneNode {
         Ok(fields)
     }
 
+    /// Decodes a `CREATE_NODE` or `UPDATE_NODE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict node map, a field is missing or has
+    /// the wrong type, sampling or blend semantics are unknown, the opacity exceeds 65,535, the fit
+    /// is unregistered, the node fails [`SceneNode::validate`], or its node ID differs from
+    /// `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new(
             "scene node",
@@ -139,6 +157,11 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Creates an empty scene for `session` at `target_generation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `target_generation` is zero.
     pub fn new(
         session: SessionIdentity,
         target_generation: TargetGeneration,
@@ -163,6 +186,12 @@ impl Scene {
         self.target_generation
     }
 
+    /// Opens transaction `transaction_id` in `context_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when either ID is zero or the transaction is already
+    /// open in that context.
     pub fn begin(&mut self, context_id: u64, transaction_id: u64) -> Result<(), MessageError> {
         require_nonzero("BEGIN_TXN", 0, context_id)?;
         require_nonzero("BEGIN_TXN", 1, transaction_id)?;
@@ -181,6 +210,12 @@ impl Scene {
         Ok(())
     }
 
+    /// Stages a `CREATE_NODE` in an open transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the node's owning context is not `context_id` or
+    /// the transaction does not exist.
     pub fn create(
         &mut self,
         context_id: u64,
@@ -200,6 +235,12 @@ impl Scene {
         Ok(())
     }
 
+    /// Stages an `UPDATE_NODE` in an open transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the node's owning context is not `context_id` or
+    /// the transaction does not exist.
     pub fn update(
         &mut self,
         context_id: u64,
@@ -219,6 +260,12 @@ impl Scene {
         Ok(())
     }
 
+    /// Stages a `DELETE_NODE` in an open transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `node_id` is zero or the transaction does not
+    /// exist.
     pub fn delete(
         &mut self,
         context_id: u64,
@@ -241,6 +288,14 @@ impl Scene {
             .is_some()
     }
 
+    /// Applies an open transaction atomically, advancing the scene revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the target generation or expected scene revision
+    /// is stale, the transaction is not live, a create duplicates an existing node, an update or
+    /// delete names a missing node, or the scene revision is exhausted. A failed commit leaves the
+    /// scene unchanged.
     pub fn commit(
         &mut self,
         context_id: u64,
@@ -315,6 +370,12 @@ impl Scene {
         Ok(next)
     }
 
+    /// Removes every node that displays the given surface, returning how many were removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when nodes were removed and the scene revision is
+    /// exhausted.
     pub fn remove_surface_references(
         &mut self,
         surface_context_id: u64,

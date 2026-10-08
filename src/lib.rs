@@ -53,11 +53,33 @@ pub(crate) const fn const_u32(value: usize) -> u32 {
     narrowed
 }
 
-/// Version of the Vivid wire protocol, used by both the connection preface and HELLO/WELCOME.
+/// Copies the `N` bytes at `offset` into an array.
+///
+/// Callers check the bounds first; every use reads a fixed field from a length-checked buffer.
+pub(crate) fn array_at<const N: usize>(bytes: &[u8], offset: usize) -> [u8; N] {
+    let mut array = [0; N];
+    array.copy_from_slice(&bytes[offset..offset + N]);
+    array
+}
+
+/// Major version of the Vivid wire protocol, carried by the preface and HELLO/WELCOME.
 pub const VIVID_MAJOR: u8 = 1;
+/// Minor version of the Vivid wire protocol; 1.5 peers reject any other minor version.
 pub const VIVID_MINOR: u8 = 5;
+/// Ceiling on one control record body, the core specification's 1 MiB control limit (§4.3).
+///
+/// The effective ceiling is the minimum of this, the preface limit, and the peer's advertised
+/// limit; raising it here does not let a peer accept larger bodies.
 pub const CONTROL_MAX_RECORD_BODY: u32 = 1024 * 1024;
+/// Body limit a non-control connection advertises in its preface when nothing narrower applies.
+///
+/// It equals [`HARD_MAX_RECORD_BODY`] today. It is a separate constant because it is a default
+/// that callers may lower, while the hard ceiling is a protocol bound no value may exceed.
 pub const DEFAULT_MAX_RECORD_BODY: u32 = 64 * 1024 * 1024;
+/// Absolute ceiling on any record body: the specification's 64 MiB media hard limit (§4.3).
+///
+/// Every size check in this crate rejects larger bodies before allocating, so this bounds the
+/// memory one record can demand from a receiver.
 pub const HARD_MAX_RECORD_BODY: u32 = 64 * 1024 * 1024;
 /// Ceiling an interactive lane may grant one record. The lane must stay responsive while bulk
 /// media is saturated, so it carries input and small snapshots rather than payloads.

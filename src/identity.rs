@@ -85,6 +85,11 @@ pub struct LeaseIdentity {
 }
 
 impl SessionIdentity {
+    /// Identifies session `session_id` on presenter instance `presenter`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when `session_id` is zero.
     pub fn new(presenter: PresenterInstanceId, session_id: u64) -> Result<Self, IdentityError> {
         Ok(Self {
             presenter,
@@ -100,6 +105,11 @@ impl SessionIdentity {
         self.session_id
     }
 
+    /// Identifies context `context_id` owned by this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when `context_id` is zero.
     pub fn context(self, context_id: u64) -> Result<ContextIdentity, IdentityError> {
         Ok(ContextIdentity {
             session: self,
@@ -117,6 +127,11 @@ impl ContextIdentity {
         self.context_id
     }
 
+    /// Identifies surface `surface_id` owned by this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when `surface_id` is zero.
     pub fn surface(self, surface_id: u64) -> Result<SurfaceIdentity, IdentityError> {
         Ok(SurfaceIdentity {
             context: self,
@@ -124,6 +139,11 @@ impl ContextIdentity {
         })
     }
 
+    /// Identifies scene node `node_id` owned by this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when `node_id` is zero.
     pub fn node(self, node_id: u64) -> Result<NodeIdentity, IdentityError> {
         Ok(NodeIdentity {
             context: self,
@@ -131,6 +151,11 @@ impl ContextIdentity {
         })
     }
 
+    /// Identifies transaction `transaction_id` owned by this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when `transaction_id` is zero.
     pub fn transaction(self, transaction_id: u64) -> Result<TransactionIdentity, IdentityError> {
         Ok(TransactionIdentity {
             context: self,
@@ -138,6 +163,11 @@ impl ContextIdentity {
         })
     }
 
+    /// Identifies anchor `anchor_id` owned by this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when `anchor_id` is zero.
     pub fn anchor(self, anchor_id: u64) -> Result<AnchorIdentity, IdentityError> {
         Ok(AnchorIdentity {
             context: self,
@@ -145,6 +175,11 @@ impl ContextIdentity {
         })
     }
 
+    /// Identifies lease `lease_id` owned by this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when `lease_id` is zero.
     pub fn lease(self, lease_id: u64) -> Result<LeaseIdentity, IdentityError> {
         Ok(LeaseIdentity {
             context: self,
@@ -162,6 +197,11 @@ impl SurfaceIdentity {
         self.surface_id
     }
 
+    /// Identifies track `track_id` owned by this surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when `track_id` is zero.
     pub fn track(self, track_id: u64) -> Result<TrackIdentity, IdentityError> {
         Ok(TrackIdentity {
             surface: self,
@@ -179,6 +219,11 @@ impl TrackIdentity {
         self.track_id
     }
 
+    /// Identifies channel `generation` of this track.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when `generation` is zero.
     pub fn channel(self, generation: ChannelGeneration) -> Result<ChannelIdentity, IdentityError> {
         generation
             .require_nonzero()

@@ -57,6 +57,11 @@ impl Default for Limits {
     }
 }
 impl Limits {
+    /// Builds negotiated limits from the twelve values in wire-key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when any value is zero or above the profile ceiling for its key.
     pub fn new(values: [u64; 12]) -> Result<Self> {
         if values
             .iter()
@@ -79,6 +84,12 @@ impl Limits {
                 .collect(),
         )
     }
+    /// Decodes negotiated limits from their CBOR map.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `value` is not a map of exactly the twelve registered keys
+    /// with unsigned values, or the values fail [`Limits::new`].
     pub fn from_value(value: &Value) -> Result<Self> {
         let Value::Map(fields) = value else {
             return Err(InvalidScene("vector limits must be a map"));
@@ -136,6 +147,12 @@ pub struct Frame {
     pub canvas: Canvas,
 }
 impl Frame {
+    /// Encodes the `VECTOR_FRAME` body: epoch, revision, and the canvas.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the epoch or revision is zero, or the canvas fails
+    /// [`Canvas::encode`].
     pub fn encode(&self) -> Result<Vec<u8>> {
         if self.epoch == 0 || self.revision == 0 {
             return Err(InvalidScene("scene epoch and revision must be nonzero"));
@@ -147,6 +164,12 @@ impl Frame {
         body.extend(commands);
         Ok(body)
     }
+    /// Decodes a `VECTOR_FRAME` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `body` is shorter than its 12-byte prefix or longer than the
+    /// scene ceiling allows, the epoch or revision is zero, or the canvas fails [`Canvas::decode`].
     pub fn decode(body: &[u8]) -> Result<Self> {
         if body.len() < 12 || body.len() > MAX_SCENE_BYTES + 12 {
             return Err(InvalidScene("invalid vector frame length"));
@@ -187,12 +210,22 @@ pub struct AssetRelease {
     pub id: u64,
 }
 impl AssetRelease {
+    /// Encodes the `VECTOR_ASSET_RELEASE` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the asset ID is zero.
     pub fn encode(self) -> Result<[u8; 8]> {
         if self.id == 0 {
             return Err(InvalidScene("asset ID must be nonzero"));
         }
         Ok(self.id.to_be_bytes())
     }
+    /// Decodes a `VECTOR_ASSET_RELEASE` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `body` is not exactly eight bytes or the asset ID is zero.
     pub fn decode(body: &[u8]) -> Result<Self> {
         let bytes: [u8; 8] = body
             .try_into()
@@ -205,6 +238,12 @@ impl AssetRelease {
     }
 }
 impl ImageAsset {
+    /// Checks the asset's ID, dimensions, and pixel byte count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the ID, width, or height is zero, or the RGBA byte count
+    /// overflows, exceeds the asset ceiling, or differs from `width * height * 4`.
     pub fn validate(&self) -> Result<()> {
         let bytes = u64::from(self.width)
             .checked_mul(u64::from(self.height))
@@ -220,6 +259,11 @@ impl ImageAsset {
         }
         Ok(())
     }
+    /// Encodes the `VECTOR_ASSET` body: ID, dimensions, and RGBA pixels.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`ImageAsset::validate`].
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut body = Vec::with_capacity(16 + self.rgba.len());
@@ -229,6 +273,12 @@ impl ImageAsset {
         body.extend_from_slice(&self.rgba);
         Ok(body)
     }
+    /// Decodes a `VECTOR_ASSET` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `body` is shorter than its 16-byte prefix or longer than the
+    /// asset ceiling allows, or the asset fails [`ImageAsset::validate`].
     pub fn decode(body: &[u8]) -> Result<Self> {
         if body.len() < 16 || body.len() > 16 + MAX_ASSET_BYTES {
             return Err(InvalidScene("invalid vector asset length"));
@@ -279,6 +329,11 @@ pub struct Scalar(i64);
 impl Scalar {
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self(1_i64 << 32);
+    /// Converts `value` to fixed point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `value` is non-finite or its magnitude exceeds 1,000,000.
     pub fn new(value: f64) -> Result<Self> {
         if !value.is_finite() || value.abs() > 1_000_000.0 {
             return Err(InvalidScene(
@@ -302,6 +357,11 @@ impl Scalar {
     pub const fn raw(self) -> i64 {
         self.0
     }
+    /// Wraps a raw 32.32 fixed-point value received from the wire.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the magnitude exceeds 1,000,000 logical units.
     pub fn from_raw(raw: i64) -> Result<Self> {
         if raw.unsigned_abs() > (1_000_000_u64 << 32) {
             return Err(InvalidScene("coordinate exceeds limit"));
@@ -316,6 +376,12 @@ pub struct Point {
     pub y: Scalar,
 }
 impl Point {
+    /// Builds a point from logical coordinates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when a coordinate is non-finite or beyond the logical extent of
+    /// ±1,000,000.
     pub fn new(x: f64, y: f64) -> Result<Self> {
         Ok(Self {
             x: Scalar::new(x)?,
@@ -331,6 +397,12 @@ pub struct Rect {
     pub height: Scalar,
 }
 impl Rect {
+    /// Builds a rectangle from its origin and extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when a coordinate is non-finite or beyond the logical extent of
+    /// ±1,000,000, or the rectangle fails [`Rect::validate`].
     pub fn new(x: f64, y: f64, width: f64, height: f64) -> Result<Self> {
         let rect = Self {
             origin: Point::new(x, y)?,
@@ -340,6 +412,12 @@ impl Rect {
         rect.validate()?;
         Ok(rect)
     }
+    /// Checks that the extent is positive and the far corner stays within the logical extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the width or height is not positive, or the far edge exceeds
+    /// the logical extent.
     pub fn validate(self) -> Result<()> {
         if self.width <= Scalar::ZERO || self.height <= Scalar::ZERO {
             return Err(InvalidScene("rectangle extent must be positive"));
@@ -370,6 +448,12 @@ impl Default for Transform {
     }
 }
 impl Transform {
+    /// Builds an affine transform from its six coefficients.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when a coefficient is non-finite or its magnitude exceeds
+    /// 1,000,000.
     pub fn new(values: [f64; 6]) -> Result<Self> {
         Ok(Self([
             Scalar::new(values[0])?,
@@ -405,6 +489,11 @@ impl Path {
         PathBuilder::default()
     }
 
+    /// Builds a closed rectangular path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `rect` fails [`Rect::validate`].
     pub fn rectangle(rect: Rect) -> Result<Self> {
         rect.validate()?;
         let x = rect.origin.x.get();
@@ -422,6 +511,12 @@ impl Path {
             even_odd: false,
         })
     }
+    /// Builds a closed rectangle path with the same `radius` on every corner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `radius` is negative or out of range, or `rect` fails
+    /// [`Rect::validate`].
     pub fn rounded_rectangle(rect: Rect, radius: f64) -> Result<Self> {
         Self::rounded_rectangle_corners(rect, Corners::uniform(radius)?)
     }
@@ -434,6 +529,12 @@ impl Path {
         clippy::many_single_char_names,
         reason = "corner and extent names follow the geometry"
     )]
+    /// Builds a closed rectangle path with per-corner radii, scaled down to fit when they overlap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `rect` fails [`Rect::validate`], a radius fails
+    /// [`Corners::validate`], or a computed point leaves the logical extent.
     pub fn rounded_rectangle_corners(rect: Rect, radii: Corners) -> Result<Self> {
         rect.validate()?;
         radii.validate()?;
@@ -494,6 +595,12 @@ impl Path {
             even_odd: false,
         })
     }
+    /// Builds a closed ellipse path inscribed in `rect`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `rect` fails [`Rect::validate`] or a computed point leaves the
+    /// logical extent.
     pub fn ellipse(rect: Rect) -> Result<Self> {
         rect.validate()?;
         let cx = rect.origin.x.get() + rect.width.get() / 2.0;
@@ -530,6 +637,12 @@ impl Path {
             even_odd: false,
         })
     }
+    /// Checks the path's segment count and subpath structure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the path is empty or over the segment limit, a subpath does
+    /// not begin with a move, or a close has no open subpath.
     pub fn validate(&self) -> Result<()> {
         if self.segments.is_empty() || self.segments.len() > MAX_PATH_SEGMENTS {
             return Err(InvalidScene("path segment limit exceeded"));
@@ -565,7 +678,7 @@ impl Path {
 ///     .close()
 ///     .build()
 ///     .expect("a path the wire can carry");
-/// assert_eq!(arrow.segments.len(), 6);
+/// assert_eq!(arrow.segments.len(), 5);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct PathBuilder {
@@ -636,6 +749,11 @@ impl PathBuilder {
 
     /// Finish, checking everything the wire requires: a non-empty path, within the segment
     /// ceiling, beginning with a move, and closing only a subpath that was opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when an earlier builder call recorded an invalid coordinate, or the
+    /// finished path fails [`Path::validate`].
     pub fn build(self) -> Result<Path> {
         if let Some(error) = self.failed {
             return Err(error);
@@ -685,6 +803,11 @@ pub struct Color(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Corners(pub [Scalar; 4]);
 impl Corners {
+    /// Builds per-corner radii in top-left, top-right, bottom-right, bottom-left order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when a radius is non-finite or its magnitude exceeds 1,000,000.
     pub fn new(values: [f64; 4]) -> Result<Self> {
         Ok(Self([
             Scalar::new(values[0])?,
@@ -693,6 +816,11 @@ impl Corners {
             Scalar::new(values[3])?,
         ]))
     }
+    /// Builds the same `radius` for all four corners.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `radius` is non-finite or its magnitude exceeds 1,000,000.
     pub fn uniform(radius: f64) -> Result<Self> {
         Self::new([radius; 4])
     }
@@ -705,6 +833,11 @@ impl Corners {
         let [tl, tr, br, bl] = self.0.map(Scalar::get);
         (tl == tr && tr == br && br == bl).then_some(tl)
     }
+    /// Checks that every radius is between zero and the paint extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when a radius is negative or exceeds the paint extent.
     pub fn validate(&self) -> Result<()> {
         if self
             .0
@@ -823,6 +956,12 @@ pub struct Shadow {
     pub inset: bool,
 }
 impl Shadow {
+    /// Checks the shadow's rectangle, radii, blur, and spread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the rectangle or radii are invalid, the blur is negative or
+    /// exceeds the paint extent, or the spread's magnitude exceeds the paint extent.
     pub fn validate(&self) -> Result<()> {
         self.rect.validate()?;
         self.radii.validate()?;
@@ -883,12 +1022,24 @@ impl Default for StrokeStyle {
 }
 
 impl StrokeStyle {
+    /// Builds a default stroke style with `width`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `width` is non-finite or its magnitude exceeds 1,000,000.
     pub fn new(width: f64) -> Result<Self> {
         Ok(Self {
             width: Scalar::new(width)?,
             ..Self::default()
         })
     }
+    /// Checks the stroke width, miter limit, and dash pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the width is not positive, the miter limit is below one or
+    /// above the paint extent, or the dash pattern has too many entries, a non-positive or
+    /// oversized entry, or an out-of-range offset.
     pub fn validate(&self) -> Result<()> {
         if self.width <= Scalar::ZERO {
             return Err(InvalidScene("stroke width must be positive"));
@@ -1032,6 +1183,11 @@ impl Canvas {
     pub fn commands(&self) -> &[Command] {
         &self.commands
     }
+    /// Appends `command`, returning the canvas for chaining.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the canvas already holds the maximum number of commands.
     pub fn push(&mut self, command: Command) -> Result<&mut Self> {
         if self.commands.len() >= MAX_COMMANDS {
             return Err(InvalidScene("command limit exceeded"));
@@ -1039,17 +1195,36 @@ impl Canvas {
         self.commands.push(command);
         Ok(self)
     }
+    /// Appends a fill of `path` with `brush`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the canvas already holds the maximum number of commands.
     pub fn fill(&mut self, path: Path, brush: Brush) -> Result<&mut Self> {
         self.push(Command::Fill(path, brush))
     }
+    /// Appends a stroke of `path` with `brush` at `width`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `width` is non-finite or out of range, or the canvas already
+    /// holds the maximum number of commands.
     pub fn stroke(&mut self, path: Path, brush: Brush, width: f64) -> Result<&mut Self> {
         self.push(Command::Stroke(path, brush, Scalar::new(width)?))
     }
     /// Cast a blurred rounded rectangle, as CSS box-shadow defines it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the canvas already holds the maximum number of commands.
     pub fn shadow(&mut self, shadow: Shadow) -> Result<&mut Self> {
         self.push(Command::Shadow(shadow))
     }
     /// Stroke with caps, joins, and an optional dash pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the canvas already holds the maximum number of commands.
     pub fn stroke_styled(
         &mut self,
         path: Path,
@@ -1059,6 +1234,12 @@ impl Canvas {
         self.push(Command::StyledStroke(path, brush, style))
     }
     /// Check the host's authenticated limits, which may be below the profile ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the canvas fails [`Canvas::validate`], its encoded size or
+    /// command count exceeds the negotiated limits, its save or clip depth exceeds them, or a
+    /// restore has no matching save.
     pub fn validate_with_limits(&self, limits: &Limits) -> Result<()> {
         self.validate()?;
         let limit = &limits.0;
@@ -1122,6 +1303,13 @@ impl Canvas {
         }
         Ok(())
     }
+    /// Checks every command against the profile ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the canvas holds too many commands, a brush or stroke width is
+    /// invalid, saves or clips nest too deeply, or a hit region has a zero or duplicate ID or
+    /// invalid resize edges.
     pub fn validate(&self) -> Result<()> {
         if self.commands.len() > MAX_COMMANDS {
             return Err(InvalidScene("command limit exceeded"));
@@ -1234,6 +1422,12 @@ impl Canvas {
         }
         Ok(())
     }
+    /// Encodes the canvas as its CBOR command array.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the canvas fails [`Canvas::validate`] or the encoded scene
+    /// exceeds the byte ceiling.
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let bytes = cbor::encode(&Value::Array(
@@ -1245,12 +1439,24 @@ impl Canvas {
         }
         Ok(bytes)
     }
+    /// Decodes a canvas from its CBOR command array.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `bytes` exceeds the scene byte ceiling, is not valid CBOR, or
+    /// the decoded value fails [`Canvas::from_value`].
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > MAX_SCENE_BYTES {
             return Err(InvalidScene("scene byte limit exceeded"));
         }
         Self::from_value(&cbor::decode(bytes).map_err(|_| InvalidScene("invalid scene encoding"))?)
     }
+    /// Builds a canvas from an already-decoded CBOR command array.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when `value` is not an array, holds too many or malformed commands,
+    /// or the result fails [`Canvas::validate`].
     pub fn from_value(value: &Value) -> Result<Self> {
         let values = array(value)?;
         if values.len() > MAX_COMMANDS {

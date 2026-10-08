@@ -95,6 +95,10 @@ impl ObservationQueue {
     ///
     /// Unsubscribing discards anything already queued for the classes that were dropped: a
     /// producer that stopped listening should not receive them later.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`messages::MessageError::InvalidValue`] when `mask` has unassigned class bits.
     pub fn subscribe(&mut self, mask: u64) -> Result<(), messages::MessageError> {
         if mask & !class::KNOWN_MASK != 0 {
             return Err(messages::invalid_value(

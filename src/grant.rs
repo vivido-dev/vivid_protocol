@@ -163,6 +163,10 @@ impl InputGrant {
     }
 
     /// Apply a producer binding under the presenter's current eligibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`crate::input::InputGate::apply_binding`].
     pub fn apply(
         &mut self,
         binding: &InputBinding,

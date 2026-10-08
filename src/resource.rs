@@ -122,6 +122,13 @@ impl ResourceContract {
         )
     }
 
+    /// Decodes a resource contract from its CBOR map of every registered resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceError::NotAMap`] when `value` is not a map, [`ResourceError::UnknownKey`]
+    /// for a key outside the registry, [`ResourceError::InvalidValue`] for a non-integer amount,
+    /// and [`ResourceError::MissingKey`] when a registered resource is absent.
     pub fn from_value(value: &Value) -> Result<Self, ResourceError> {
         let Value::Map(entries) = value else {
             return Err(ResourceError::NotAMap);
@@ -165,6 +172,12 @@ impl ReservationLedger {
         ResourceContract::new(values)
     }
 
+    /// Reserves `requested`, clamped to `policy` and to what remains, returning the granted
+    /// amounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceError::Overflow`] when a reserved total would overflow.
     pub fn reserve(
         &mut self,
         requested: &ResourceContract,
@@ -183,6 +196,12 @@ impl ReservationLedger {
         Ok(effective)
     }
 
+    /// Returns `contract`'s amounts to the ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceError::Overflow`] when `contract` exceeds what is reserved; the ledger is
+    /// unchanged.
     pub fn release(&mut self, contract: &ResourceContract) -> Result<(), ResourceError> {
         let mut reserved = self.reserved;
         for (index, amount) in contract.values.iter().copied().enumerate() {
@@ -212,6 +231,12 @@ impl ChannelFlow {
         }
     }
 
+    /// Admits one record of `body_length` bytes against the channel's absolute allowance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceError::Overflow`] when a counter would overflow, and
+    /// [`ResourceError::FlowControl`] when the record exceeds the allowance.
     pub fn admit(&mut self, body_length: u32) -> Result<(), ResourceError> {
         let body_bytes = self
             .sent_body_bytes
@@ -254,6 +279,11 @@ impl TokenBucket {
         }
     }
 
+    /// Adds the tokens earned over `elapsed`, up to the bucket capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceError::Overflow`] when the earned amount overflows.
     pub fn replenish(&mut self, elapsed: Duration) -> Result<(), ResourceError> {
         let nanos = elapsed.as_nanos();
         let earned_numerator = u128::from(self.rate_per_second)
@@ -279,6 +309,11 @@ impl TokenBucket {
     /// `Ok(None)` means now. `Err` means never: a charge larger than the bucket can ever hold is
     /// something the caller has to reject, not wait out — waiting would be an unbounded stall on
     /// whatever thread is shaping the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceError::ExceedsContract`] when `units` exceeds the capacity or the rate is
+    /// zero, and [`ResourceError::Overflow`] when the wait cannot be represented.
     pub fn time_until(&self, units: u64) -> Result<Option<Duration>, ResourceError> {
         if units <= self.tokens {
             return Ok(None);
@@ -302,6 +337,12 @@ impl TokenBucket {
         )))
     }
 
+    /// Spends `units` tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceError::ExceedsContract`] when fewer than `units` tokens are available; the
+    /// bucket is unchanged.
     pub fn charge(&mut self, units: u64) -> Result<(), ResourceError> {
         self.tokens = self
             .tokens

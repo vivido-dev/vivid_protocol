@@ -38,6 +38,14 @@ impl InputBinding {
             && self.requested_classes == 0
     }
 
+    /// Checks the binding's epoch, reason, scope, classes, and watchdog against `header_object_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the producer epoch is zero, the surface ID differs from
+    /// `header_object_id`, the reason is unregistered, a disabling binding carries classes or
+    /// scope, or an enabling binding has a zero ID or generation, no or unknown input classes, or a
+    /// watchdog outside the supported range.
     pub fn validate(&self, header_object_id: u64) -> Result<(), MessageError> {
         self.producer_epoch
             .require_nonzero()
@@ -94,6 +102,12 @@ impl InputBinding {
         ]
     }
 
+    /// Decodes a `SET_INPUT_BINDING` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `SET_INPUT_BINDING` map, a field is
+    /// missing or has the wrong type, or the binding fails [`InputBinding::validate`].
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("SET_INPUT_BINDING", payload, &[0, 1, 2, 3, 4, 5, 6])?;
         let binding = Self {
@@ -241,6 +255,13 @@ impl InputEvent {
         payload
     }
 
+    /// Decodes a `KEY_INPUT` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `KEY_INPUT` map, the input tuple is
+    /// missing, mistyped, or has a zero context, surface, or surface generation, the surface ID
+    /// differs from `header_object_id`, or the usage is outside the keyboard usage range.
     pub fn decode_key(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("KEY_INPUT", payload, &[0, 1, 2, 3, 4, 5, 6])?;
         let binding = InputTuple::decode(&map)?;
@@ -261,6 +282,14 @@ impl InputEvent {
         })
     }
 
+    /// Decodes a `POINTER_MOTION` payload on a `width` by `height` surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `POINTER_MOTION` map, the input
+    /// tuple is missing, mistyped, or has a zero context, surface, or surface generation, the
+    /// surface ID differs from `header_object_id`, or the position is outside the `width` by
+    /// `height` canonical surface.
     pub fn decode_motion(
         header_object_id: u64,
         payload: &Value,
@@ -276,6 +305,14 @@ impl InputEvent {
         Ok(Self::PointerMotion { binding, x, y })
     }
 
+    /// Decodes a `POINTER_BUTTON` payload on a `width` by `height` surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `POINTER_BUTTON` map, the input
+    /// tuple is missing, mistyped, or has a zero context, surface, or surface generation, the
+    /// surface ID differs from `header_object_id`, the button is unknown, or the position is
+    /// outside the `width` by `height` canonical surface.
     pub fn decode_button(
         header_object_id: u64,
         payload: &Value,
@@ -302,6 +339,14 @@ impl InputEvent {
         })
     }
 
+    /// Decodes a `POINTER_AXIS` payload on a `width` by `height` surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `POINTER_AXIS` map, the input tuple
+    /// is missing, mistyped, or has a zero context, surface, or surface generation, the surface ID
+    /// differs from `header_object_id`, a scroll delta is outside -12,000 through 12,000, or the
+    /// position is outside the `width` by `height` canonical surface.
     pub fn decode_axis(
         header_object_id: u64,
         payload: &Value,
@@ -360,6 +405,20 @@ pub enum InjectionRejection {
     ClassNotGranted,
 }
 
+impl std::fmt::Display for InjectionRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NoActiveGrant => "no input grant is active",
+            Self::StaleTuple => "input event names a stale binding",
+            Self::SurfaceGenerationChanged => "surface generation changed since the grant",
+            Self::WatchdogExpired => "input grant watchdog expired",
+            Self::ClassNotGranted => "input class was not granted",
+        })
+    }
+}
+
+impl std::error::Error for InjectionRejection {}
+
 #[derive(Debug, Default, Clone)]
 pub struct InputGate {
     latest_binding: Option<InputBinding>,
@@ -377,6 +436,13 @@ impl InputGate {
         self.release_generation
     }
 
+    /// Applies a `SET_INPUT_BINDING`, granting at most `effective_classes` from `now`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the binding fails [`InputBinding::validate`], moves the input
+    /// epoch backward, reuses the current epoch with different contents, or a grant generation is
+    /// exhausted.
     pub fn apply_binding(
         &mut self,
         binding: InputBinding,
@@ -444,6 +510,13 @@ impl InputGate {
         Ok(outcome)
     }
 
+    /// Extends the active grant's watchdog for an `INPUT_LEASE_RENEW` received at `received_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when there is no active grant, the renewal names
+    /// another binding, repeats or reorders a sequence number, arrives after the watchdog expired,
+    /// changes the watchdog, or the new deadline overflows.
     pub fn renew(
         &mut self,
         binding: InputTuple,
@@ -474,6 +547,11 @@ impl InputGate {
         Ok(())
     }
 
+    /// Revokes any active grant, advancing the grant generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when a grant generation is exhausted.
     pub fn revoke(&mut self) -> Result<GrantGeneration, MessageError> {
         let grant_generation = self.next_grant_generation()?;
         let release_generation = self.next_release_generation()?;
@@ -483,6 +561,13 @@ impl InputGate {
         Ok(grant_generation)
     }
 
+    /// Checks whether `event` may be injected now under the active grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InjectionRejection`] when there is no active grant, the event's tuple is stale,
+    /// the surface generation changed, the watchdog expired, or the event's input class was not
+    /// granted.
     pub fn authorize(
         &self,
         event: InputEvent,
@@ -513,6 +598,11 @@ impl InputGate {
     /// Callers that share this gate between threads place it behind the same mutex used by
     /// revocation and surface-target replacement. The closure must invoke only the currently
     /// selected target and must not enqueue work elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`InjectionRejection`] from [`InputGate::authorize`] without running
+    /// `operation`.
     pub fn dispatch<R>(
         &mut self,
         event: InputEvent,

@@ -19,12 +19,24 @@ macro_rules! counter_type {
                 self.0
             }
 
+            /// Returns the next value in this domain.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`io::ErrorKind::InvalidData`] when the counter is at `u64::MAX`; a domain
+            /// never wraps.
             pub fn advance(self) -> io::Result<Self> {
                 self.0.checked_add(1).map(Self).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, concat!($label, " exhausted"))
                 })
             }
 
+            /// Returns `self` when it is a valid live value.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`io::ErrorKind::InvalidData`] for zero, which no live value in this domain
+            /// may carry.
             pub fn require_nonzero(self) -> io::Result<Self> {
                 if self.0 == 0 {
                     Err(io::Error::new(

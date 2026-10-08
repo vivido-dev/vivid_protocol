@@ -88,6 +88,12 @@ impl NativeDiscovery {
         self.interactive.as_ref().unwrap_or(&self.control)
     }
 
+    /// Returns the endpoint for a track on `lane`, falling back to the bulk and then control
+    /// endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] when `lane` is neither realtime nor bulk.
     pub fn track(&self, lane: LaneClass) -> io::Result<&Endpoint> {
         match lane {
             LaneClass::Realtime => Ok(self

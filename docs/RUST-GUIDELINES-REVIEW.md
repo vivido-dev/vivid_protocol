@@ -15,8 +15,8 @@ A follow-up raised `rust-version` to 1.95 to match `vivid_sdk` and `vivido`. Nea
 consumer already needed 1.95 through the SDK.
 
 The open findings follow, most important first. Guideline IDs such as `M-INIT-CASCADED` name the
-rule each one comes from. `Cargo.toml` opts out of the lints for the first three until they are
-done, and each `#[expect]` reason in the source points back here.
+rule each one comes from. `Cargo.toml` opts out of `map_err_ignore` until typed errors land, and
+each `#[expect]` reason in the source points back here.
 
 ## Errors are `io::Error` with string messages (M-ERRORS-CANONICAL-STRUCTS)
 
@@ -44,23 +44,22 @@ About 128 `map_err(|_| ...)` calls deliberately replace an integer-conversion er
 labelled protocol error, so `clippy::map_err_ignore` is allowed until this redesign. The change
 reaches every signature that `vivid_sdk`, `vivid_gateway`, and `vivido` call.
 
-## Documentation (M-CANONICAL-DOCS, M-MODULE-DOCS, M-DOCUMENTED-MAGIC)
+## Documentation (M-CANONICAL-DOCS)
 
-- 347 public functions that return `Result` have no `# Errors` section, and 13 that can panic have
-  no `# Panics` section. `clippy::missing_errors_doc` and `clippy::missing_panics_doc` are allowed
-  until they do.
-- `missing_docs` reports 2,144 undocumented public items, counting fields and variants.
-- `cbor.rs`, `media.rs`, and `wire.rs` have no `//!` module documentation.
-- In `lib.rs`, `VIVID_MINOR` and `CONTROL_MAX_RECORD_BODY` have no doc comment.
-  `DEFAULT_MAX_RECORD_BODY` and `HARD_MAX_RECORD_BODY` are both 64 MiB, and nothing explains why
-  the crate keeps two.
-- The `cbor.rs` decoder limits (`MAX_DEPTH`, `MAX_VALUE_LENGTH`, `MAX_CONTAINER_LENGTH`) don't say
-  how they were chosen.
+Every fallible public function now documents its errors, and every function that can panic says
+when, so `clippy::missing_errors_doc` and `clippy::missing_panics_doc` are enforced. Each module
+has `//!` documentation, and the size and CBOR constants explain how they were chosen.
 
-To reproduce the counts:
+`missing_docs` still reports 1,825 undocumented public items. Most are self-describing wire
+fields (722), registry and flag constants (408), and enum variants (343). The rest are 122
+methods, 165 types, 56 functions, eight associated constants, and one type alias. Documenting them would let the
+crate enable `missing_docs`; the wire fields can usually point to the specification table that
+defines them.
+
+To reproduce the count:
 
 ```sh
-cargo clippy --lib -- -W clippy::missing_errors_doc -W clippy::missing_panics_doc -W missing_docs
+cargo clippy --lib -- -A clippy::all -W missing_docs
 ```
 
 ## Long positional parameter lists (M-INIT-CASCADED)

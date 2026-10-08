@@ -59,6 +59,13 @@ pub struct InputPacket {
 }
 
 impl InputPacket {
+    /// Decodes a microphone packet body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when `body` is not a valid audio packet, or its
+    /// epoch, packet ID, timestamps, duration, trim, or PCM length do not match the fixed
+    /// microphone format.
     pub fn decode(body: &[u8]) -> io::Result<Self> {
         let packet = media::parse_audio_packet(body)?;
         if packet.epoch == 0
@@ -88,6 +95,12 @@ impl InputPacket {
         })
     }
 
+    /// Encodes this microphone packet body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when the packet does not match the fixed microphone
+    /// format, and [`io::ErrorKind::InvalidInput`] when the body would be too large.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         let body = media::audio_packet_body(AudioPacket {
             epoch: self.epoch,

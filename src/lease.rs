@@ -49,6 +49,13 @@ pub struct SessionLeaseDefinition {
 }
 
 impl SessionLeaseDefinition {
+    /// Checks the lease's IDs, activation timeout, and permitted profiles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the context or lease ID is zero, the activation
+    /// timeout is outside 1 through 60 seconds, or the permitted profiles are not sorted, unique,
+    /// prerequisite-closed, and inclusive of the core profile.
     pub fn validate(&self) -> Result<(), MessageError> {
         require_nonzero("CREATE_SESSION_LEASE", 0, self.context_id)?;
         require_nonzero("CREATE_SESSION_LEASE", 1, self.lease_id)?;
@@ -82,6 +89,11 @@ impl SessionLeaseDefinition {
         Ok(())
     }
 
+    /// Encodes the `CREATE_SESSION_LEASE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`SessionLeaseDefinition::validate`].
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.validate()?;
         let mut fields = vec![
@@ -109,6 +121,14 @@ impl SessionLeaseDefinition {
         Ok(fields)
     }
 
+    /// Decodes a `CREATE_SESSION_LEASE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `CREATE_SESSION_LEASE` map, a field
+    /// is missing or has the wrong type, the profile list holds a non-text entry, the cleanup
+    /// policy or resource contract is invalid, or the definition fails
+    /// [`SessionLeaseDefinition::validate`].
     pub fn decode(payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new(
             "CREATE_SESSION_LEASE",
@@ -272,6 +292,15 @@ impl LeaseMachine {
         clippy::too_many_arguments,
         reason = "one argument per HELLO binding field; see docs/RUST-GUIDELINES-REVIEW.md"
     )]
+    /// Reserves an issued lease for a fresh activation attempt, or recognizes an exact retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseTransitionError::BadState`] when `session_id` is zero,
+    /// [`LeaseTransitionError::AuthenticationFailed`] when a resume attempt is pending, the lease
+    /// is not issued and this is not an exact retry of the reserved or active attempt, or the
+    /// profile fingerprint differs, and [`LeaseTransitionError::Exhausted`] when the revision
+    /// cannot advance.
     pub fn begin_activation(
         &mut self,
         attempt_id: [u8; 16],
@@ -322,7 +351,7 @@ impl LeaseMachine {
                 let decision = self.exact_retry(attempt_id, client_nonce, hello_bytes)?;
                 self.attempt
                     .as_mut()
-                    .expect("validated retry has an attempt")
+                    .ok_or(LeaseTransitionError::BadState)?
                     .transport_live = true;
                 Ok(decision)
             }
@@ -348,6 +377,12 @@ impl LeaseMachine {
         }
     }
 
+    /// Marks the reserved lease active once its `WELCOME` is committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseTransitionError::BadState`] when the lease is not reserved, and
+    /// [`LeaseTransitionError::Exhausted`] when the revision cannot advance.
     pub fn commit_welcome(&mut self) -> Result<(), LeaseTransitionError> {
         if self.state != LeaseState::Reserved {
             return Err(LeaseTransitionError::BadState);
@@ -356,6 +391,11 @@ impl LeaseMachine {
         self.advance_revision()
     }
 
+    /// Records that the active attempt has admitted its first post-`HELLO` record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseTransitionError::BadState`] when the lease is not active or has no attempt.
     pub fn admit_post_hello(&mut self) -> Result<(), LeaseTransitionError> {
         if self.state != LeaseState::Active {
             return Err(LeaseTransitionError::BadState);
@@ -367,6 +407,12 @@ impl LeaseMachine {
         Ok(())
     }
 
+    /// Handles loss of the attempt's transport, closing or suspending the lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseTransitionError::BadState`] when the lease is neither reserved nor active,
+    /// and [`LeaseTransitionError::Exhausted`] when the revision cannot advance.
     pub fn confirm_transport_lost(
         &mut self,
         clean: bool,
@@ -409,6 +455,15 @@ impl LeaseMachine {
         clippy::too_many_arguments,
         reason = "one argument per HELLO binding field; see docs/RUST-GUIDELINES-REVIEW.md"
     )]
+    /// Reserves a suspended lease for a resume attempt, or recognizes an exact retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseTransitionError::BadState`] when the lease is not suspended and this is not a
+    /// retry, [`LeaseTransitionError::StaleResumeGeneration`] when `expected_generation` is not
+    /// current, [`LeaseTransitionError::AuthenticationFailed`] for a non-retryable attempt or a
+    /// fingerprint mismatch, and [`LeaseTransitionError::Exhausted`] when the revision or resume
+    /// generation cannot advance.
     pub fn begin_resume(
         &mut self,
         expected_generation: ResumeGeneration,
@@ -437,7 +492,7 @@ impl LeaseMachine {
             let decision = self.exact_retry(attempt_id, client_nonce, hello_bytes)?;
             self.attempt
                 .as_mut()
-                .expect("validated retry has an attempt")
+                .ok_or(LeaseTransitionError::BadState)?
                 .transport_live = true;
             return Ok(decision);
         }
@@ -480,6 +535,12 @@ impl LeaseMachine {
         })
     }
 
+    /// Revokes the lease from any live state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseTransitionError::BadState`] when the lease is already closed, revoked, or
+    /// expired, and [`LeaseTransitionError::Exhausted`] when the revision cannot advance.
     pub fn revoke(&mut self) -> Result<(), LeaseTransitionError> {
         if matches!(
             self.state,
@@ -494,6 +555,12 @@ impl LeaseMachine {
         self.advance_revision()
     }
 
+    /// Expires the lease from any live state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseTransitionError::BadState`] when the lease is already closed, revoked, or
+    /// expired, and [`LeaseTransitionError::Exhausted`] when the revision cannot advance.
     pub fn expire(&mut self) -> Result<(), LeaseTransitionError> {
         if matches!(
             self.state,

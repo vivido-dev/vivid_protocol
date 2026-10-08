@@ -125,6 +125,12 @@ impl ChannelOpenState {
         ChannelOpenDecision::Fresh(acceptance)
     }
 
+    /// Admits a media record on the producer side's accepted channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when no channel is accepted, or `generation` is not
+    /// the accepted channel or its transport is down.
     pub fn admit_media(&mut self, generation: ChannelGeneration) -> Result<(), MessageError> {
         let accepted = self
             .accepted
@@ -542,6 +548,11 @@ impl ImageConfiguration {
     ///
     /// Public so a producer can reject a container before it becomes a track configuration,
     /// instead of each SDK binding reimplementing these bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the encoding is unknown, a dimension is out of
+    /// range, the encoded length is invalid, or a required SHA-256 value is missing.
     pub fn validate(&self) -> Result<(), MessageError> {
         if !(1..=2).contains(&self.encoding) {
             return Err(invalid_value(
@@ -742,6 +753,16 @@ pub struct TrackConfiguration {
 }
 
 impl TrackConfiguration {
+    /// Checks the configuration; `probe` selects the `PROBE_TRACK_CONFIG` rules, where the track ID
+    /// is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when a required ID is zero (or a probe's track ID is
+    /// nonzero), an uplink track is not live realtime audio without a slot or retained pixels, a
+    /// vector scene is not on live bulk slot 5, the lane is not realtime or bulk, the body or flow
+    /// limits cannot carry one maximum legal record or exceed the hard limit, the target latency
+    /// exceeds the maximum, or the kind-specific configuration is invalid.
     pub fn validate(&self, probe: bool) -> Result<(), MessageError> {
         if self.direction == TrackDirection::Uplink
             && (!matches!(self.kind, KindConfiguration::Audio(_))
@@ -843,6 +864,11 @@ impl TrackConfiguration {
         Ok(())
     }
 
+    /// Encodes the `CREATE_TRACK` payload, or the `PROBE_TRACK_CONFIG` payload when `probe` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`TrackConfiguration::validate`].
     pub fn payload(&self, probe: bool) -> Result<PayloadMap, MessageError> {
         self.validate(probe)?;
         let mut payload = vec![
@@ -869,6 +895,14 @@ impl TrackConfiguration {
         Ok(payload)
     }
 
+    /// Decodes a `CREATE_TRACK` payload, or a `PROBE_TRACK_CONFIG` payload when `probe` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict track map, a field is missing or has
+    /// the wrong type, the track ID differs from `header_object_id`, the kind, direction, mode, or
+    /// lane is unregistered, the kind configuration is invalid, or the result fails
+    /// [`TrackConfiguration::validate`].
     pub fn decode(
         header_object_id: u64,
         payload: &Value,
@@ -929,6 +963,13 @@ impl TrackState {
         }
     }
 
+    /// Accepts a channel for `generation` with the given credit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the track is lost, `generation` is not the live
+    /// channel generation, the credit cannot admit one maximum legal record, or the track revision
+    /// is exhausted.
     pub fn accept_channel(
         &mut self,
         generation: ChannelGeneration,
@@ -956,6 +997,14 @@ impl TrackState {
         Ok(())
     }
 
+    /// Admits one received media record against the channel's credit and ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the track is lost or the channel generation is
+    /// stale, the record exceeds the flow allowance or overflows accounting, the media ID is zero
+    /// or not increasing, the epoch moved backward, or a new epoch does not begin with a
+    /// random-access unit.
     pub fn admit_media(
         &mut self,
         generation: ChannelGeneration,
@@ -1000,6 +1049,12 @@ impl TrackState {
         Ok(())
     }
 
+    /// Moves the track from channel generation `expected` to `next`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `expected` is not current, `next` is not exactly
+    /// one more, or the track revision is exhausted.
     pub fn advance_channel(
         &mut self,
         expected: ChannelGeneration,
@@ -1020,11 +1075,21 @@ impl TrackState {
         self.advance_revision("ADVANCE_CHANNEL")
     }
 
+    /// Records that the track's channel detached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the track revision is exhausted.
     pub fn detach(&mut self) -> Result<(), MessageError> {
         self.milestones |= MILESTONE_CHANNEL_DETACHED;
         self.advance_revision("channel detach")
     }
 
+    /// Marks the track lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the track revision is exhausted.
     pub fn lose(&mut self) -> Result<(), MessageError> {
         self.lost = true;
         self.milestones |= MILESTONE_TRACK_LOST;

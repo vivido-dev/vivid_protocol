@@ -42,6 +42,12 @@ impl Default for Typography {
     }
 }
 impl Typography {
+    /// Checks that spacing is within 0 through 1,024 and any line height within (0, 4,096].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when letter or word spacing is negative or above
+    /// 1,024, or the line height is not positive or above 4,096.
     pub fn validate(&self) -> Result<(), MessageError> {
         if [self.letter_spacing, self.word_spacing]
             .iter()
@@ -151,6 +157,14 @@ impl StyledText {
     pub fn text(&self) -> String {
         self.runs.iter().map(|run| run.text.as_str()).collect()
     }
+    /// Checks the paragraph's typography, runs, and layout limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the typography is invalid, ellipsis is requested
+    /// without a maximum width, there are no runs or too many, the maximum width or line count is
+    /// out of range, the text exceeds the byte ceiling, or a run has a non-positive size, an
+    /// over-long font family, or a weight outside 1 through 1,000.
     pub fn validate(&self) -> Result<(), MessageError> {
         self.typography.validate()?;
         if self.typography.overflow == TextOverflow::Ellipsis && self.max_width.is_none() {
@@ -180,6 +194,11 @@ impl StyledText {
         }
         Ok(())
     }
+    /// Encodes the paragraph as its CBOR array.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`StyledText::validate`].
     pub fn value(&self) -> Result<Value, MessageError> {
         self.validate()?;
         let runs = self
@@ -215,6 +234,13 @@ impl StyledText {
         }
         Ok(Value::Array(values))
     }
+    /// Decodes a paragraph from its CBOR array.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a five- or six-element paragraph array, a run
+    /// is malformed, the text exceeds the byte ceiling, or the result fails
+    /// [`StyledText::validate`].
     pub fn decode(value: &Value) -> Result<Self, MessageError> {
         let v = value
             .as_array()
@@ -292,6 +318,13 @@ pub struct MeasureBatch {
     pub retain: bool,
 }
 impl MeasureBatch {
+    /// Encodes the `MEASURE_OVERLAY_TEXT_BATCH` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address is invalid, the batch is empty or over the
+    /// batch limit, a paragraph fails [`StyledText::validate`], or the batch's aggregate text
+    /// exceeds its ceiling.
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         if self.texts.is_empty() || self.texts.len() > MAX_TEXT_BATCH {
@@ -320,6 +353,13 @@ impl MeasureBatch {
         payload.push((4, Value::Bool(self.retain)));
         Ok(payload)
     }
+    /// Decodes a `MEASURE_OVERLAY_TEXT_BATCH` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict map, the batch is not an array or is
+    /// over the batch limit, the window address fails against `object`, a paragraph is malformed,
+    /// or the batch fails [`MeasureBatch::payload`].
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3, 4])?;
         let values = map
@@ -348,6 +388,12 @@ pub struct BatchMeasured {
     pub layouts: Vec<(u64, TextMeasurement)>,
 }
 impl BatchMeasured {
+    /// Encodes the `OVERLAY_TEXT_BATCH_MEASURED` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the result list is empty or over the batch limit, a
+    /// measurement is invalid, or the combined geometry exceeds its ceiling.
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         if self.layouts.is_empty() || self.layouts.len() > MAX_TEXT_BATCH {
             return Err(bad(3, "batch result limit"));
@@ -371,6 +417,13 @@ impl BatchMeasured {
         payload.push((3, Value::Array(values)));
         Ok(payload)
     }
+    /// Decodes an `OVERLAY_TEXT_BATCH_MEASURED` payload for the window at `address`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict map, names another window, the results
+    /// are not an array of layout ID and measurement pairs, the list is empty or over the batch
+    /// limit, or the batch fails [`BatchMeasured::payload`].
     pub fn decode(address: WindowAddress, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3])?;
         if WindowAddress::decode(address.surface_id, &map)? != address {
@@ -405,6 +458,12 @@ pub struct ReleaseLayouts {
     pub ids: Vec<u64>,
 }
 impl ReleaseLayouts {
+    /// Encodes the `RELEASE_OVERLAY_TEXT_LAYOUTS` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address is invalid, or the ID list is empty, over
+    /// the batch limit, or holds a zero or duplicate ID.
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         let mut ids = std::collections::BTreeSet::new();
@@ -418,6 +477,13 @@ impl ReleaseLayouts {
         payload.push((3, Value::Array(self.ids.iter().copied().map(u).collect())));
         Ok(payload)
     }
+    /// Decodes a `RELEASE_OVERLAY_TEXT_LAYOUTS` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict map, the IDs are not an array of
+    /// unsigned integers, the list exceeds the release limit, the window address fails against
+    /// `object`, or the list fails [`ReleaseLayouts::payload`].
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3])?;
         let values = map

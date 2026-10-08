@@ -1,3 +1,19 @@
+//! Connection framing: the preface, record headers, and blocking record transport.
+//!
+//! Every Vivid connection starts with a 16-byte preface: the magic `VIVD`, the major and minor
+//! version, the [`ConnectionKind`], a reserved zero byte, and the largest record body the sender
+//! will accept, big-endian. Records follow, each a 24-byte [`RecordHeader`] (body length, record
+//! type, flags, object ID, and sequence number, all big-endian) and then the body.
+//!
+//! [`Preface`] and [`RecordHeader`] encode and decode those layouts without I/O. With the `native`
+//! or `native-transport` feature, `Connection` opens a TCP or Unix-socket `Endpoint`, exchanges
+//! prefaces, and reads and writes records. Its `ConnectionWriter` half is cloneable and keeps
+//! send sequence numbers ordered; the `ConnectionReader` half enforces the negotiated body limit
+//! before allocating.
+//!
+//! A receiver that rejects only the version answers with [`unsupported_version_record`]; malformed
+//! prefaces are closed silently, as the core specification requires.
+
 use std::{fmt, io};
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -81,6 +97,12 @@ impl ConnectionKind {
         }
     }
 
+    /// Checks that a connection's first record is the one its kind requires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when the record is not sequence 1, has the wrong
+    /// record type for this kind, or is a control `HELLO` whose object ID is not zero.
     pub fn validate_first_record(self, header: &RecordHeader) -> io::Result<()> {
         if header.sequence != 1 || header.record_type != self.required_first_record() {
             return Err(io::Error::new(
@@ -108,6 +130,12 @@ pub struct Preface {
 }
 
 impl Preface {
+    /// Decodes a 16-byte preface, checking every field except the version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] for wrong magic, nonzero reserved bytes or flags, a
+    /// body limit of zero or above [`crate::HARD_MAX_RECORD_BODY`], or an unknown connection kind.
     pub fn decode(bytes: [u8; PREFACE_SIZE]) -> io::Result<Self> {
         if &bytes[0..4] != MAGIC {
             return Err(io::Error::new(
@@ -127,7 +155,7 @@ impl Preface {
                 "Vivid preface reserved flags are nonzero",
             ));
         }
-        let initiator_tx_body_limit = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        let initiator_tx_body_limit = u32::from_be_bytes(crate::array_at(&bytes, 8));
         if initiator_tx_body_limit == 0 || initiator_tx_body_limit > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -144,6 +172,11 @@ impl Preface {
     }
 
     /// Decode the structurally stable preface and classify only a well-formed version mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Preface::decode`]; a well-formed preface of another version is not
+    /// an error.
     pub fn classify(bytes: [u8; PREFACE_SIZE]) -> io::Result<PrefaceClassification> {
         let preface = Self::decode(bytes)?;
         if (preface.major, preface.minor) == (VIVID_MAJOR, VIVID_MINOR) {
@@ -160,7 +193,12 @@ pub enum PrefaceClassification {
     UnsupportedVersion(Preface),
 }
 
-/// Build the one record a receiver may send for a structurally valid version mismatch.
+/// Builds the one record a receiver may send for a structurally valid version mismatch.
+///
+/// # Panics
+///
+/// Never in practice: the record carries a fixed `ERROR` body of a few dozen bytes, so its length
+/// always fits the header's `u32`.
 pub fn unsupported_version_record() -> Vec<u8> {
     let body = crate::messages::unsupported_version_error();
     let header = RecordHeader {
@@ -178,6 +216,12 @@ pub fn unsupported_version_record() -> Vec<u8> {
 }
 
 /// Validate an accepted preface, emitting one typed rejection only for a version mismatch.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] for a malformed preface without writing anything, and
+/// [`io::ErrorKind::Unsupported`] after writing the version rejection for another version. Errors
+/// writing that rejection are returned instead.
 #[cfg(any(feature = "native", feature = "native-transport"))]
 pub fn accept_preface<W: Write + ?Sized>(
     bytes: [u8; PREFACE_SIZE],
@@ -260,6 +304,13 @@ impl Read for ReaderIo {
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
 impl Endpoint {
+    /// Parses an endpoint from `unix:/absolute/path`, `tcp:127.0.0.1:PORT`, or a bare absolute
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] for an empty or relative Unix path, a TCP address
+    /// other than `127.0.0.1` with a nonzero port, or any other URL scheme.
     pub fn parse(value: &str) -> io::Result<Self> {
         if let Some(path) = value.strip_prefix("unix:") {
             if path.is_empty() || !Path::new(path).is_absolute() {
@@ -437,6 +488,14 @@ impl NativeShutdown {
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
 impl ConnectionWriter {
+    /// Writes one record with a single-slice body, flushing as the flush mode requires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down,
+    /// [`io::ErrorKind::InvalidInput`] when `flags` sets a reserved bit or the body exceeds the
+    /// send limit or [`crate::HARD_MAX_RECORD_BODY`], [`io::ErrorKind::InvalidData`] when the send
+    /// sequence is exhausted, and any transport write or flush error.
     pub fn write_record(
         &self,
         record_type: u16,
@@ -447,6 +506,14 @@ impl ConnectionWriter {
         self.write_record_parts(record_type, flags, object_id, &[body])
     }
 
+    /// Writes one record whose body is the concatenation of `parts`, without copying them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down,
+    /// [`io::ErrorKind::InvalidInput`] when `flags` sets a reserved bit or the body exceeds the
+    /// send limit or [`crate::HARD_MAX_RECORD_BODY`], [`io::ErrorKind::InvalidData`] when the send
+    /// sequence is exhausted, and any transport write or flush error.
     pub fn write_record_parts(
         &self,
         record_type: u16,
@@ -457,6 +524,14 @@ impl ConnectionWriter {
         self.write_record_parts_inner(record_type, flags, object_id, parts, false)
     }
 
+    /// Writes one record and flushes it immediately, whatever the flush mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down,
+    /// [`io::ErrorKind::InvalidInput`] when `flags` sets a reserved bit or the body exceeds the
+    /// send limit or [`crate::HARD_MAX_RECORD_BODY`], [`io::ErrorKind::InvalidData`] when the send
+    /// sequence is exhausted, and any transport write or flush error.
     pub fn write_record_checkpoint(
         &self,
         record_type: u16,
@@ -467,6 +542,14 @@ impl ConnectionWriter {
         self.write_record_parts_inner(record_type, flags, object_id, &[body], true)
     }
 
+    /// Writes one record from `parts` and flushes it immediately, whatever the flush mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down,
+    /// [`io::ErrorKind::InvalidInput`] when `flags` sets a reserved bit or the body exceeds the
+    /// send limit or [`crate::HARD_MAX_RECORD_BODY`], [`io::ErrorKind::InvalidData`] when the send
+    /// sequence is exhausted, and any transport write or flush error.
     pub fn write_record_parts_checkpoint(
         &self,
         record_type: u16,
@@ -566,6 +649,12 @@ impl ConnectionWriter {
         Ok(header.sequence)
     }
 
+    /// Switches between immediate and batched flushing, flushing pending records first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down, and any
+    /// transport flush error.
     pub fn set_flush_mode(&self, mode: FlushMode) -> io::Result<()> {
         let mut state = self
             .state
@@ -582,6 +671,12 @@ impl ConnectionWriter {
         Ok(())
     }
 
+    /// Flushes any records batched by [`FlushMode::Batched`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down, and any
+    /// transport flush error.
     pub fn flush(&self) -> io::Result<()> {
         let mut state = self
             .state
@@ -595,6 +690,13 @@ impl ConnectionWriter {
         Ok(())
     }
 
+    /// Sets the largest record body this writer will send.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] when `maximum` is zero or above
+    /// [`crate::HARD_MAX_RECORD_BODY`], and [`io::ErrorKind::BrokenPipe`] when the writer is
+    /// closed.
     pub fn set_send_body_limit(&self, maximum: u32) -> io::Result<()> {
         validate_body_limit(maximum)?;
         let mut state = self
@@ -615,6 +717,11 @@ impl ConnectionWriter {
     /// connection slot live. Shutdown is therefore explicit and shared: native sockets are shut
     /// down in both directions, while stream adapters are dropped so multiplexed transports can
     /// observe their own channel close.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when an internal lock is poisoned or the transport refuses the
+    /// shutdown; repeated calls succeed.
     pub fn shutdown(&self) -> io::Result<()> {
         // Publish cancellation before waking a native syscall. Some platforms may report a
         // concurrently shut-down write as successful even though its bytes were discarded.
@@ -717,16 +824,34 @@ impl ConnectionReader {
     /// committing to wait forever, which a language binding driving a transfer or lane from a
     /// worker thread needs. Only native socket transports can honour it; anything else reports
     /// [`io::ErrorKind::Unsupported`] rather than pretending the deadline exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error the transport reports when setting its read timeout.
     pub fn set_read_deadline(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         self.io.set_read_deadline(timeout)
     }
 
+    /// Sets the largest record body this reader will accept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] when `maximum` is zero or above
+    /// [`crate::HARD_MAX_RECORD_BODY`].
     pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
         validate_body_limit(maximum)?;
         self.receive_body_limit = maximum;
         Ok(())
     }
 
+    /// Reads the next record into a newly allocated body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when the header sets a reserved flag, the body
+    /// exceeds the receive limit or [`crate::HARD_MAX_RECORD_BODY`], or the sequence number is not
+    /// the next expected one, and any transport read error, including `UnexpectedEof` when the peer
+    /// closes mid-record.
     pub fn read_record(&mut self) -> io::Result<Record> {
         let mut body = Vec::new();
         let header = self.read_record_body_into(&mut body)?;
@@ -739,6 +864,14 @@ impl ConnectionReader {
         })
     }
 
+    /// Reads the next record into `body`, reusing its capacity across calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when the header sets a reserved flag, the body
+    /// exceeds the receive limit or [`crate::HARD_MAX_RECORD_BODY`], or the sequence number is not
+    /// the next expected one, and any transport read error, including `UnexpectedEof` when the peer
+    /// closes mid-record.
     pub fn read_record_into<'a>(
         &mut self,
         body: &'a mut Vec<u8>,
@@ -799,11 +932,22 @@ pub struct Connection {
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
 impl Connection {
+    /// Connects to `endpoint` and sends this crate's protocol-version preface for `kind`.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from connecting to `endpoint` or writing the preface, including
+    /// [`io::ErrorKind::Unsupported`] for a Unix endpoint on a platform without Unix sockets.
     pub fn open(endpoint: &Endpoint, kind: ConnectionKind) -> io::Result<Self> {
         Self::open_version(endpoint, kind, VIVID_MAJOR, VIVID_MINOR)
     }
 
     /// Open a fresh connection using a version the caller has explicitly selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from connecting to `endpoint` or writing the preface, including
+    /// [`io::ErrorKind::Unsupported`] for a Unix endpoint on a platform without Unix sockets.
     pub fn open_version(
         endpoint: &Endpoint,
         kind: ConnectionKind,
@@ -819,6 +963,10 @@ impl Connection {
     /// The caller owns transport authentication and peer routing. This constructor still emits
     /// the connection preface and preserves all normal record limits and sequencing, making it
     /// suitable for bindings such as an authenticated WebSocket relay.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from writing the preface to `writer`.
     pub fn from_streams(
         reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
@@ -829,11 +977,21 @@ impl Connection {
 
     /// Create a new, private metadata-only NDJSON trace. Existing paths are rejected.
     /// No preface or record body is persisted. Dropping the last writer drains the bounded queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::AlreadyExists`] when `path` exists, and any error creating its
+    /// parent directory or the file.
     pub fn trace(path: &Path, kind: ConnectionKind) -> io::Result<Self> {
         let guard = TraceGuard::file(path, TraceComponent::Protocol, TraceHop::Local, [0; 16])?;
         Self::new(None, WriterIo::Trace(guard), kind)
     }
 
+    /// Opens a connection that discards every record, for measuring encoders without I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the discarded preface write fails, which `io::Sink` never does.
     pub fn sink(kind: ConnectionKind) -> io::Result<Self> {
         Self::new(None, WriterIo::Sink(io::sink()), kind)
     }
@@ -883,6 +1041,11 @@ impl Connection {
     /// handshake response. Once the caller has validated that response, `split` removes those
     /// transport deadlines: ordinary protocol idleness and backpressure are not framing errors or
     /// loss signals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`] for a trace or sink connection, and any error
+    /// clearing the establishment deadlines.
     pub fn split(self) -> io::Result<(ConnectionReader, ConnectionWriter)> {
         let mut reader = self.reader.ok_or_else(|| {
             io::Error::new(
@@ -904,6 +1067,14 @@ impl Connection {
         self.writer.clone()
     }
 
+    /// Writes one record; see [`ConnectionWriter::write_record`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down,
+    /// [`io::ErrorKind::InvalidInput`] when `flags` sets a reserved bit or the body exceeds the
+    /// send limit or [`crate::HARD_MAX_RECORD_BODY`], [`io::ErrorKind::InvalidData`] when the send
+    /// sequence is exhausted, and any transport write or flush error.
     pub fn write_record(
         &mut self,
         record_type: u16,
@@ -915,6 +1086,14 @@ impl Connection {
             .write_record(record_type, flags, object_id, body)
     }
 
+    /// Writes one record from `parts`; see [`ConnectionWriter::write_record_parts`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down,
+    /// [`io::ErrorKind::InvalidInput`] when `flags` sets a reserved bit or the body exceeds the
+    /// send limit or [`crate::HARD_MAX_RECORD_BODY`], [`io::ErrorKind::InvalidData`] when the send
+    /// sequence is exhausted, and any transport write or flush error.
     pub fn write_record_parts(
         &mut self,
         record_type: u16,
@@ -926,6 +1105,14 @@ impl Connection {
             .write_record_parts(record_type, flags, object_id, parts)
     }
 
+    /// Writes and flushes one record; see [`ConnectionWriter::write_record_checkpoint`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down,
+    /// [`io::ErrorKind::InvalidInput`] when `flags` sets a reserved bit or the body exceeds the
+    /// send limit or [`crate::HARD_MAX_RECORD_BODY`], [`io::ErrorKind::InvalidData`] when the send
+    /// sequence is exhausted, and any transport write or flush error.
     pub fn write_record_checkpoint(
         &mut self,
         record_type: u16,
@@ -937,6 +1124,15 @@ impl Connection {
             .write_record_checkpoint(record_type, flags, object_id, body)
     }
 
+    /// Writes and flushes one record from `parts`; see
+    /// [`ConnectionWriter::write_record_parts_checkpoint`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed or shut down,
+    /// [`io::ErrorKind::InvalidInput`] when `flags` sets a reserved bit or the body exceeds the
+    /// send limit or [`crate::HARD_MAX_RECORD_BODY`], [`io::ErrorKind::InvalidData`] when the send
+    /// sequence is exhausted, and any transport write or flush error.
     pub fn write_record_parts_checkpoint(
         &mut self,
         record_type: u16,
@@ -948,18 +1144,44 @@ impl Connection {
             .write_record_parts_checkpoint(record_type, flags, object_id, parts)
     }
 
+    /// Switches between immediate and batched flushing; see [`ConnectionWriter::set_flush_mode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed, and any transport flush
+    /// error.
     pub fn set_flush_mode(&mut self, mode: FlushMode) -> io::Result<()> {
         self.writer.set_flush_mode(mode)
     }
 
+    /// Flushes batched records; see [`ConnectionWriter::flush`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::BrokenPipe`] when the writer is closed, and any transport flush
+    /// error.
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
 
+    /// Sets the send body limit; see [`ConnectionWriter::set_send_body_limit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] when `maximum` is zero or above
+    /// [`crate::HARD_MAX_RECORD_BODY`], and [`io::ErrorKind::BrokenPipe`] when the writer is
+    /// closed.
     pub fn set_send_body_limit(&mut self, maximum: u32) -> io::Result<()> {
         self.writer.set_send_body_limit(maximum)
     }
 
+    /// Sets the receive body limit; see [`ConnectionReader::set_receive_body_limit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`] for a trace or sink connection, which has no reader,
+    /// and otherwise [`io::ErrorKind::InvalidInput`] when `maximum` is zero or above
+    /// [`crate::HARD_MAX_RECORD_BODY`].
     pub fn set_receive_body_limit(&mut self, maximum: u32) -> io::Result<()> {
         self.reader
             .as_mut()
@@ -967,6 +1189,12 @@ impl Connection {
             .set_receive_body_limit(maximum)
     }
 
+    /// Reads the next record; see [`ConnectionReader::read_record`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`] for a trace or sink connection, which has no reader,
+    /// and otherwise the reader's errors.
     pub fn read_record(&mut self) -> io::Result<Record> {
         self.reader
             .as_mut()
@@ -979,6 +1207,12 @@ impl Connection {
             .read_record()
     }
 
+    /// Reads the next record into `body`; see [`ConnectionReader::read_record_into`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`] for a trace or sink connection, which has no reader,
+    /// and otherwise the reader's errors.
     pub fn read_record_into<'a>(
         &mut self,
         body: &'a mut Vec<u8>,
@@ -1261,11 +1495,11 @@ impl RecordHeader {
 
     pub fn decode(bytes: [u8; HEADER_SIZE]) -> Self {
         Self {
-            body_length: u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
-            record_type: u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
-            flags: u16::from_be_bytes(bytes[6..8].try_into().unwrap()),
-            object_id: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
-            sequence: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+            body_length: u32::from_be_bytes(crate::array_at(&bytes, 0)),
+            record_type: u16::from_be_bytes(crate::array_at(&bytes, 4)),
+            flags: u16::from_be_bytes(crate::array_at(&bytes, 6)),
+            object_id: u64::from_be_bytes(crate::array_at(&bytes, 8)),
+            sequence: u64::from_be_bytes(crate::array_at(&bytes, 16)),
         }
     }
 }

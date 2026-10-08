@@ -27,6 +27,11 @@ pub struct WindowAddress {
 }
 
 impl WindowAddress {
+    /// Returns the full surface identity of this window under `owner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the context or surface ID is zero.
     pub fn identity(self, owner: SessionIdentity) -> Result<SurfaceIdentity, MessageError> {
         owner
             .context(self.context_id)
@@ -34,6 +39,12 @@ impl WindowAddress {
             .map_err(|_| bad(0, "window identity must be nonzero"))
     }
 
+    /// Checks that the IDs and generation are nonzero and the surface matches header `object`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the context ID, surface ID, or generation is zero, or the
+    /// surface ID differs from `object`.
     pub fn validate(self, object: u64) -> Result<(), MessageError> {
         validate_header_object(object, self.surface_id)?;
         if self.context_id == 0 || self.surface_id == 0 || self.generation == 0 {
@@ -70,6 +81,13 @@ pub struct SetWindow {
 }
 
 impl SetWindow {
+    /// Encodes the `SET_OVERLAY_WINDOW` payload; `owner` scopes the parent check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address fails [`WindowAddress::validate`], the
+    /// window options are invalid, or the parent is zero, belongs to another owner, or is the
+    /// window itself.
     pub fn payload(&self, owner: SessionIdentity) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         self.options.validate().map_err(|e| bad(4, e.0))?;
@@ -116,6 +134,13 @@ impl SetWindow {
         Ok(values)
     }
 
+    /// Decodes a `SET_OVERLAY_WINDOW` payload sent by `owner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `SET_OVERLAY_WINDOW` map, a field is
+    /// missing or has the wrong type, the window address fails [`WindowAddress::validate`] against
+    /// `object`, or the options or parent are invalid as [`SetWindow::payload`] describes.
     pub fn decode(
         owner: SessionIdentity,
         object: u64,
@@ -183,6 +208,12 @@ pub struct Action {
     pub action: WindowAction,
 }
 impl Action {
+    /// Encodes the `OVERLAY_ACTION` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address fails [`WindowAddress::validate`] or the
+    /// expected revision is zero.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         nonzero(self.expected_revision, 3)?;
@@ -202,6 +233,13 @@ impl Action {
         ]);
         Ok(fields)
     }
+    /// Decodes an `OVERLAY_ACTION` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `OVERLAY_ACTION` map, a field is
+    /// missing or has the wrong type, the window address fails [`WindowAddress::validate`] against
+    /// `object`, the expected revision is zero, or the action is unknown.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3, 4])?;
         Ok(Self {
@@ -228,6 +266,12 @@ pub struct Viewport {
     pub scale_denominator: u32,
 }
 impl Viewport {
+    /// Checks that the extent and both scale terms are positive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the width, height, scale numerator, or scale
+    /// denominator is not positive.
     pub fn validate(self) -> Result<(), MessageError> {
         if self.width <= Scalar::ZERO
             || self.height <= Scalar::ZERO
@@ -265,6 +309,14 @@ impl Status {
         }
         Ok(())
     }
+    /// Encodes the `OVERLAY_STATUS` payload; `owner` scopes the window's parent check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window fails [`SetWindow::payload`], the expected or
+    /// viewport revision is zero, the viewport fails [`Viewport::validate`], the active binding is
+    /// invalid or names another window, or the accepted revision precedes the active or presented
+    /// content.
     pub fn payload(&self, owner: SessionIdentity) -> Result<PayloadMap, MessageError> {
         self.validate_progress()?;
         nonzero(self.window.expected_revision, 3)?;
@@ -309,6 +361,13 @@ impl Status {
         ]);
         Ok(fields)
     }
+    /// Decodes an `OVERLAY_STATUS` payload sent to `owner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `OVERLAY_STATUS` map, a field is
+    /// missing or has the wrong type, the window address fails [`WindowAddress::validate`] against
+    /// `object`, or the status fails the rules of [`Status::payload`].
     pub fn decode(
         owner: SessionIdentity,
         object: u64,
@@ -368,6 +427,12 @@ pub struct Submission {
     pub revision: u64,
 }
 impl Submission {
+    /// Checks the submission's window address and that its channel identity is nonzero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address fails [`WindowAddress::validate`], or the
+    /// track ID, channel generation, epoch, or revision is zero.
     pub fn validate(self) -> Result<(), MessageError> {
         self.address.validate(self.address.surface_id)?;
         nonzero(self.track_id, 3)?;
@@ -388,6 +453,11 @@ pub struct SubmissionOutcome {
     pub outcome: PresentationOutcome,
 }
 impl SubmissionOutcome {
+    /// Encodes the `OVERLAY_SUBMISSION_OUTCOME` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Submission::validate`].
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         let s = self.submission;
         s.validate()?;
@@ -407,6 +477,13 @@ impl SubmissionOutcome {
         ]);
         Ok(values)
     }
+    /// Decodes an `OVERLAY_SUBMISSION_OUTCOME` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `OVERLAY_SUBMISSION_OUTCOME` map, a
+    /// field is missing or has the wrong type, the window address fails [`WindowAddress::validate`]
+    /// against `object`, the submission fails [`Submission::validate`], or the outcome is unknown.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3, 4, 5, 6, 7])?;
         let submission = Submission {
@@ -433,6 +510,12 @@ pub struct ViewportChanged {
     pub viewport: Viewport,
 }
 impl ViewportChanged {
+    /// Encodes the `OVERLAY_VIEWPORT_CHANGED` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the viewport fails [`Viewport::validate`] or the revision is
+    /// zero.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         self.viewport.validate()?;
         nonzero(self.revision, 0)?;
@@ -454,6 +537,13 @@ impl ViewportChanged {
             ),
         ])
     }
+    /// Decodes an `OVERLAY_VIEWPORT_CHANGED` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `object` is not zero, `value` is not a strict
+    /// `OVERLAY_VIEWPORT_CHANGED` map, or a field is missing or has the wrong type, the viewport
+    /// fails [`Viewport::validate`], or the revision is zero.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         validate_header_object(object, 0)?;
         let map = strict(value, &[0, 1, 2])?;
@@ -479,11 +569,22 @@ pub struct Query {
     pub surface_id: u64,
 }
 impl Query {
+    /// Encodes the `QUERY_OVERLAY` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the context or surface ID is zero.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         nonzero(self.context_id, 0)?;
         nonzero(self.surface_id, 1)?;
         Ok(vec![(0, u(self.context_id)), (1, u(self.surface_id))])
     }
+    /// Decodes a `QUERY_OVERLAY` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `QUERY_OVERLAY` map, an ID is missing,
+    /// mistyped, or zero, or the surface ID differs from `object`.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1])?;
         let query = Self {
@@ -516,6 +617,12 @@ impl From<super::WindowEvent> for InputEvent {
     }
 }
 impl InputEvent {
+    /// Encodes the `OVERLAY_INPUT_EVENT` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address fails [`WindowAddress::validate`] or the
+    /// event payload is invalid or oversized.
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         if !valid_event(&self.event) {
@@ -621,6 +728,14 @@ impl InputEvent {
         fields.extend([(3, u(self.scene_revision)), (4, u(kind)), (5, payload)]);
         Ok(fields)
     }
+    /// Decodes an `OVERLAY_INPUT_EVENT` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `OVERLAY_INPUT_EVENT` map, a field is
+    /// missing or has the wrong type, the window address fails [`WindowAddress::validate`] against
+    /// `object`, the event kind is unknown, or its payload has the wrong arity, an out-of-range
+    /// value, or invalid coordinates.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3, 4, 5])?;
         let address = WindowAddress::decode(object, &map)?;
@@ -772,6 +887,12 @@ pub struct SetSemantics {
     pub semantics: Semantics,
 }
 impl SetSemantics {
+    /// Encodes the `SET_OVERLAY_SEMANTICS` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address fails [`WindowAddress::validate`] or the
+    /// semantic tree is invalid.
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         self.semantics
@@ -783,6 +904,14 @@ impl SetSemantics {
         fields.push((4, Value::Array(nodes)));
         Ok(fields)
     }
+    /// Decodes a `SET_OVERLAY_SEMANTICS` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `SET_OVERLAY_SEMANTICS` map, a field
+    /// is missing or has the wrong type, the window address fails [`WindowAddress::validate`]
+    /// against `object`, the node list is empty or over the node limit, a node is malformed, or the
+    /// tree is invalid.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3, 4])?;
         let address = WindowAddress::decode(object, &map)?;
@@ -965,6 +1094,12 @@ pub struct Clipboard {
     pub text: String,
 }
 impl Clipboard {
+    /// Encodes the `SET_OVERLAY_CLIPBOARD` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address fails [`WindowAddress::validate`] or the
+    /// text is empty or over the clipboard limit.
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         if self.text.is_empty() || self.text.len() > super::MAX_CLIPBOARD_BYTES {
@@ -974,6 +1109,13 @@ impl Clipboard {
         fields.push((3, Value::Text(self.text.clone())));
         Ok(fields)
     }
+    /// Decodes a `SET_OVERLAY_CLIPBOARD` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `SET_OVERLAY_CLIPBOARD` map, a field
+    /// is missing or has the wrong type, the window address fails [`WindowAddress::validate`]
+    /// against `object`, or the text is not text, is empty, or exceeds the clipboard limit.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3])?;
         let address = WindowAddress::decode(object, &map)?;
@@ -1031,6 +1173,12 @@ impl Default for Environment {
 }
 
 impl Environment {
+    /// Checks the font family length, font size, and refresh interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the font family exceeds its byte ceiling, the
+    /// font size is not positive, or the refresh interval is zero.
     pub fn validate(&self) -> Result<(), MessageError> {
         if self.font_family.len() > text::styled::MAX_FAMILY_BYTES {
             return Err(bad(1, "environment font family exceeds its ceiling"));
@@ -1052,6 +1200,12 @@ pub struct EnvironmentChanged {
     pub environment: Environment,
 }
 impl EnvironmentChanged {
+    /// Encodes the `OVERLAY_ENV_CHANGED` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the environment fails [`Environment::validate`] or the
+    /// revision is zero.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         self.environment.validate()?;
         nonzero(self.revision, 0)?;
@@ -1071,6 +1225,13 @@ impl EnvironmentChanged {
             (5, env.refresh_interval_us.map_or(Value::Null, u)),
         ])
     }
+    /// Decodes an `OVERLAY_ENV_CHANGED` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `object` is not zero, `value` is not a strict
+    /// `OVERLAY_ENV_CHANGED` map, or a field is missing or has the wrong type, the appearance is
+    /// unknown, or the environment fails [`Environment::validate`].
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         validate_header_object(object, 0)?;
         let map = strict(value, &[0, 1, 2, 3, 4, 5])?;
@@ -1114,6 +1275,12 @@ pub struct Capture {
     pub capture: bool,
 }
 impl Capture {
+    /// Encodes the `OVERLAY_INPUT_CAPTURE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address fails [`WindowAddress::validate`] or the
+    /// scene revision is zero.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         nonzero(self.scene_revision, 3)?;
@@ -1121,6 +1288,13 @@ impl Capture {
         fields.extend([(3, u(self.scene_revision)), (4, Value::Bool(self.capture))]);
         Ok(fields)
     }
+    /// Decodes an `OVERLAY_INPUT_CAPTURE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `OVERLAY_INPUT_CAPTURE` map, a field
+    /// is missing or has the wrong type, the window address fails [`WindowAddress::validate`]
+    /// against `object`, or the scene revision is zero.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3, 4])?;
         Ok(Self {
@@ -1138,6 +1312,12 @@ pub struct Renew {
     pub watchdog_us: u64,
 }
 impl Renew {
+    /// Encodes the `OVERLAY_INPUT_RENEW` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the lane generation is zero or the watchdog is
+    /// outside the supported range.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         nonzero(self.lane_generation, 0)?;
         if !(crate::input::MIN_WATCHDOG_US..=crate::input::MAX_WATCHDOG_US)
@@ -1147,6 +1327,13 @@ impl Renew {
         }
         Ok(vec![(0, u(self.lane_generation)), (1, u(self.watchdog_us))])
     }
+    /// Decodes an `OVERLAY_INPUT_RENEW` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `object` is not zero, `value` is not a strict
+    /// `OVERLAY_INPUT_RENEW` map, or a field is missing or has the wrong type, the lane generation
+    /// is zero, or the watchdog is outside the supported range.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         validate_header_object(object, 0)?;
         let map = strict(value, &[0, 1])?;

@@ -25,6 +25,11 @@ impl Secret32 {
         Self(bytes)
     }
 
+    /// Parses a secret from exactly 64 hexadecimal digits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::InvalidSecretEncoding`] when `value` is not 64 ASCII hex digits.
     pub fn from_hex(value: &str) -> Result<Self, AuthError> {
         if value.len() != 64 || !value.is_ascii() {
             return Err(AuthError::InvalidSecretEncoding);
@@ -320,7 +325,7 @@ fn hkdf_expand(prk: &[u8; 32], info: &[&[u8]]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-fn hmac_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn hmac_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts every key length");
     for part in parts {
         mac.update(part);

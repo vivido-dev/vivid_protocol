@@ -88,6 +88,11 @@ pub struct SurfaceDescriptor {
 }
 
 impl SurfaceDescriptor {
+    /// Encodes the descriptor as its CBOR map.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`SurfaceDescriptor::validate`].
     pub fn to_value(&self) -> Result<Value, MessageError> {
         self.validate()?;
         Ok(Value::Map(vec![
@@ -99,6 +104,13 @@ impl SurfaceDescriptor {
         ]))
     }
 
+    /// Decodes a descriptor from its CBOR map.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict descriptor map, a field is missing or
+    /// has the wrong type, the role is unregistered, or the descriptor fails
+    /// [`SurfaceDescriptor::validate`].
     pub fn from_value(value: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("surface descriptor", value, &[0, 1, 2, 3, 4])?;
         let descriptor = Self {
@@ -112,6 +124,12 @@ impl SurfaceDescriptor {
         Ok(descriptor)
     }
 
+    /// Checks the title and locator lengths and the availability bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the title exceeds 256 UTF-8 bytes, the locator
+    /// hint exceeds 512, or the availability mask has unknown bits.
     pub fn validate(&self) -> Result<(), MessageError> {
         if self.title.len() > 256 {
             return Err(invalid_value(
@@ -155,6 +173,13 @@ pub struct SurfaceDefinition {
 }
 
 impl SurfaceDefinition {
+    /// Checks the surface's IDs, geometry, rotation, policy, and profile coordinate model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the context or surface ID, logical width or
+    /// height, or a scale term is zero, the rotation is not a right angle, the policy has unknown
+    /// bits, or the coordinate model is illegal for the semantic profile.
     pub fn validate(&self) -> Result<(), MessageError> {
         require_nonzero("surface", 0, self.context_id)?;
         require_nonzero("surface", 1, self.surface_id)?;
@@ -190,6 +215,11 @@ impl SurfaceDefinition {
         self.descriptor.validate()
     }
 
+    /// Encodes the `CREATE_SURFACE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`SurfaceDefinition::validate`] or [`SurfaceDescriptor::validate`].
     pub fn create_payload(&self) -> Result<PayloadMap, MessageError> {
         self.validate()?;
         Ok(vec![
@@ -208,6 +238,14 @@ impl SurfaceDefinition {
         ])
     }
 
+    /// Decodes a `CREATE_SURFACE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `CREATE_SURFACE` map, a field is
+    /// missing or has the wrong type, the surface ID differs from `header_object_id`, the
+    /// coordinate model is unregistered, the rotation does not fit in `u16`, the descriptor is
+    /// invalid, or the definition fails [`SurfaceDefinition::validate`].
     pub fn decode_create(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new(
             "CREATE_SURFACE",
@@ -260,6 +298,11 @@ pub struct SurfaceMutation {
 }
 
 impl SurfaceState {
+    /// Starts tracking a newly created surface at revision and generation one.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`SurfaceDefinition::validate`].
     pub fn new(definition: SurfaceDefinition) -> Result<Self, MessageError> {
         definition.validate()?;
         Ok(Self {
@@ -269,6 +312,13 @@ impl SurfaceState {
         })
     }
 
+    /// Replaces the mutable surface fields when the expected revision and generation are current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `expected_revision` or `expected_generation` is
+    /// stale, the replacement changes immutable identity or profile state or fails
+    /// [`SurfaceDefinition::validate`], or the revision or generation is exhausted.
     pub fn replace_mutable(
         &mut self,
         expected_revision: SurfaceRevision,
@@ -370,6 +420,13 @@ impl DesktopSurfaceParameters {
         ]
     }
 
+    /// Decodes desktop-surface profile parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `map` is not a strict parameter map, a field is missing or has
+    /// the wrong type, an origin does not fit in `i32`, the topology is not an array of valid
+    /// outputs, or the parameters fail [`DesktopSurfaceParameters::validate`].
     pub fn decode(map: &PayloadMap) -> Result<Self, MessageError> {
         let value = Value::Map(map.clone());
         let strict = StrictMap::new("desktop surface parameters", &value, &[0, 1, 2, 3, 4])?;
@@ -397,6 +454,12 @@ impl DesktopSurfaceParameters {
         Ok(parameters)
     }
 
+    /// Checks the semantic generation, input capabilities, and output topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the semantic generation is zero, the input
+    /// capability mask has unassigned bits, or output IDs repeat within the topology.
     pub fn validate(&self) -> Result<(), MessageError> {
         if self.semantic_generation == 0 {
             return Err(invalid_value(

@@ -39,6 +39,10 @@ pub const OVERLAY_ENV: &str = "overlay-env-v1";
 pub const OVERLAY_A11Y: &str = "overlay-a11y-v1";
 
 pub mod record {
+    //! Record type codes carried in every record header.
+    //!
+    //! Retired codes stay assigned so they are never reused; [`is_retired`] names them.
+
     pub const SET_OVERLAY_WINDOW: u16 = 0x7020;
     pub const OVERLAY_WINDOW_READY: u16 = 0x7021;
     pub const OVERLAY_ACTION: u16 = 0x7022;
@@ -191,6 +195,8 @@ pub mod record {
 }
 
 pub mod error {
+    //! Error codes carried by `ERROR` replies.
+
     pub const AUTH_FAILED: u64 = 1;
     pub const UNSUPPORTED_VERSION: u64 = 2;
     pub const UNSUPPORTED_PROFILE: u64 = 3;
@@ -267,6 +273,8 @@ pub mod channel_advance_reason {
 }
 
 pub mod limit {
+    //! Limit identifiers that `ERROR` detail key 0 uses to name the bound a request exceeded.
+
     pub const CONCURRENT_SESSIONS: u64 = 1;
     pub const CONCURRENT_CONNECTIONS: u64 = 2;
     pub const CONTEXTS: u64 = 3;
@@ -361,6 +369,13 @@ pub fn prerequisites(profile: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// Checks that `profiles` are sorted, unique, known, and closed under their prerequisites.
+///
+/// # Errors
+///
+/// Returns [`ProfileError::NotSortedUnique`] when the list is unsorted or repeats a profile,
+/// [`ProfileError::Unknown`] for an unregistered profile, and [`ProfileError::MissingPrerequisite`]
+/// when a profile's prerequisite is absent.
 pub fn validate_profile_set<'a>(
     profiles: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), ProfileError> {

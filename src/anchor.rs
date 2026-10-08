@@ -4,8 +4,6 @@ use std::fmt;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
@@ -13,8 +11,6 @@ pub mod conpty;
 
 const AUTH_LABEL: &[u8] = b"VIVID-ANCHOR-3";
 pub const MAX_MARKER_BYTES: usize = 192;
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
@@ -50,15 +46,24 @@ pub fn authenticator(
     context_id: u64,
     anchor_id: u64,
 ) -> [u8; 16] {
-    let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts every key length");
-    mac.update(AUTH_LABEL);
-    mac.update(session_tag);
-    mac.update(&context_id.to_be_bytes());
-    mac.update(&anchor_id.to_be_bytes());
-    let full = mac.finalize().into_bytes();
-    full[..16].try_into().expect("fixed-size authenticator")
+    let full = crate::auth::hmac_parts(
+        &key.0,
+        &[
+            AUTH_LABEL,
+            session_tag,
+            &context_id.to_be_bytes(),
+            &anchor_id.to_be_bytes(),
+        ],
+    );
+    crate::array_at(&full, 0)
 }
 
+/// Encodes the APC marker that announces anchor `anchor_id` in `context_id`.
+///
+/// # Errors
+///
+/// Returns an error message when `context_id` or `anchor_id` is zero, or the marker would exceed
+/// [`MAX_MARKER_BYTES`].
 pub fn encode_marker(
     key: &AnchorKey,
     session_tag: &[u8; 16],
@@ -77,6 +82,12 @@ pub fn encode_marker(
     Ok(marker)
 }
 
+/// Encodes the anchor marker in the form that survives `ConPTY`'s line wrapping.
+///
+/// # Errors
+///
+/// Returns an error message when [`encode_marker`] fails or the `ConPTY` form would exceed
+/// [`MAX_MARKER_BYTES`].
 pub fn encode_conpty_marker(
     key: &AnchorKey,
     session_tag: &[u8; 16],
@@ -93,6 +104,11 @@ pub fn encode_conpty_marker(
 }
 
 /// Parse the marker body between APC introducer `ESC _` and terminator `ESC \`.
+///
+/// # Errors
+///
+/// Returns an error message when `marker` is oversized or non-ASCII, is not a Vivid anchor-v3
+/// marker, lacks a field, or has a field of the wrong length or encoding.
 pub fn parse_marker(marker: &str) -> Result<AnchorMarker, &'static str> {
     if marker.len() > MAX_MARKER_BYTES - 4 || !marker.is_ascii() {
         return Err("anchor marker is oversized or non-ASCII");
@@ -136,6 +152,12 @@ pub fn parse_marker(marker: &str) -> Result<AnchorMarker, &'static str> {
     })
 }
 
+/// Parses an anchor marker recovered from `ConPTY` output, which ends in `;VIVID-END`.
+///
+/// # Errors
+///
+/// Returns an error message when `marker` exceeds [`MAX_MARKER_BYTES`], lacks the `;VIVID-END`
+/// suffix, or fails [`parse_marker`].
 pub fn parse_conpty_marker(marker: &str) -> Result<AnchorMarker, &'static str> {
     if marker.len() > MAX_MARKER_BYTES || !marker.ends_with(";VIVID-END") {
         return Err("not a bounded Vivid ConPTY anchor-v3 marker");

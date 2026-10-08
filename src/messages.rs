@@ -182,6 +182,11 @@ impl Envelope {
         }
     }
 
+    /// Builds a request envelope, which needs a nonzero request ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `request_id` is zero.
     pub fn correlated(request_id: u64, payload: PayloadMap) -> Result<Self, MessageError> {
         if request_id == 0 {
             return Err(invalid("envelope", 0, "must be nonzero for a request"));
@@ -189,6 +194,12 @@ impl Envelope {
         Ok(Self::new(request_id, payload))
     }
 
+    /// Encodes the envelope as deterministic CBOR.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the payload or precondition keys are not strictly increasing,
+    /// or when CBOR encoding fails.
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
         validate_sorted_map("payload", &self.payload)?;
         validate_sorted_map("preconditions", &self.preconditions)?;
@@ -213,6 +224,11 @@ impl Envelope {
         Ok(cbor::encode(&value)?)
     }
 
+    /// Checks that this envelope carries a request, which has a nonzero request ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the request ID is zero.
     pub fn validate_request(&self) -> Result<(), MessageError> {
         if self.request_id == 0 {
             Err(invalid("envelope", 0, "must be nonzero for a request"))
@@ -221,6 +237,11 @@ impl Envelope {
         }
     }
 
+    /// Checks that this envelope carries an unsolicited event, which has request ID zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the request ID is nonzero.
     pub fn validate_event(&self) -> Result<(), MessageError> {
         if self.request_id != 0 {
             Err(invalid("envelope", 0, "must be zero for an event"))
@@ -232,6 +253,12 @@ impl Envelope {
 
 /// Decode an owned envelope. The caller owns the returned payload and the borrowed input;
 /// sensitive users should wrap the envelope in `zeroize::Zeroizing` until ownership transfers.
+///
+/// # Errors
+///
+/// Returns [`MessageError`] when `body` is not canonical CBOR, is not an envelope map, contains an
+/// unknown envelope key, has a field of the wrong type, or has payload or precondition keys that
+/// are not strictly increasing.
 pub fn decode_control(body: &[u8]) -> Result<Envelope, MessageError> {
     let mut value = Zeroizing::new(cbor::decode(body)?);
     let map = StrictMap::new("envelope", &value, &[0, 1, 2, 3, 4, 5, 6])?;
@@ -271,10 +298,21 @@ pub fn decode_control(body: &[u8]) -> Result<Envelope, MessageError> {
     Ok(envelope)
 }
 
+/// Encodes `payload` in an envelope with `request_id`.
+///
+/// # Errors
+///
+/// Returns [`MessageError`] when the payload keys are not strictly increasing or CBOR encoding
+/// fails.
 pub fn encode_payload(request_id: u64, payload: PayloadMap) -> Result<Vec<u8>, MessageError> {
     Zeroizing::new(Envelope::new(request_id, payload)).encode()
 }
 
+/// Encodes an envelope with an empty payload, the body of `OK` and similar acknowledgements.
+///
+/// # Panics
+///
+/// Never in practice: an envelope with an empty payload always encodes.
 pub fn empty(request_id: u64) -> Vec<u8> {
     encode_payload(request_id, vec![]).expect("empty payload is valid")
 }
@@ -492,6 +530,12 @@ pub struct Hello {
 }
 
 impl Hello {
+    /// Signs this `HELLO` with root authentication over `preface` and the unauthenticated payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the authentication is not root authentication,
+    /// and any error from [`Hello::validate`].
     pub fn authenticate_root(
         &mut self,
         root_secret: &Secret32,
@@ -510,6 +554,12 @@ impl Hello {
         Ok(())
     }
 
+    /// Signs this `HELLO` for a lease resume with the prior session's resume key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the authentication is not resume authentication,
+    /// and any error from [`Hello::validate`].
     pub fn authenticate_resume(
         &mut self,
         prior_resume_key: &[u8; 32],
@@ -551,6 +601,14 @@ impl Hello {
         Ok(())
     }
 
+    /// Checks every `HELLO` field against the core specification's limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the producer name or version is too long, a
+    /// profile list is unsorted, overlapping, unknown, or not closed under prerequisites, the
+    /// control-body limit is zero or above [`crate::HARD_MAX_RECORD_BODY`], or an extension reuses
+    /// a registered field.
     pub fn validate(&self) -> Result<(), MessageError> {
         bounded_text("HELLO", 0, &self.producer_name, 256)?;
         bounded_text("HELLO", 1, &self.producer_version, 128)?;
@@ -605,10 +663,20 @@ impl Hello {
         validate_sorted_map("HELLO extensions", &self.extensions)
     }
 
+    /// Returns the complete `HELLO` payload, including the authentication proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Hello::validate`].
     pub fn payload_value(&self) -> Result<Value, MessageError> {
         self.payload_value_inner(false)
     }
 
+    /// Returns the `HELLO` payload with the authentication proof omitted, as the proof signs it.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Hello::validate`].
     pub fn authless_payload_value(&self) -> Result<Value, MessageError> {
         self.payload_value_inner(true)
     }
@@ -629,11 +697,21 @@ impl Hello {
         Ok(Value::Map(fields))
     }
 
+    /// Encodes the proof-free `HELLO` payload that the authentication proof signs.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Hello::validate`], or a CBOR encoding error.
     pub fn authless_payload(&self) -> Result<Vec<u8>, MessageError> {
         let value = Zeroizing::new(self.authless_payload_value()?);
         Ok(cbor::encode(&value)?)
     }
 
+    /// Encodes this `HELLO` as a request envelope with `request_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the payload fails [`Hello::validate`] or `request_id` is zero.
     pub fn encode(&self, request_id: u64) -> Result<Vec<u8>, MessageError> {
         let Value::Map(payload) = self.payload_value()? else {
             unreachable!()
@@ -643,6 +721,12 @@ impl Hello {
         envelope.encode()
     }
 
+    /// Decodes a `HELLO` request, returning its request ID and payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not a valid envelope, is not a request, lacks a
+    /// `HELLO` field or has one of the wrong type, or fails [`Hello::validate`].
     pub fn decode(body: &[u8]) -> Result<(u64, Self), MessageError> {
         let mut envelope = Zeroizing::new(decode_control(body)?);
         envelope.validate_request()?;
@@ -693,6 +777,13 @@ impl Drop for WelcomeAuthentication {
 }
 
 impl WelcomeAuthentication {
+    /// Checks the authentication kind, attempt status, and lease state for consistency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] for an unregistered authentication kind, an attempt
+    /// status other than fresh or replayed, or a lease state that does not fit the authentication
+    /// kind.
     pub fn validate(&self) -> Result<(), MessageError> {
         if self.kind > AUTHENTICATION_RESUME {
             return Err(invalid(
@@ -764,12 +855,24 @@ pub struct Welcome {
 }
 
 impl Welcome {
+    /// Sets the `WELCOME` confirmation from the handshake key and the unconfirmed payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Welcome::validate`].
     pub fn confirm(&mut self, prk: &HandshakePrk) -> Result<(), MessageError> {
         let unconfirmed = self.unconfirmed_payload()?;
         self.authentication.confirmation = auth::welcome_confirmation(prk, &unconfirmed);
         Ok(())
     }
 
+    /// Checks every `WELCOME` field against the core specification's limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the authentication fields are inconsistent, a
+    /// session, root-context, or target ID is zero, the accepted profiles are invalid, negotiated
+    /// vector limits are missing or invalid, or the control-body limit is out of range.
     pub fn validate(&self) -> Result<(), MessageError> {
         self.authentication.validate()?;
         nonzero("WELCOME", 0, self.session_id)?;
@@ -856,11 +959,22 @@ impl Welcome {
         Ok(Value::Map(fields))
     }
 
+    /// Encodes the `WELCOME` payload without its confirmation, as the confirmation signs it.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Welcome::validate`], or a CBOR encoding error.
     pub fn unconfirmed_payload(&self) -> Result<Vec<u8>, MessageError> {
         let value = Zeroizing::new(self.payload_value_inner(true)?);
         Ok(cbor::encode(&value)?)
     }
 
+    /// Encodes this `WELCOME` as a reply envelope with `request_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the payload fails [`Welcome::validate`] or `request_id` is
+    /// zero.
     pub fn encode(&self, request_id: u64) -> Result<Vec<u8>, MessageError> {
         let Value::Map(payload) = self.payload_value_inner(false)? else {
             unreachable!()
@@ -870,6 +984,13 @@ impl Welcome {
         envelope.encode()
     }
 
+    /// Decodes a `WELCOME` reply, returning its request ID and payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not a valid envelope, has a zero request ID, lacks a
+    /// `WELCOME` field or has one of the wrong type, carries an invalid resource contract, or fails
+    /// [`Welcome::validate`].
     pub fn decode(body: &[u8]) -> Result<(u64, Self), MessageError> {
         let mut envelope = Zeroizing::new(decode_control(body)?);
         envelope.validate_request()?;
@@ -908,12 +1029,24 @@ pub struct ErrorDetail {
 }
 
 impl ErrorDetail {
+    /// Builds error detail from `fields`, checking them first.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`ErrorDetail::validate`].
     pub fn new(fields: PayloadMap) -> Result<Self, MessageError> {
         let detail = Self { fields };
         detail.validate()?;
         Ok(detail)
     }
 
+    /// Checks detail fields against the registered `ERROR` detail keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when keys are not strictly increasing or exceed 18, a field has the
+    /// wrong type, the idempotent-result field is unregistered, or the encoded detail exceeds 4,096
+    /// bytes.
     pub fn validate(&self) -> Result<(), MessageError> {
         let fields = &self.fields;
         validate_sorted_map("ERROR detail", fields)?;
@@ -973,6 +1106,12 @@ pub struct ErrorReply {
 }
 
 impl ErrorReply {
+    /// Encodes this `ERROR` reply as deterministic CBOR.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] for an unregistered error code or a diagnostic over
+    /// 4,096 bytes, and any error from [`ErrorDetail::validate`].
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
         if !registry::error::is_registered(self.code) {
             return Err(invalid("ERROR", 0, "is not a registered error code"));
@@ -992,6 +1131,13 @@ impl ErrorReply {
     }
 }
 
+/// Decodes an `ERROR` reply body.
+///
+/// # Errors
+///
+/// Returns [`MessageError`] when `body` is not a valid envelope, has an unknown or mistyped field,
+/// carries an unregistered error code, names a failed request ID that differs from the envelope's,
+/// or has invalid detail or an over-long diagnostic.
 pub fn parse_error_reply(body: &[u8]) -> Result<ErrorReply, MessageError> {
     let envelope = decode_control(body)?;
     let value = Value::Map(envelope.payload);
@@ -1020,6 +1166,11 @@ pub fn parse_error_reply(body: &[u8]) -> Result<ErrorReply, MessageError> {
     })
 }
 
+/// Encodes the fatal `UNSUPPORTED_VERSION` error body that names this crate's protocol version.
+///
+/// # Panics
+///
+/// Never in practice: every field is a fixed, valid value.
 pub fn unsupported_version_error() -> Vec<u8> {
     ErrorReply {
         code: ERROR_UNSUPPORTED_VERSION,
@@ -1092,6 +1243,13 @@ impl LaneOpen {
         ]
     }
 
+    /// Decodes a `LANE_OPEN` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not a valid request envelope, has an unknown,
+    /// missing, or mistyped field, names a lane other than interactive, or has a zero session ID or
+    /// lane generation.
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         let mut envelope = Zeroizing::new(decode_control(body)?);
         envelope.validate_request()?;
@@ -1201,6 +1359,13 @@ impl ChannelOpen {
         ]
     }
 
+    /// Decodes a `CHANNEL_OPEN` request whose record header named `header_object_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not a valid request envelope, has an unknown,
+    /// missing, or mistyped field, has a zero ID or generation, names an unregistered track kind or
+    /// a lane other than realtime or bulk, or its track ID differs from `header_object_id`.
     pub fn decode(header_object_id: u64, body: &[u8]) -> Result<Self, MessageError> {
         let mut envelope = Zeroizing::new(decode_control(body)?);
         envelope.validate_request()?;
@@ -1230,6 +1395,11 @@ impl ChannelOpen {
     }
 }
 
+/// Checks that a record header and its payload name the same object.
+///
+/// # Errors
+///
+/// Returns [`MessageError::HeaderObjectMismatch`] when the two IDs differ.
 pub fn validate_header_object(header_object_id: u64, payload_id: u64) -> Result<(), MessageError> {
     if header_object_id == payload_id {
         Ok(())
@@ -1258,6 +1428,12 @@ impl fmt::Debug for StrictMap<'_> {
 }
 
 impl<'a> StrictMap<'a> {
+    /// Wraps `value` as a strict map that may only contain the `allowed` keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::ExpectedMap`] when `value` is not a map, and
+    /// [`MessageError::UnknownKey`] when it holds a key outside `allowed`.
     pub fn new(
         schema: &'static str,
         value: &'a Value,
@@ -1272,6 +1448,12 @@ impl<'a> StrictMap<'a> {
         Ok(Self { schema, entries })
     }
 
+    /// Wraps `value` as a map that requires keys `0..=last_known_key` and keeps any later keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::ExpectedMap`] when `value` is not a map, and
+    /// [`MessageError::MissingKey`] when a key up to `last_known_key` is absent.
     pub fn preserving(
         schema: &'static str,
         value: &'a Value,
@@ -1291,6 +1473,11 @@ impl<'a> StrictMap<'a> {
         Ok(Self { schema, entries })
     }
 
+    /// Returns the value stored under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::MissingKey`] when `key` is absent.
     pub fn required(&self, key: u64) -> Result<&'a Value, MessageError> {
         self.entries
             .iter()
@@ -1307,6 +1494,12 @@ impl<'a> StrictMap<'a> {
             .find_map(|(entry_key, value)| (*entry_key == key).then_some(value))
     }
 
+    /// Returns the unsigned integer stored under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::MissingKey`] when `key` is absent and [`MessageError::WrongType`]
+    /// when its value has another type.
     pub fn required_u64(&self, key: u64) -> Result<u64, MessageError> {
         self.required(key)?.as_u64().ok_or(MessageError::WrongType {
             schema: self.schema,
@@ -1314,6 +1507,13 @@ impl<'a> StrictMap<'a> {
         })
     }
 
+    /// Returns the unsigned integer stored under `key` as a `u32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::MissingKey`] when `key` is absent, [`MessageError::WrongType`] when
+    /// the value is not an unsigned integer, and [`MessageError::InvalidValue`] when it does not
+    /// fit in `u32`.
     pub fn required_u32(&self, key: u64) -> Result<u32, MessageError> {
         u32::try_from(self.required_u64(key)?).map_err(|_| MessageError::InvalidValue {
             schema: self.schema,
@@ -1322,6 +1522,12 @@ impl<'a> StrictMap<'a> {
         })
     }
 
+    /// Returns the unsigned integer stored under `key`, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::WrongType`] when the value is present but is not an unsigned
+    /// integer.
     pub fn optional_u64(&self, key: u64) -> Result<Option<u64>, MessageError> {
         self.optional(key)
             .map(|value| {
@@ -1333,6 +1539,12 @@ impl<'a> StrictMap<'a> {
             .transpose()
     }
 
+    /// Returns the boolean stored under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::MissingKey`] when `key` is absent and [`MessageError::WrongType`]
+    /// when its value has another type.
     pub fn required_bool(&self, key: u64) -> Result<bool, MessageError> {
         self.required(key)?
             .as_bool()
@@ -1342,6 +1554,12 @@ impl<'a> StrictMap<'a> {
             })
     }
 
+    /// Returns the text stored under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::MissingKey`] when `key` is absent and [`MessageError::WrongType`]
+    /// when its value has another type.
     pub fn required_text(&self, key: u64) -> Result<&'a str, MessageError> {
         self.required(key)?
             .as_text()
@@ -1351,6 +1569,11 @@ impl<'a> StrictMap<'a> {
             })
     }
 
+    /// Returns the text stored under `key`, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::WrongType`] when the value is present but is not text.
     pub fn optional_text(&self, key: u64) -> Result<Option<&'a str>, MessageError> {
         self.optional(key)
             .map(|value| {
@@ -1362,6 +1585,12 @@ impl<'a> StrictMap<'a> {
             .transpose()
     }
 
+    /// Returns the byte string stored under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::MissingKey`] when `key` is absent and [`MessageError::WrongType`]
+    /// when its value has another type.
     pub fn required_bytes(&self, key: u64) -> Result<&'a [u8], MessageError> {
         self.required(key)?
             .as_bytes()
@@ -1371,6 +1600,11 @@ impl<'a> StrictMap<'a> {
             })
     }
 
+    /// Returns the byte string stored under `key`, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::WrongType`] when the value is present but is not a byte string.
     pub fn optional_bytes(&self, key: u64) -> Result<Option<&'a [u8]>, MessageError> {
         self.optional(key)
             .map(|value| {
@@ -1382,6 +1616,13 @@ impl<'a> StrictMap<'a> {
             .transpose()
     }
 
+    /// Returns the byte string stored under `key` as an array of exactly `N` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::MissingKey`] when `key` is absent, [`MessageError::WrongType`] when
+    /// the value is not a byte string, and [`MessageError::InvalidValue`] when its length is not
+    /// `N`.
     pub fn required_fixed_bytes<const N: usize>(&self, key: u64) -> Result<[u8; N], MessageError> {
         self.required_bytes(key)?
             .try_into()
@@ -1392,6 +1633,12 @@ impl<'a> StrictMap<'a> {
             })
     }
 
+    /// Returns the byte string stored under `key` as an array of exactly `N` bytes, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::WrongType`] when the value is present but is not a byte string, and
+    /// [`MessageError::InvalidValue`] when its length is not `N`.
     pub fn optional_fixed_bytes<const N: usize>(
         &self,
         key: u64,
@@ -1407,6 +1654,12 @@ impl<'a> StrictMap<'a> {
             .transpose()
     }
 
+    /// Returns the map stored under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::MissingKey`] when `key` is absent and [`MessageError::WrongType`]
+    /// when its value has another type.
     pub fn required_map(&self, key: u64) -> Result<&'a [(u64, Value)], MessageError> {
         self.required(key)?.as_map().ok_or(MessageError::WrongType {
             schema: self.schema,
@@ -1414,6 +1667,11 @@ impl<'a> StrictMap<'a> {
         })
     }
 
+    /// Returns the map stored under `key`, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::WrongType`] when the value is present but is not a map.
     pub fn optional_map(&self, key: u64) -> Result<Option<&'a [(u64, Value)]>, MessageError> {
         self.optional(key)
             .map(|value| {
@@ -1425,6 +1683,12 @@ impl<'a> StrictMap<'a> {
             .transpose()
     }
 
+    /// Returns the array of text values stored under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::MissingKey`] when `key` is absent, and [`MessageError::WrongType`]
+    /// when the value is not an array or holds a non-text element.
     pub fn required_text_array(&self, key: u64) -> Result<Vec<String>, MessageError> {
         let values = self
             .required(key)?
@@ -1531,6 +1795,11 @@ pub fn invalid_value(schema: &'static str, key: u64, reason: &'static str) -> Me
     invalid(schema, key, reason)
 }
 
+/// Returns `value` when it is nonzero, for codecs outside this module.
+///
+/// # Errors
+///
+/// Returns [`MessageError::InvalidValue`] naming `schema` and `key` when `value` is zero.
 pub fn require_nonzero(schema: &'static str, key: u64, value: u64) -> Result<u64, MessageError> {
     nonzero(schema, key, value)
 }

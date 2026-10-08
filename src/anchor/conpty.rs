@@ -72,7 +72,9 @@ pub fn scan(bytes: &[u8]) -> Scan {
         length += 1;
         cursor += 1;
         if length == ENVELOPE_BYTES {
-            let envelope = std::str::from_utf8(&canonical).expect("marker grammar is ASCII");
+            let Ok(envelope) = std::str::from_utf8(&canonical) else {
+                return Scan::Invalid;
+            };
             return if parse_conpty_marker(envelope).is_ok() {
                 Scan::Complete {
                     consumed: cursor,

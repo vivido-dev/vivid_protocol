@@ -56,6 +56,13 @@ impl OutputDescriptor {
         ])
     }
 
+    /// Decodes one output descriptor of a desktop topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict output map, a field is missing, has
+    /// the wrong type, or does not fit its integer type, the rotation is unregistered, the extent
+    /// is zero, or the scale is not a positive ratio.
     pub fn decode(value: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("output descriptor", value, &[0, 1, 2, 3, 4, 5, 6, 7, 8])?;
         let descriptor = Self {
@@ -131,6 +138,13 @@ impl DesktopTarget {
         ]
     }
 
+    /// Decodes the desktop target descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `map` is not a strict desktop-target map, a field is missing,
+    /// has the wrong type, or does not fit its integer type, the output list is not an array of
+    /// valid outputs, or the target fails [`DesktopTarget::validate`].
     pub fn decode(map: &PayloadMap) -> Result<Self, MessageError> {
         let value = Value::Map(map.clone());
         let strict = StrictMap::new("desktop target", &value, &[0, 1, 2, 3, 4, 5, 6])?;
@@ -163,6 +177,11 @@ impl DesktopTarget {
     /// Desktop §1's structural rules: nonzero virtual extent, exactly one primary output when the
     /// list is nonempty, unique output IDs, and every output inside the virtual rectangle after
     /// checked transform arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the virtual extent is zero, a nonempty output
+    /// list does not have exactly one primary output, output IDs repeat, or an edge overflows.
     pub fn validate(&self) -> Result<(), MessageError> {
         if self.width == 0 || self.height == 0 {
             return Err(invalid_value(
@@ -290,6 +309,11 @@ pub struct DesktopTargetState {
 }
 
 impl DesktopTargetState {
+    /// Starts tracking `target` at generation one.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`DesktopTarget::validate`].
     pub fn new(target: DesktopTarget) -> Result<Self, MessageError> {
         target.validate()?;
         Ok(Self {
@@ -307,6 +331,11 @@ impl DesktopTargetState {
     }
 
     /// Offer a new descriptor and learn what the session owes its producers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `next` fails [`DesktopTarget::validate`] or the
+    /// target generation is exhausted.
     pub fn offer(&mut self, next: DesktopTarget) -> Result<TargetTransition, MessageError> {
         next.validate()?;
         if next == self.current {

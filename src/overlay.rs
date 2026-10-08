@@ -162,6 +162,13 @@ pub struct Semantics {
     pub nodes: Vec<SemanticNode>,
 }
 impl Semantics {
+    /// Checks the semantic tree's revision, size, node IDs, bounds, labels, actions, and structure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the scene revision is zero, the tree is empty or over the node
+    /// limit, node IDs are zero or repeat, a node's bounds, label, or action list is invalid or
+    /// oversized, a set position exceeds its size, or a child index is out of range.
     pub fn validate(&self) -> Result<(), InvalidScene> {
         if self.scene_revision == 0 {
             return Err(InvalidScene("semantics require a published scene revision"));
@@ -322,6 +329,12 @@ impl WindowOptions {
             min_height: Scalar::ONE,
         }
     }
+    /// Checks that the bounds are valid and at least the positive minimum size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the bounds are invalid, the minimum width or height is not
+    /// positive, or the bounds are smaller than the minimum.
     pub fn validate(&self) -> Result<(), InvalidScene> {
         self.bounds.validate()?;
         if self.min_width <= Scalar::ZERO
@@ -505,6 +518,14 @@ impl Windows {
             .filter_map(|id| self.entries.get(id))
             .filter(|w| self.effectively_visible(w.identity))
     }
+    /// Creates window `id` at `generation` with `options`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the options are invalid, `generation` or an ID is zero, the
+    /// window exists, its owner's input was revoked, a per-owner or global window limit is reached,
+    /// the parent belongs to another owner or is gone, or a modal or popup conflicts with the
+    /// active modal.
     pub fn create(
         &mut self,
         id: SurfaceIdentity,
@@ -578,6 +599,11 @@ impl Windows {
         Ok(())
     }
     /// Commit the revision only when the presenter has atomically installed drawing and hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the window does not exist or `generation` or `scene_revision`
+    /// is stale.
     pub fn publish_scene(
         &mut self,
         id: SurfaceIdentity,
@@ -598,6 +624,11 @@ impl Windows {
         Ok(())
     }
     /// Apply a conditional window action. Close returns no surviving window revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the action or its identity is invalid for `owner`, the window
+    /// does not exist, the generation or revision is stale, or the window revision is exhausted.
     pub fn apply_action(
         &mut self,
         owner: SessionIdentity,
@@ -700,6 +731,14 @@ impl Windows {
         self.stack.retain(|key| !group.contains(key));
         self.stack.extend(group);
     }
+    /// Replaces the options of window `id` when `generation` and `revision` are current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the options are invalid, the window does not exist,
+    /// `generation` or `revision` is stale, the parent or mode would change, a modal conflicts with
+    /// another owner's modal focus, a popup is blocked by the active modal, or the window revision
+    /// is exhausted.
     pub fn update(
         &mut self,
         id: SurfaceIdentity,
@@ -808,6 +847,11 @@ impl Windows {
                 .top_modal()
                 .is_none_or(|modal| self.descendant(id, modal))
     }
+    /// Focuses window `id` and raises its group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the window is hidden or blocked by a modal.
     pub fn request_focus(&mut self, id: SurfaceIdentity) -> Result<(), InvalidScene> {
         if !self.eligible(id) {
             return Err(InvalidScene("window is hidden or blocked by a modal"));
@@ -960,6 +1004,12 @@ impl Windows {
         }
         event
     }
+    /// Captures the pointer for focused window `id` at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidScene`] when the window does not exist, is not eligible, or does not have
+    /// focus.
     pub fn capture_pointer(
         &mut self,
         id: SurfaceIdentity,

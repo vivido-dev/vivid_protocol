@@ -1,8 +1,28 @@
+//! Deterministic CBOR for Vivid control records.
+//!
+//! Vivid uses a constrained CBOR profile (core specification §5): definite-length byte and text
+//! strings, arrays, and maps; shortest-form integers; integer map keys in strictly increasing
+//! order; UTF-8 text, booleans, and null. Tags, floating point, other simple values, indefinite
+//! lengths, unsorted or duplicate keys, and trailing bytes are rejected.
+//!
+//! [`encode`] and [`decode`] convert between bytes and [`Value`]. Because the encoding is
+//! canonical, decoding and re-encoding a value reproduces its bytes exactly; signatures and
+//! idempotency keys rely on that. [`decode_preserving_map`] and [`encode_preserving_map`] keep
+//! unknown map entries byte-for-byte, so negotiation payloads can carry fields this crate does not
+//! understand.
+//!
+//! The decoder enforces the profile's resource bounds before allocating: nesting depth, string
+//! length, and container length.
+
 use std::fmt::{self, Display, Formatter};
 use zeroize::{Zeroize, Zeroizing};
 
+/// Maximum nesting depth of arrays and maps, from the core specification's CBOR profile.
 const MAX_DEPTH: usize = 16;
+/// Maximum byte or text string length, from the CBOR profile; record ceilings bound it further.
 const MAX_VALUE_LENGTH: usize = 16 * 1024 * 1024;
+/// Maximum array or map entry count, from the CBOR profile. It also caps the allocation a single
+/// container header can request.
 const MAX_CONTAINER_LENGTH: usize = 4096;
 
 /// RFC 8949 §3 additional-information values announcing a 1-, 2-, 4-, or 8-byte argument.
@@ -248,6 +268,11 @@ impl Display for EncodeError {
 impl std::error::Error for EncodeError {}
 
 /// Encode a value using the canonical Vivid CBOR subset.
+///
+/// # Errors
+///
+/// Returns [`EncodeError`] when `value` nests deeper than 16 levels, holds a string over 16 MiB or
+/// a container over 4,096 entries, or has map keys that are not strictly increasing.
 pub fn encode(value: &Value) -> Result<Vec<u8>, EncodeError> {
     let mut output = Vec::new();
     encode_into(&mut output, value)?;
@@ -255,6 +280,12 @@ pub fn encode(value: &Value) -> Result<Vec<u8>, EncodeError> {
 }
 
 /// Encode a value into a reusable caller-owned buffer.
+///
+/// # Errors
+///
+/// Returns [`EncodeError`] when `value` nests deeper than 16 levels, holds a string over 16 MiB or
+/// a container over 4,096 entries, or has map keys that are not strictly increasing. On error the
+/// partly written buffer is zeroed and left empty.
 pub fn encode_into(output: &mut Vec<u8>, value: &Value) -> Result<(), EncodeError> {
     let mut encoder = Encoder::from_vec(std::mem::take(output));
     encoder.clear();
@@ -267,6 +298,12 @@ pub fn encode_into(output: &mut Vec<u8>, value: &Value) -> Result<(), EncodeErro
 }
 
 /// Merge parsed known entries with byte-exact preserved entries in canonical key order.
+///
+/// # Errors
+///
+/// Returns [`EncodeError`] when the combined map exceeds 4,096 entries, the known or preserved keys
+/// are not strictly increasing, a known and a preserved key collide, a preserved value is not valid
+/// CBOR, or a known value fails [`encode`].
 pub fn encode_preserving_map(
     known: &[(u64, Value)],
     preserved: &[PreservedField],
@@ -388,6 +425,13 @@ impl Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+/// Decodes one canonical Vivid CBOR value occupying all of `bytes`.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] when `bytes` is not canonical Vivid CBOR: an unsupported type, a
+/// non-shortest integer, invalid UTF-8, unsorted or duplicate map keys, a resource bound exceeded,
+/// truncation, or trailing bytes.
 pub fn decode(bytes: &[u8]) -> Result<Value, DecodeError> {
     decode_at_depth(bytes, 0)
 }
@@ -402,6 +446,11 @@ fn decode_at_depth(bytes: &[u8], depth: usize) -> Result<Value, DecodeError> {
 }
 
 /// Decode a canonical numeric-keyed map while retaining unknown values as borrowed byte slices.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] when `known_keys` is not strictly increasing, or `bytes` is not one
+/// canonical map with unsigned, strictly increasing keys and valid values and no trailing bytes.
 pub fn decode_preserving_map<'a>(
     bytes: &'a [u8],
     known_keys: &[u64],

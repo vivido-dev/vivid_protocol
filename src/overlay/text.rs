@@ -17,6 +17,12 @@ pub struct MeasureText {
     pub text: Text,
 }
 impl MeasureText {
+    /// Encodes the `MEASURE_OVERLAY_TEXT` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address is invalid, the text exceeds the
+    /// measurement byte limit, or the text specification does not encode as a valid canvas command.
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         if self.text.text.len() > MAX_MEASURE_TEXT_BYTES {
@@ -32,6 +38,12 @@ impl MeasureText {
         payload.push((3, value));
         Ok(payload)
     }
+    /// Decodes a `MEASURE_OVERLAY_TEXT` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict map, the window address fails against
+    /// `object`, or the payload is not exactly one valid text specification within the byte limit.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3])?;
         let address = WindowAddress::decode(object, &map)?;
@@ -120,6 +132,12 @@ pub struct TextMeasurement {
     pub clusters: Vec<TextGeometry>,
 }
 impl TextMeasurement {
+    /// Encodes this measurement as the `OVERLAY_TEXT_MEASURED` payload for the window at `address`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the line or cluster geometry exceeds its limit, `address` is
+    /// invalid, or the encoded measurement does not decode back as valid.
     pub fn payload(&self, address: WindowAddress) -> Result<PayloadMap, MessageError> {
         if self.lines.len() > MAX_TEXT_GEOMETRY || self.clusters.len() > MAX_TEXT_GEOMETRY {
             return Err(bad(4, "text geometry limit exceeded"));
@@ -146,6 +164,12 @@ impl TextMeasurement {
         Self::decode(address, &Value::Map(values.clone()))?;
         Ok(values)
     }
+    /// Decodes an `OVERLAY_TEXT_MEASURED` payload for the window at `address`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict map, names another window, has a
+    /// negative extent, malformed or oversized geometry, or an invalid truncation offset.
     pub fn decode(address: WindowAddress, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3, 4, 5, 6])?;
         if WindowAddress::decode(address.surface_id, &map)? != address {
@@ -186,6 +210,14 @@ impl TextMeasurement {
             clusters: geometry(5)?,
         })
     }
+    /// Checks that every geometry range and the truncation point fall on UTF-8 boundaries of
+    /// `text`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the truncation offset is not a character
+    /// boundary or a geometry range ends after it, or a range does not lie on UTF-8 boundaries
+    /// within `text`.
     pub fn validate_text(&self, text: &str) -> Result<(), MessageError> {
         if self.truncated_at.is_some_and(|cut| {
             !text.is_char_boundary(cut as usize)
@@ -210,6 +242,12 @@ pub struct EditorGeometry {
     pub caret: Option<Rect>,
 }
 impl EditorGeometry {
+    /// Encodes the `SET_OVERLAY_EDITOR` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the window address is invalid, the scene revision is zero, or
+    /// the caret rectangle is invalid.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         self.address.validate(self.address.surface_id)?;
         nonzero(self.scene_revision, 3)?;
@@ -223,6 +261,12 @@ impl EditorGeometry {
         ]);
         Ok(values)
     }
+    /// Decodes a `SET_OVERLAY_EDITOR` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict map, the window address fails against
+    /// `object`, the scene revision is zero, or the caret is neither null nor a valid rectangle.
     pub fn decode(object: u64, value: &Value) -> Result<Self, MessageError> {
         let map = strict(value, &[0, 1, 2, 3, 4])?;
         Ok(Self {

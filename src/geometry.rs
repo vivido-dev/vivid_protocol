@@ -102,6 +102,13 @@ impl NodeGeometry {
         }
     }
 
+    /// Decodes a scene node's geometry map.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `map` is not a strict geometry map, a field is missing or has
+    /// the wrong type, the coordinate space is unregistered, the width or height is not positive,
+    /// an edge overflows, or normalized geometry leaves the unit square.
     pub fn decode(map: &PayloadMap) -> Result<Self, MessageError> {
         let value = Value::Map(map.clone());
         let strict = StrictMap::new("node geometry", &value, &[0, 1, 2, 3, 4])?;
@@ -143,6 +150,11 @@ impl NodeGeometry {
     ///
     /// Normalized geometry changes its pixel projection when the target generation changes, which
     /// is why a scene transaction carries the expected target generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the normalized projection overflows or projects
+    /// to an empty extent.
     pub fn project(&self, target: TargetExtent) -> Result<FixedRect, MessageError> {
         match self.space {
             CoordinateSpace::TargetLogical => Ok(self.rect),
@@ -174,6 +186,11 @@ impl TargetExtent {
 }
 
 /// Decode the optional clip map, which has the same shape in every target profile.
+///
+/// # Errors
+///
+/// Returns [`MessageError`] when `map` is not a strict clip map, a field is missing or has the
+/// wrong type, the width or height is not positive, or an edge overflows.
 pub fn decode_clip(map: &PayloadMap) -> Result<FixedRect, MessageError> {
     let value = Value::Map(map.clone());
     let strict = StrictMap::new("node clip", &value, &[0, 1, 2, 3])?;
@@ -330,6 +347,11 @@ impl SurfaceMapping {
     ///
     /// Desktop §7 requires `0 <= x < width << 32` strictly, so the right and bottom edges are
     /// outside the surface and an event naming them is discarded rather than clamped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when a logical dimension overflows 32.32 fixed point
+    /// or the point lies outside the surface.
     pub fn validate_point(&self, x: u64, y: u64) -> Result<(), MessageError> {
         let width = u64::from(self.logical_width)
             .checked_shl(32)
@@ -359,6 +381,12 @@ impl SurfaceMapping {
     /// The point is validated first, then rotated into the captured target's orientation, then
     /// offset by the captured origin. Truncation toward zero is deliberate: a pointer at
     /// `x = 1919.75` belongs to pixel 1919.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the point fails
+    /// [`SurfaceMapping::validate_point`], rotation overflows, or the result leaves the `i32` OS
+    /// coordinate space.
     pub fn to_os_logical(&self, x: u64, y: u64) -> Result<(i32, i32), MessageError> {
         self.validate_point(x, y)?;
         let (rotated_x, rotated_y) = self.rotate(x, y)?;

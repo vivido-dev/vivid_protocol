@@ -22,6 +22,12 @@ pub struct NeedKeyframe {
 }
 
 impl NeedKeyframe {
+    /// Decodes a `NEED_KEYFRAME` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when `value` is not a strict `NEED_KEYFRAME` map, or
+    /// a field is missing, has the wrong type, or does not fit its integer type.
     pub fn decode(value: &Value) -> io::Result<Self> {
         let map = StrictMap::new("NEED_KEYFRAME", value, &[0, 1, 2, 3, 4, 5, 6, 7, 8])?;
         map.optional_u64(6)?;
@@ -74,6 +80,13 @@ pub struct PlayOptions {
 }
 
 impl PlayOptions {
+    /// Decodes a `PLAY` payload, returning the track it addresses and the playback options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when `value` is not a strict `PLAY` map, a field is
+    /// missing or has the wrong type, the rate, late policy, or loop count is not the single
+    /// supported value, or the start policy is unknown.
     pub fn decode(value: &Value) -> io::Result<(TrackAddress, Self)> {
         let map = StrictMap::new("PLAY", value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])?;
         let address = TrackAddress {
@@ -104,6 +117,12 @@ impl PlayOptions {
         Ok((address, options))
     }
 
+    /// Encodes the `PLAY` payload for the track at `address`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when an ID or the channel generation in `address` is
+    /// zero, or the options are inconsistent, such as a minimum buffer above the maximum latency.
     pub fn payload(self, address: TrackAddress) -> io::Result<PayloadMap> {
         if address.context_id == 0
             || address.surface_id == 0
@@ -166,6 +185,12 @@ pub struct PlaybackHold {
 }
 
 impl PlaybackHold {
+    /// Encodes the `PLAYBACK_HOLD` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when the context, surface, or serial is zero, the
+    /// reason mask has unknown bits, or the held state and reasons disagree.
     pub fn payload(&self) -> io::Result<PayloadMap> {
         if self.context_id == 0
             || self.surface_id == 0
@@ -203,6 +228,13 @@ impl PlaybackHold {
         Ok(fields)
     }
 
+    /// Decodes a `PLAYBACK_HOLD` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when `value` or its held position is not a strict
+    /// map, a field is missing or has the wrong type, or the hold fails the rules of
+    /// [`PlaybackHold::payload`].
     pub fn decode(value: &Value) -> io::Result<Self> {
         let map = StrictMap::new("PLAYBACK_HOLD", value, &[0, 1, 2, 3, 4, 5, 6, 7])?;
         let position = map

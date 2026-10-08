@@ -84,6 +84,11 @@ impl IdempotencyCache {
     }
 
     /// Store a non-secret logical result after the mutation outcome is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompletionError::NotReserved`] when `key` has no reservation, and
+    /// [`CompletionError::AlreadyComplete`] when it already has an outcome.
     pub fn complete(&mut self, key: [u8; 16], result: Vec<u8>) -> Result<(), CompletionError> {
         let entry = self
             .entries
@@ -96,6 +101,12 @@ impl IdempotencyCache {
         Ok(())
     }
 
+    /// Records that the mutation for `key` ended with an unknown outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompletionError::NotReserved`] when `key` has no reservation, and
+    /// [`CompletionError::AlreadyComplete`] when it already has an outcome.
     pub fn mark_unknown(&mut self, key: [u8; 16]) -> Result<(), CompletionError> {
         let entry = self
             .entries

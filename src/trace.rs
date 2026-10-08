@@ -347,6 +347,11 @@ impl fmt::Debug for TraceGuard {
 }
 
 impl TraceGuard {
+    /// Starts a trace worker that hands each record to `callback` on a background thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from spawning the worker thread.
     pub fn callback(
         component: TraceComponent,
         hop: TraceHop,
@@ -410,6 +415,12 @@ impl TraceGuard {
         })
     }
 
+    /// Starts a trace worker that appends records to a new, private NDJSON file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::AlreadyExists`] when `path` exists, and any error creating its
+    /// parent directory, the file, or the worker thread.
     pub fn file(
         path: &Path,
         component: TraceComponent,

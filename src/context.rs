@@ -30,6 +30,13 @@ pub struct ContextDefinition {
 }
 
 impl ContextDefinition {
+    /// Checks the context's IDs, operation classes, and label against `header_object_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the context or parent ID is zero, the context ID differs from
+    /// `header_object_id`, the operation classes have unknown bits, or the label exceeds 64 UTF-8
+    /// bytes.
     pub fn validate(&self, header_object_id: u64) -> Result<(), MessageError> {
         require_nonzero("CREATE_CONTEXT", 0, self.context_id)?;
         require_nonzero("CREATE_CONTEXT", 1, self.parent_context_id)?;
@@ -51,6 +58,11 @@ impl ContextDefinition {
         Ok(())
     }
 
+    /// Encodes the `CREATE_CONTEXT` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`ContextDefinition::validate`].
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.validate(self.context_id)?;
         Ok(vec![
@@ -63,6 +75,13 @@ impl ContextDefinition {
         ])
     }
 
+    /// Decodes a `CREATE_CONTEXT` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `CREATE_CONTEXT` map, a field is
+    /// missing or has the wrong type, the resource contract is invalid, or the definition fails
+    /// [`ContextDefinition::validate`].
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("CREATE_CONTEXT", payload, &[0, 1, 2, 3, 4, 5])?;
         let definition = Self {
@@ -100,6 +119,12 @@ pub enum ContextLifecycle {
 }
 
 impl ContextState {
+    /// Creates the session's root context with `contract` as its resource budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `context_id` is zero or `operation_classes` has
+    /// unknown bits.
     pub fn root(
         session: SessionIdentity,
         context_id: u64,
@@ -127,6 +152,17 @@ impl ContextState {
         })
     }
 
+    /// Reserves resources for a child, returning its effective operation classes and contract.
+    ///
+    /// The granted contract is the request clamped to `policy` and to this context's remaining
+    /// budget, so an oversized request is narrowed rather than rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when this context is not active, is not the child's
+    /// parent, or lacks delegation authority, or the context revision is exhausted. Returns
+    /// [`MessageError::Cbor`] carrying the [`crate::resource::ResourceError`] text when resource
+    /// accounting overflows.
     pub fn reserve_child(
         &mut self,
         definition: &ContextDefinition,
@@ -155,6 +191,13 @@ impl ContextState {
         self.identity.context_id
     }
 
+    /// Returns a released child's resources to this context's budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::Cbor`] carrying the [`crate::resource::ResourceError`] text when
+    /// `contract` exceeds what is reserved here, and [`MessageError::InvalidValue`] when the
+    /// context revision is exhausted.
     pub fn release_child(&mut self, contract: &ResourceContract) -> Result<(), MessageError> {
         self.reservations
             .release(contract)
@@ -162,6 +205,12 @@ impl ContextState {
         self.advance_revision()
     }
 
+    /// Revokes an active context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the context is not active, or the context
+    /// revision is exhausted.
     pub fn revoke(&mut self) -> Result<(), MessageError> {
         if self.lifecycle != ContextLifecycle::Active {
             return Err(invalid_value("REVOKE_CONTEXT", 0, "context is not active"));

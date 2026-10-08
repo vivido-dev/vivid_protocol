@@ -97,6 +97,14 @@ impl FileDropBinding {
         self.destination.is_none()
     }
 
+    /// Checks the binding's epoch, scope, and limits; `header_object_id` must name its surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the producer epoch or context ID is zero, the surface ID and
+    /// generation disagree, a disabled binding carries limits, an enabled binding lacks a
+    /// destination or file limit, a limit or timeout is out of range, or the surface ID differs
+    /// from `header_object_id`.
     pub fn validate(&self, header_object_id: u64) -> Result<(), MessageError> {
         self.producer_epoch
             .require_nonzero()
@@ -159,6 +167,11 @@ impl FileDropBinding {
         )
     }
 
+    /// Encodes the `SET_FILE_DROP_BINDING` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`FileDropBinding::validate`].
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         self.validate(self.surface_id)?;
         Ok(vec![
@@ -179,6 +192,13 @@ impl FileDropBinding {
         ])
     }
 
+    /// Decodes a `SET_FILE_DROP_BINDING` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `SET_FILE_DROP_BINDING` map, a field
+    /// is missing or has the wrong type, the destination is unknown, or the binding fails
+    /// [`FileDropBinding::validate`], or the payload's object ID differs from `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new(
             "SET_FILE_DROP_BINDING",
@@ -248,6 +268,14 @@ impl FileDropGrant {
         ]
     }
 
+    /// Decodes a `FILE_DROP_BOUND` grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `FILE_DROP_BOUND` map, a field is
+    /// missing or has the wrong type, the destination or state is unknown, the producer epoch is
+    /// zero, or the surface ID and generation disagree, or the payload's object ID differs from
+    /// `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new(
             "FILE_DROP_BOUND",
@@ -396,6 +424,12 @@ pub struct FileDropOffer {
 }
 
 impl FileDropOffer {
+    /// Encodes the `FILE_DROP_OFFER` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the suggested name fails
+    /// [`validate_suggested_name`].
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         validate_suggested_name(&self.suggested_name)?;
         let mut payload = self.binding.payload();
@@ -404,6 +438,13 @@ impl FileDropOffer {
         Ok(payload)
     }
 
+    /// Decodes a `FILE_DROP_OFFER` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `FILE_DROP_OFFER` map, a field is
+    /// missing or has the wrong type or the suggested name fails [`validate_suggested_name`], or
+    /// the payload's object ID differs from `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("FILE_DROP_OFFER", payload, &[0, 1, 2, 3, 4, 5, 6, 7])?;
         let offer = Self {
@@ -428,6 +469,12 @@ pub struct AcceptFileDrop {
 }
 
 impl AcceptFileDrop {
+    /// Encodes the `ACCEPT_FILE_DROP` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when the transfer ID is zero, the initial generation is not one, or
+    /// the initial credit is invalid.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         self.validate(self.binding.drop_id)?;
         let mut payload = self.binding.payload();
@@ -441,6 +488,14 @@ impl AcceptFileDrop {
         Ok(payload)
     }
 
+    /// Decodes an `ACCEPT_FILE_DROP` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `ACCEPT_FILE_DROP` map, a field is
+    /// missing or has the wrong type, the transfer ID is zero, the initial generation is not one,
+    /// or the initial credit is invalid, or the payload's object ID differs from
+    /// `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new(
             "ACCEPT_FILE_DROP",
@@ -493,6 +548,11 @@ pub struct CancelFileDrop {
 }
 
 impl CancelFileDrop {
+    /// Encodes the cancellation payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] for an unregistered cancellation reason.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         if self.reason > 7 {
             return Err(invalid_value(
@@ -506,6 +566,13 @@ impl CancelFileDrop {
         Ok(payload)
     }
 
+    /// Decodes a cancellation payload for the record named by `schema`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict map for `schema`, a field is missing
+    /// or has the wrong type, the cancellation reason is unregistered, or the payload's object ID
+    /// differs from `header_object_id`.
     pub fn decode(
         schema: &'static str,
         header_object_id: u64,
@@ -542,6 +609,12 @@ pub struct AdvanceFileTransfer {
 }
 
 impl AdvanceFileTransfer {
+    /// Encodes the `ADVANCE_FILE_TRANSFER` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when an ID or generation is zero, the new generation does not
+    /// follow the expected one, or the credit is invalid.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         self.validate(self.transfer_id)?;
         Ok(vec![
@@ -557,6 +630,14 @@ impl AdvanceFileTransfer {
         ])
     }
 
+    /// Decodes an `ADVANCE_FILE_TRANSFER` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `ADVANCE_FILE_TRANSFER` map, a field
+    /// is missing or has the wrong type, an ID or generation is zero, the generations are not
+    /// consecutive, or the credit is invalid, or the payload's object ID differs from
+    /// `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new(
             "ADVANCE_FILE_TRANSFER",
@@ -621,6 +702,12 @@ pub struct FileTransferAdvanced {
 }
 
 impl FileTransferAdvanced {
+    /// Encodes the `FILE_TRANSFER_ADVANCED` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the transfer ID or generation is zero or the
+    /// open timeout is out of range.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         require_nonzero("FILE_TRANSFER_ADVANCED", 0, self.transfer_id)?;
         self.generation
@@ -635,6 +722,13 @@ impl FileTransferAdvanced {
         ])
     }
 
+    /// Decodes a `FILE_TRANSFER_ADVANCED` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `FILE_TRANSFER_ADVANCED` map, a
+    /// field is missing or has the wrong type, the transfer ID or generation is zero, or the open
+    /// timeout is out of range, or the payload's object ID differs from `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("FILE_TRANSFER_ADVANCED", payload, &[0, 1, 2, 3])?;
         let advanced = Self {
@@ -655,11 +749,23 @@ pub struct QueryFileDrop {
 }
 
 impl QueryFileDrop {
+    /// Encodes the `QUERY_FILE_DROP` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the drop ID is zero.
     pub fn payload(self) -> Result<PayloadMap, MessageError> {
         require_nonzero("QUERY_FILE_DROP", 0, self.drop_id)?;
         Ok(vec![(0, Value::Unsigned(self.drop_id))])
     }
 
+    /// Decodes a `QUERY_FILE_DROP` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `QUERY_FILE_DROP` map, a field is
+    /// missing or has the wrong type or the drop ID is zero, or the payload's object ID differs
+    /// from `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("QUERY_FILE_DROP", payload, &[0])?;
         let query = Self {
@@ -709,6 +815,13 @@ pub struct FileDropStatus {
 }
 
 impl FileDropStatus {
+    /// Encodes the `FILE_DROP_STATUS` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the drop ID is zero, an accepted or later state
+    /// lacks a transfer ID or generation, the result does not match the state, or the final name is
+    /// unsafe.
     pub fn payload(&self) -> Result<PayloadMap, MessageError> {
         require_nonzero("FILE_DROP_STATUS", 0, self.drop_id)?;
         if matches!(
@@ -783,6 +896,13 @@ impl FileDropStatus {
         ])
     }
 
+    /// Decodes a `FILE_DROP_STATUS` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `FILE_DROP_STATUS` map, a field is
+    /// missing or has the wrong type, the state or result is unknown, or the status fails the rules
+    /// of [`FileDropStatus::payload`], or the payload's object ID differs from `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("FILE_DROP_STATUS", payload, &[0, 1, 2, 3, 4, 5, 6])?;
         let result = match map.required_u64(5)? {
@@ -814,6 +934,13 @@ impl FileDropAccepted {
         ]
     }
 
+    /// Decodes a `FILE_DROP_ACCEPTED` reply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `payload` is not a strict `FILE_DROP_ACCEPTED` map, a field is
+    /// missing or has the wrong type, the drop ID, transfer ID, or generation is zero, or the open
+    /// timeout is out of range, or the payload's object ID differs from `header_object_id`.
     pub fn decode(header_object_id: u64, payload: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("FILE_DROP_ACCEPTED", payload, &[0, 1, 2, 3])?;
         let value = Self {
@@ -867,6 +994,12 @@ impl FileTransferOpen {
         )
     }
 
+    /// Encodes the `FILE_TRANSFER_OPEN` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when a required ID, generation, or epoch is zero, the
+    /// surface ID and generation disagree, or the credit is invalid.
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
         self.validate()?;
         encode_raw(vec![
@@ -888,6 +1021,13 @@ impl FileTransferOpen {
         ])
     }
 
+    /// Decodes a `FILE_TRANSFER_OPEN` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not canonical CBOR, is not a strict
+    /// `FILE_TRANSFER_OPEN` map, a field is missing or has the wrong type, or the open fails the
+    /// rules of [`FileTransferOpen::encode`].
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         let value = zeroize::Zeroizing::new(cbor::decode(body)?);
         let map = StrictMap::new(
@@ -960,6 +1100,11 @@ pub struct FileTransferAccepted {
 }
 
 impl FileTransferAccepted {
+    /// Encodes the `FILE_TRANSFER_ACCEPTED` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the transfer ID or generation is zero.
     pub fn encode(self) -> Result<Vec<u8>, MessageError> {
         require_nonzero("FILE_TRANSFER_ACCEPTED", 0, self.transfer_id)?;
         self.transfer_generation
@@ -972,6 +1117,13 @@ impl FileTransferAccepted {
         ])
     }
 
+    /// Decodes a `FILE_TRANSFER_ACCEPTED` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not canonical CBOR, is not a strict
+    /// `FILE_TRANSFER_ACCEPTED` map, a field is missing or has the wrong type, or the transfer ID
+    /// or generation is zero.
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         let value = cbor::decode(body)?;
         let map = StrictMap::new("FILE_TRANSFER_ACCEPTED", &value, &[0, 1, 2])?;
@@ -997,6 +1149,12 @@ pub struct MaximumFileData {
 }
 
 impl MaximumFileData {
+    /// Encodes the `MAX_FILE_DATA` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the transfer ID or generation is zero or either
+    /// credit field is zero.
     pub fn encode(self) -> Result<Vec<u8>, MessageError> {
         require_nonzero("MAX_FILE_DATA", 0, self.transfer_id)?;
         self.transfer_generation
@@ -1013,6 +1171,13 @@ impl MaximumFileData {
         ])
     }
 
+    /// Decodes a `MAX_FILE_DATA` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not canonical CBOR, is not a strict `MAX_FILE_DATA`
+    /// map, a field is missing or has the wrong type, or it fails the rules of
+    /// [`MaximumFileData::encode`].
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         let value = cbor::decode(body)?;
         let map = StrictMap::new("MAX_FILE_DATA", &value, &[0, 1, 2, 3])?;
@@ -1036,6 +1201,11 @@ pub struct FileFinish {
 }
 
 impl FileFinish {
+    /// Encodes the `FILE_FINISH` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the transfer ID or generation is zero.
     pub fn encode(self) -> Result<Vec<u8>, MessageError> {
         require_nonzero("FILE_FINISH", 0, self.transfer_id)?;
         self.transfer_generation
@@ -1049,6 +1219,13 @@ impl FileFinish {
         ])
     }
 
+    /// Decodes a `FILE_FINISH` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not canonical CBOR, is not a strict `FILE_FINISH`
+    /// map, a field is missing or has the wrong type, the digest is not 32 bytes, or the transfer
+    /// ID or generation is zero.
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         let value = cbor::decode(body)?;
         let map = StrictMap::new("FILE_FINISH", &value, &[0, 1, 2, 3])?;
@@ -1105,6 +1282,13 @@ pub struct FileResult {
 }
 
 impl FileResult {
+    /// Encodes the `FILE_RESULT` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the transfer ID or generation is zero, a
+    /// committed result has an unsafe final name, a failure carries a final name, or a committed
+    /// path is present on a result other than committed or fails [`validate_committed_path`].
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
         require_nonzero("FILE_RESULT", 0, self.transfer_id)?;
         self.transfer_generation
@@ -1148,6 +1332,13 @@ impl FileResult {
         encode_raw(entries)
     }
 
+    /// Decodes a `FILE_RESULT` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not canonical CBOR, is not a strict `FILE_RESULT`
+    /// map, a field is missing or has the wrong type, the result code is unknown, or it fails the
+    /// rules of [`FileResult::encode`].
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         let value = cbor::decode(body)?;
         let map = StrictMap::new("FILE_RESULT", &value, &[0, 1, 2, 3, 4, 5])?;
@@ -1173,6 +1364,12 @@ pub struct FileTransferAbort {
 }
 
 impl FileTransferAbort {
+    /// Encodes the `FILE_TRANSFER_ABORT` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the transfer ID or generation is zero or the
+    /// reason is unregistered.
     pub fn encode(self) -> Result<Vec<u8>, MessageError> {
         require_nonzero("FILE_TRANSFER_ABORT", 0, self.transfer_id)?;
         self.transfer_generation
@@ -1193,6 +1390,13 @@ impl FileTransferAbort {
         ])
     }
 
+    /// Decodes a `FILE_TRANSFER_ABORT` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `body` is not canonical CBOR, is not a strict
+    /// `FILE_TRANSFER_ABORT` map, a field is missing or has the wrong type, or it fails the rules
+    /// of [`FileTransferAbort::encode`].
     pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
         let value = cbor::decode(body)?;
         let map = StrictMap::new("FILE_TRANSFER_ABORT", &value, &[0, 1, 2, 3])?;
@@ -1213,6 +1417,12 @@ pub struct ParsedFileData<'a> {
     pub data: &'a [u8],
 }
 
+/// Builds the 16-byte `FILE_DATA` prefix for `data_length` bytes at `offset`.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `data_length` is zero or does not fit in `u32`, or
+/// the record body would exceed [`crate::HARD_MAX_RECORD_BODY`].
 pub fn file_data_prefix(
     offset: u64,
     data_length: usize,
@@ -1231,12 +1441,18 @@ pub fn file_data_prefix(
     Ok(prefix)
 }
 
+/// Borrows the offset and data out of a received `FILE_DATA` body.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when `body` is shorter than the prefix, the reserved
+/// bytes are nonzero, or the declared length is zero or differs from the data actually present.
 pub fn parse_file_data(body: &[u8]) -> io::Result<ParsedFileData<'_>> {
     if body.len() < FILE_DATA_PREFIX_SIZE {
         return Err(invalid_io("file data is shorter than its prefix"));
     }
-    let offset = u64::from_be_bytes(body[..8].try_into().expect("checked prefix"));
-    let data_length = u32::from_be_bytes(body[8..12].try_into().expect("checked prefix")) as usize;
+    let offset = u64::from_be_bytes(crate::array_at(body, 0));
+    let data_length = u32::from_be_bytes(crate::array_at(body, 8)) as usize;
     if body[12..16] != [0; 4]
         || data_length == 0
         || data_length != body.len() - FILE_DATA_PREFIX_SIZE
@@ -1262,6 +1478,12 @@ pub struct FileTransferFlow {
 }
 
 impl FileTransferFlow {
+    /// Starts credit accounting for one transfer generation at `resume_offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `generation` is zero or exactly one of the two
+    /// credit limits is zero.
     pub fn new(
         generation: FileTransferGeneration,
         resume_offset: u64,
@@ -1292,6 +1514,12 @@ impl FileTransferFlow {
         self.next_offset
     }
 
+    /// Admits a `FILE_DATA` record of `payload_length` bytes at `offset` against the credit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `offset` is not the next expected offset, the
+    /// payload is empty, a counter overflows, or the record exceeds the cumulative credit.
     pub fn admit(&mut self, offset: u64, payload_length: u32) -> Result<(), MessageError> {
         if offset != self.next_offset || payload_length == 0 {
             return Err(invalid_value(
@@ -1328,6 +1556,12 @@ impl FileTransferFlow {
         self.maximum_records = self.maximum_records.max(records);
     }
 
+    /// Moves the flow to the next generation with fresh credit, as `ADVANCE_FILE_TRANSFER` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when `generation` does not directly follow the
+    /// current one, the committed offset is impossible, or the generation is exhausted.
     pub fn advance(
         &mut self,
         generation: FileTransferGeneration,
@@ -1379,6 +1613,12 @@ impl FileDropGate {
         self.current
     }
 
+    /// Applies a `SET_FILE_DROP_BINDING`, recognizing an exact retry of the latest binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::InvalidValue`] when the binding fails [`FileDropBinding::validate`],
+    /// moves the producer epoch backward, or reuses the current epoch with different contents.
     pub fn apply(
         &mut self,
         binding: FileDropBinding,
@@ -1396,7 +1636,13 @@ impl FileDropGate {
             if binding.producer_epoch == previous.producer_epoch {
                 return if binding == *previous {
                     Ok(FileDropBindingOutcome::ExactRetry(
-                        self.last_result.expect("a previous binding has a result"),
+                        self.last_result.ok_or_else(|| {
+                            invalid_value(
+                                "SET_FILE_DROP_BINDING",
+                                0,
+                                "repeats a binding with no recorded result",
+                            )
+                        })?,
                     ))
                 } else {
                     Err(invalid_value(
@@ -1539,6 +1785,11 @@ fn validate_deadline(schema: &'static str, key: u64, timeout_us: u64) -> Result<
 /// legally contain. Pinning the final component to the already-validated `final_name` leaves the
 /// directory prefix as the only producer-controlled part, and that is bounded to absolute,
 /// control-free, non-`..` components.
+///
+/// # Errors
+///
+/// Returns [`MessageError::InvalidValue`] when `path` is empty, too long, relative, contains a
+/// control character or a `..` component, or does not end in `final_name`.
 pub fn validate_committed_path(path: &str, final_name: &str) -> Result<(), MessageError> {
     if path.is_empty()
         || path.len() > MAX_COMMITTED_PATH_BYTES
@@ -1556,6 +1807,13 @@ pub fn validate_committed_path(path: &str, final_name: &str) -> Result<(), Messa
     Ok(())
 }
 
+/// Checks a producer-suggested file name before it is shown or used to create a file.
+///
+/// # Errors
+///
+/// Returns [`MessageError::InvalidValue`] when `name` is empty or too long, is `.` or `..`, ends in
+/// a dot or space, contains a path separator, reserved punctuation, or a control character, or is a
+/// reserved Windows device name.
 pub fn validate_suggested_name(name: &str) -> Result<(), MessageError> {
     if name.is_empty()
         || name.len() > MAX_FILE_DROP_NAME_BYTES
