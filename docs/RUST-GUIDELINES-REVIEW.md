@@ -25,13 +25,20 @@ about 117 signatures in `media`, `file_drop`, `timed`, `revision`, `audio_input`
 Callers can only tell causes apart by matching strings.
 
 `io::Error` is right for `wire`, which does real I/O. The codecs should return typed errors
-instead. Related gaps:
+instead. Every public error type now implements `Display` and `Error`; `CompletionError` and
+`LeaseTransitionError` were the last two. The remaining gaps all break callers, so they wait for
+the next semver-major release:
 
-- `CompletionError` (`idempotency.rs`) and `LeaseTransitionError` (`lease.rs`) implement neither
-  `Display` nor `Error`.
-- `SizeError`'s `Display` prints its `Debug` form.
-- The public error enums (`MessageError`, `AuthError`, `ResourceError`, `ProfileError`, and
-  `SizeError`) are not `#[non_exhaustive]`, so adding a variant breaks callers.
+- **Typed codec errors.** Replacing `io::Result` changes every signature that `vivid_sdk`,
+  `vivid_gateway`, and `vivido` call.
+- **`#[non_exhaustive]`.** `MessageError`, `AuthError`, `ResourceError`, `ProfileError`,
+  `SizeError`, `CompletionError`, and `LeaseTransitionError` lack it. Adding it breaks any
+  exhaustive `match`, so adding a variant later breaks callers too.
+- **`SizeError`'s `Display` prints the variant name** (`TooLarge`). `vivi` reports oversized
+  images through `io::Error::other(SizeError)` and its tests match on that text, which
+  `tests/errors.rs` pins. Change both together.
+- **`MessageError::Cbor` holds a `String`**, not the `cbor::DecodeError`, so `source()` cannot
+  chain to it.
 
 About 128 `map_err(|_| ...)` calls deliberately replace an integer-conversion error with a
 labelled protocol error, so `clippy::map_err_ignore` is allowed until this redesign. The change

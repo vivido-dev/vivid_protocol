@@ -33,6 +33,17 @@ pub enum CompletionError {
     AlreadyComplete,
 }
 
+impl std::fmt::Display for CompletionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NotReserved => "idempotency key has no pending reservation",
+            Self::AlreadyComplete => "idempotency key already has an outcome",
+        })
+    }
+}
+
+impl std::error::Error for CompletionError {}
+
 #[derive(Debug)]
 pub struct IdempotencyCache {
     maximum_entries: usize,

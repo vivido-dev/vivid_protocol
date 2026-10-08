@@ -198,6 +198,19 @@ pub enum LeaseTransitionError {
     Exhausted,
 }
 
+impl std::fmt::Display for LeaseTransitionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::AuthenticationFailed => "lease authentication failed",
+            Self::BadState => "lease transition is not allowed in the current state",
+            Self::StaleResumeGeneration => "resume generation is stale",
+            Self::Exhausted => "lease revision or resume generation is exhausted",
+        })
+    }
+}
+
+impl std::error::Error for LeaseTransitionError {}
+
 #[derive(Clone)]
 pub struct LeaseMachine {
     state: LeaseState,
