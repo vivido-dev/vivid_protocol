@@ -10,8 +10,11 @@ use std::time::Duration;
 
 pub mod wire;
 
+/// Most overlay windows one presenter tracks across all owners.
 pub const MAX_WINDOWS: usize = 256;
+/// Most overlay windows one session may own (limit key 10's hard ceiling).
 pub const MAX_WINDOWS_PER_OWNER: usize = 32;
+/// Most input events queued for one owner (limit key 11's hard ceiling).
 pub const MAX_PENDING_EVENTS: usize = 256;
 /// The most nodes one overlay may publish in its semantic tree.
 pub const MAX_SEMANTIC_NODES: usize = 256;
@@ -29,32 +32,54 @@ pub const MAX_SEMANTIC_ACTIONS: usize = 7;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SemanticRole {
+    /// A node with no more specific role.
     #[default]
     Generic,
+    /// The application's root.
     Application,
+    /// A container of related nodes.
     Group,
+    /// A heading; the node's level says which.
     Heading,
+    /// Static text.
     Text,
+    /// A push button.
     Button,
+    /// An on/off switch.
     Switch,
+    /// A check box.
     CheckBox,
+    /// One choice in a radio group.
     RadioButton,
+    /// An editable text field.
     TextInput,
+    /// A slider with a numeric value.
     Slider,
+    /// A numeric field stepped up and down.
     SpinButton,
+    /// A progress bar or spinner.
     ProgressIndicator,
+    /// A list.
     List,
+    /// One item of a list.
     ListItem,
+    /// An image.
     Image,
+    /// A link.
     Link,
+    /// A dialog.
     Dialog,
+    /// One tab of a tab list.
     Tab,
+    /// A visual separator.
     Separator,
 }
 impl SemanticRole {
+    /// Returns the wire index.
     pub fn index(self) -> u64 {
         self as u64
     }
+    /// Returns the role with wire index `index`, or `None` when it is unassigned.
     pub fn from_index(index: u64) -> Option<Self> {
         const ALL: [SemanticRole; 20] = [
             SemanticRole::Generic,
@@ -90,20 +115,30 @@ impl SemanticRole {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AccessibleAction {
-    /// The node's default action, which is a click for a button and a focus for most else.
+    /// The node's default action.
+    ///
+    /// That is a click for a button and a focus for most other nodes.
     #[default]
     Default,
+    /// Moves focus to the node.
     Focus,
+    /// Activates the node, as a click would.
     Click,
+    /// Steps a numeric value up.
     Increment,
+    /// Steps a numeric value down.
     Decrement,
+    /// Expands a collapsible node.
     Expand,
+    /// Collapses an expandable node.
     Collapse,
 }
 impl AccessibleAction {
+    /// Returns the wire index.
     pub fn index(self) -> u64 {
         self as u64
     }
+    /// Returns the action with wire index `index`, or `None` when it is unassigned.
     pub fn from_index(index: u64) -> Option<Self> {
         // Seven actions, each with a counterpart in the toolkits a host builds on. A `Select`
         // action had no counterpart anywhere and was removed rather than advertised and then
@@ -124,8 +159,11 @@ impl AccessibleAction {
 /// How a switch or check box reads to assistive technology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toggled {
+    /// Not checked.
     Off,
+    /// Checked.
     On,
+    /// Partly checked, such as a parent of mixed children.
     Mixed,
 }
 
@@ -134,9 +172,11 @@ pub enum Toggled {
 pub struct SemanticNode {
     /// Application-chosen identity, nonzero and unique within one tree.
     pub id: u64,
+    /// What the node is.
     pub role: SemanticRole,
     /// Window-local logical pixels, so assistive technology can point at what it describes.
     pub bounds: Rect,
+    /// Accessible name, at most 256 UTF-8 bytes; may be empty.
     pub label: String,
     /// `[current, minimum, maximum]` for a control with a numeric value.
     pub numeric: Option<[Scalar; 3]>,
@@ -144,8 +184,11 @@ pub struct SemanticNode {
     pub level: Option<u8>,
     /// `[position, size]`, both one-based, for a node that is part of a set.
     pub set: Option<[u16; 2]>,
+    /// Checked state, for a switch or check box.
     pub toggled: Option<Toggled>,
+    /// Whether the node is shown but unavailable.
     pub disabled: bool,
+    /// Actions assistive technology may invoke on the node.
     pub actions: Vec<AccessibleAction>,
     /// Indices into the tree, not identities. A child's index is always greater than its
     /// parent's, which makes a cycle impossible by construction rather than by a visited set.
@@ -161,6 +204,7 @@ pub struct SemanticNode {
 pub struct Semantics {
     /// The published scene these nodes describe.
     pub scene_revision: u64,
+    /// The nodes in tree order; index 0 is the root.
     pub nodes: Vec<SemanticNode>,
 }
 impl Semantics {
@@ -235,36 +279,57 @@ impl Semantics {
     }
 }
 
-/// A press sequence longer than this restarts at one, exactly as a fourth terminal click does.
+/// Most clicks one press sequence counts.
+///
+/// A longer sequence restarts at one, exactly as a fourth terminal click does.
 pub const MAX_CLICKS: u8 = 3;
 /// The most UTF-8 an overlay may copy out in one gesture.
 pub const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
-/// A host MUST NOT accept a clipboard write more than this long after the gesture that caused
-/// it. The exact interval is the host's, but a producer cannot ask for an unbounded one.
+/// Longest delay between a gesture and the clipboard write it allows.
+///
+/// A host MUST NOT accept a clipboard write more than this long after the gesture that caused it.
+/// The exact interval is the host's, but a producer cannot ask for an unbounded one.
 pub const MAX_CLIPBOARD_GESTURE_AGE: Duration = Duration::from_secs(2);
+/// Most UTF-8 bytes in committed text or IME preedit text.
 pub const MAX_EVENT_TEXT_BYTES: usize = 4096;
+/// Most bytes of input events queued for one owner.
 pub const MAX_EVENT_QUEUE_BYTES: usize = 128 * 1024;
+/// Most sessions that may own overlay windows at once.
 pub const MAX_OWNERS: usize = 16;
 
 /// Normative overlay modifier bits. A presenter MUST NOT set a reserved bit, and a receiver
 /// MUST reject an event that does. Platform bitmasks are translated, never forwarded.
 pub mod modifiers {
+    /// Shift.
     pub const SHIFT: u32 = 1;
+    /// Control.
     pub const CONTROL: u32 = 1 << 1;
+    /// Alt or Option.
     pub const ALT: u32 = 1 << 2;
+    /// Super, Command, or the Windows key.
     pub const SUPER: u32 = 1 << 3;
+    /// Caps Lock is on.
     pub const CAPS_LOCK: u32 = 1 << 4;
+    /// Num Lock is on.
     pub const NUM_LOCK: u32 = 1 << 5;
+    /// Every assigned bit; the others are reserved and must be zero.
     pub const KNOWN_MASK: u32 = SHIFT | CONTROL | ALT | SUPER | CAPS_LOCK | NUM_LOCK;
 }
 
-/// Normative overlay pointer buttons, sharing `desktop-surface-v1` section 7's assignment so a
-/// producer can accept either lane's events without knowing which presenter produced them.
+/// Normative overlay pointer buttons.
+///
+/// They share `desktop-surface-v1` section 7's assignment, so a producer can accept either lane's
+/// events without knowing which presenter produced them.
 pub mod buttons {
+    /// The primary button, usually left.
     pub const PRIMARY: u16 = 0;
+    /// The auxiliary button, usually the wheel.
     pub const AUXILIARY: u16 = 1;
+    /// The secondary button, usually right.
     pub const SECONDARY: u16 = 2;
+    /// The back button.
     pub const BACK: u16 = 3;
+    /// The forward button.
     pub const FORWARD: u16 = 4;
     /// Additional device buttons occupy 5..=MAXIMUM. The range is bounded so a hostile or broken
     /// device cannot force a producer to size per-button state from an untrusted number.
@@ -273,43 +338,61 @@ pub mod buttons {
 
 /// Physical keys are USB HID keyboard-page usages, as in `desktop-surface-v1` section 7.
 pub mod keys {
+    /// A physical key the keyboard page does not name; never an identity.
     pub const UNMAPPED: u32 = 0;
+    /// Lowest keyboard-page usage a physical key may carry.
     pub const FIRST_USAGE: u32 = 0x04;
+    /// Highest keyboard-page usage a physical key may carry.
     pub const LAST_USAGE: u32 = 0xe7;
-    /// Zero reports a physical key the keyboard page does not name; it is not an identity.
+    /// A physical key the keyboard page does not name.
+    ///
+    /// It is never an identity.
     pub fn valid(usage: u32) -> bool {
         usage == UNMAPPED || (FIRST_USAGE..=LAST_USAGE).contains(&usage)
     }
 }
 
-/// One wheel or trackpad delta together with the device detail a producer needs to interpret it.
+/// One wheel or trackpad delta and its device detail.
+///
+/// The detail is what a producer needs to interpret the delta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scroll {
+    /// Horizontal delta in logical pixels.
     pub dx: Scalar,
+    /// Vertical delta in logical pixels.
     pub dy: Scalar,
     /// True for pixel-precise devices such as trackpads, false for detented wheels.
     pub precise: bool,
+    /// Where the delta falls in a trackpad gesture.
     pub phase: ScrollPhase,
 }
 
-/// Whether a wheel delta came from a pixel-precise device and where it sits in a gesture.
+/// A wheel delta's device precision and gesture phase.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScrollPhase {
     /// A device that reports no gesture boundaries, such as an ordinary detented wheel.
     #[default]
     None,
+    /// The first delta of a gesture.
     Began,
+    /// A delta in the middle of a gesture.
     Changed,
+    /// The last delta of a gesture.
     Ended,
+    /// The gesture was cancelled.
     Cancelled,
 }
 
+/// How an overlay window stacks and takes input (`SET_OVERLAY_WINDOW` key 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WindowMode {
+    /// An ordinary window.
     Floating,
+    /// A transient window that an outside press or Escape dismisses.
     Popup,
+    /// Blocks input to other windows of the same owner until it closes.
     Modal,
 }
 
@@ -324,16 +407,24 @@ impl WindowMode {
     }
 }
 
+/// The geometry and behavior an overlay window is created or updated with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowOptions {
+    /// Window rectangle, relative to the pane viewport (key 4).
     pub bounds: Rect,
+    /// Stacking and input mode; immutable after creation (key 5).
     pub mode: WindowMode,
+    /// Whether the window is shown (key 6).
     pub visible: bool,
+    /// Parent window in the same session; immutable after creation (key 7).
     pub parent: Option<SurfaceIdentity>,
+    /// Smallest width a host resize may produce (key 8).
     pub min_width: Scalar,
+    /// Smallest height a host resize may produce (key 8).
     pub min_height: Scalar,
 }
 impl WindowOptions {
+    /// Creates visible options with no parent and a one-unit minimum size.
     pub fn new(bounds: Rect, mode: WindowMode) -> Self {
         Self {
             bounds,
@@ -363,24 +454,37 @@ impl WindowOptions {
     }
 }
 
+/// Why the host dismissed an overlay window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DismissReason {
+    /// The user pressed Escape.
     Escape,
+    /// The user pressed outside a popup.
     OutsidePress,
+    /// The window was closed explicitly.
     Closed,
+    /// The owning session ended.
     OwnerLost,
+    /// The parent window closed.
     ParentClosed,
 }
 
+/// One input or lifecycle event for an overlay window (`OVERLAY_INPUT_EVENT` key 5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
+    /// The window gained (`true`) or lost focus (type 0).
     Focus(bool),
+    /// Pointer motion or a button transition (type 1).
     Pointer {
+        /// Pointer position in window-local logical pixels.
         position: Point,
+        /// The hit region; zero is the default window rectangle.
         region: u64,
+        /// Button and whether it went down, or `None` for motion.
         button: Option<(u16, bool)>,
+        /// Held modifiers, as [`modifiers`] bits.
         modifiers: u32,
         /// 1-3 for a press, 0 for motion or a release (overlay-pointer-v1). A host counts clicks
         /// from its own double-click policy; a producer never has to reproduce that timing.
@@ -391,7 +495,9 @@ pub enum Event {
     },
     /// Assistive technology invoked one semantic node (overlay-a11y-v1).
     Accessibility {
+        /// The semantic node's application ID.
         node: u64,
+        /// The invoked action.
         action: AccessibleAction,
     },
     /// The pointer entered or left one region (overlay-pointer-v1).
@@ -402,60 +508,95 @@ pub enum Event {
     Hover {
         /// The region being entered or left. Zero is the default window rectangle.
         region: u64,
+        /// Whether the pointer entered (`true`) or left the region.
         entered: bool,
     },
+    /// A wheel or trackpad scroll (type 2).
     Wheel {
+        /// Pointer position in window-local logical pixels.
         position: Point,
+        /// Horizontal delta in logical pixels.
         dx: Scalar,
+        /// Vertical delta in logical pixels.
         dy: Scalar,
+        /// Held modifiers, as [`modifiers`] bits.
         modifiers: u32,
         /// True for pixel-precise devices such as trackpads, false for detented wheels.
         precise: bool,
+        /// Where the delta falls in a trackpad gesture.
         phase: ScrollPhase,
     },
+    /// A physical key transition (type 3).
     Key {
+        /// USB HID keyboard-page usage, or [`keys::UNMAPPED`].
         physical: u32,
+        /// Whether the key went down.
         down: bool,
+        /// Whether this is an auto-repeat.
         repeat: bool,
+        /// Held modifiers, as [`modifiers`] bits.
         modifiers: u32,
     },
+    /// Committed text, at most [`MAX_EVENT_TEXT_BYTES`] (type 4).
     Text(String),
+    /// The IME's current composition (type 5).
     Ime {
+        /// Uncommitted composition text.
         preedit: String,
+        /// Selected UTF-8 byte range within the preedit text.
         selection: Option<(u32, u32)>,
     },
+    /// The host moved or resized the window (type 6).
     Geometry {
+        /// The new window rectangle.
         bounds: Rect,
+        /// Whether this is the final geometry of the gesture.
         settled: bool,
     },
+    /// The host dismissed the window (type 7).
     Dismissed(DismissReason),
+    /// Held input and gestures were cancelled (type 8).
     Cancel,
 }
 
+/// An [`Event`] addressed to one window and scene.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowEvent {
+    /// The window the event is for.
     pub window: SurfaceIdentity,
+    /// The window's surface generation.
     pub generation: u64,
+    /// The window's geometry revision.
     pub revision: u64,
     /// Published drawing/hit-test revision, independent of the geometry revision.
     pub scene_revision: u64,
+    /// The event.
     pub event: Event,
 }
 
+/// The host's state for one overlay window.
 #[derive(Debug, Clone)]
 pub struct Window {
+    /// The window's surface identity.
     pub identity: SurfaceIdentity,
+    /// The surface generation.
     pub generation: u64,
+    /// Window geometry revision; advances on each successful mutation.
     pub revision: u64,
+    /// The published drawing and hit-test revision.
     pub scene_revision: u64,
+    /// Current geometry and behavior.
     pub options: WindowOptions,
 }
 
 /// One pointer report: where it is, what changed, and what the device measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointerReport {
+    /// Pointer position in pane-viewport logical pixels.
     pub position: Point,
+    /// Button and whether it went down, or `None` for motion.
     pub button: Option<(u16, bool)>,
+    /// Held modifiers, as [`modifiers`] bits.
     pub modifiers: u32,
     /// 1-3 for a press, 0 for motion or a release.
     pub clicks: u8,
@@ -483,6 +624,7 @@ struct Hover {
     cursor: Option<CursorShape>,
 }
 
+/// A presenter's overlay windows for one pane: stacking, focus, capture, and event queues.
 #[derive(Debug, Default)]
 pub struct Windows {
     entries: BTreeMap<SurfaceIdentity, Window>,
@@ -498,9 +640,11 @@ pub struct Windows {
 }
 
 impl Windows {
+    /// Returns the window `id`, if it exists.
     pub fn get(&self, id: SurfaceIdentity) -> Option<&Window> {
         self.entries.get(&id)
     }
+    /// Returns the focused window, if any.
     pub fn focus(&self) -> Option<SurfaceIdentity> {
         self.focus
     }
@@ -512,6 +656,7 @@ impl Windows {
     pub fn restorable_focus(&self) -> Option<SurfaceIdentity> {
         self.focus_candidate()
     }
+    /// Returns whether a window holds pointer capture.
     pub fn has_pointer_capture(&self) -> bool {
         self.capture.is_some()
     }
@@ -529,6 +674,7 @@ impl Windows {
             self.swallowed_escape = false;
         }
     }
+    /// Returns the effectively visible windows, bottom to top.
     pub fn visible(&self) -> impl Iterator<Item = &Window> {
         self.stack
             .iter()
@@ -903,6 +1049,7 @@ impl Windows {
         let next = self.focus_candidate();
         self.change_focus(next);
     }
+    /// Closes `id` and its descendants, queuing a dismissal for each.
     pub fn close(&mut self, id: SurfaceIdentity, reason: DismissReason) {
         // Remove descendants first, without allowing a parent of a removed node to keep input.
         let children: Vec<_> = self
@@ -932,6 +1079,7 @@ impl Windows {
         self.stack.retain(|key| *key != id);
         self.focus_history.retain(|key| *key != id);
     }
+    /// Removes every window and queued event that belongs to `owner`.
     pub fn revoke_owner(&mut self, owner: SessionIdentity) {
         self.overflowed.remove(&owner);
         let ids: Vec<_> = self
@@ -1013,6 +1161,7 @@ impl Windows {
     pub fn take_overflow(&mut self, owner: SessionIdentity) -> bool {
         self.overflowed.remove(&owner)
     }
+    /// Returns the next queued event for `owner`.
     pub fn take_event(&mut self, owner: SessionIdentity) -> Option<WindowEvent> {
         let queue = self.events.get_mut(&owner)?;
         let event = queue.pop_front();
@@ -1052,6 +1201,7 @@ impl Windows {
         });
         Ok(())
     }
+    /// Releases pointer capture if `id` holds it.
     pub fn release_pointer(&mut self, id: SurfaceIdentity) {
         if self.capture.is_some_and(|c| c.window == id) {
             self.capture = None;

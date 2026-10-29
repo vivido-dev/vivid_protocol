@@ -1,19 +1,28 @@
-//! Optional host text measurements and revision-bound platform editor placement.
+//! Host text measurement and platform editor placement for overlays (`overlay-text-v1`).
+//!
+//! An overlay cannot shape text itself, so it asks the host: [`MeasureText`] measures one text run
+//! with the same fonts and shaping the host paints with, and the reply is a [`TextMeasurement`] of
+//! line and cluster [`TextGeometry`]. [`EditorGeometry`] places the platform input-method editor
+//! over the focused window's text field for one presented scene revision.
 use super::{
     MessageError, PayloadMap, Rect, Scalar, Value, WindowAddress, array, bad, boolean,
     decode_rectangle, decode_scalar, nonzero, rectangle, scalar, small, strict, u,
 };
 use crate::vector::{Canvas, Command, Text};
 
-#[path = "styled.rs"]
 pub mod styled;
 
+/// Most UTF-8 bytes one measurement may cover.
 pub const MAX_MEASURE_TEXT_BYTES: usize = 4096;
+/// Most line and cluster entries in one measurement reply.
 pub const MAX_TEXT_GEOMETRY: usize = 1024;
 
+/// A `MEASURE_OVERLAY_TEXT` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasureText {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// The text to measure, as a tag-7 text command (key 3).
     pub text: Text,
 }
 impl MeasureText {
@@ -76,14 +85,21 @@ impl MeasureText {
 /// UTF-8 byte range and logical layout geometry. Zero advances (combining clusters) are valid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextGeometry {
+    /// First UTF-8 byte of the range.
     pub start: u32,
+    /// UTF-8 byte after the range.
     pub end: u32,
+    /// Left edge, relative to the layout origin.
     pub x: Scalar,
+    /// Top edge, relative to the layout origin.
     pub y: Scalar,
+    /// Width; zero for a combining cluster.
     pub width: Scalar,
+    /// Height.
     pub height: Scalar,
     /// Baseline for a line; zero for a cluster.
     pub baseline: Scalar,
+    /// Whether a cluster is right-to-left; always `false` for a line.
     pub rtl: bool,
 }
 impl TextGeometry {
@@ -122,13 +138,18 @@ impl TextGeometry {
     }
 }
 
+/// The `OVERLAY_TEXT_MEASURED` reply: size, lines, and clusters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextMeasurement {
     /// Original UTF-8 cutoff for an ellipsized layout; synthetic marker ranges are empty here.
     pub truncated_at: Option<u32>,
+    /// Layout width in logical pixels (key 3).
     pub width: Scalar,
+    /// Layout height in logical pixels (key 3).
     pub height: Scalar,
+    /// Line geometry, in order (key 4).
     pub lines: Vec<TextGeometry>,
+    /// Cluster geometry, in visual order (key 5).
     pub clusters: Vec<TextGeometry>,
 }
 impl TextMeasurement {
@@ -234,9 +255,12 @@ impl TextMeasurement {
     }
 }
 
+/// A `SET_OVERLAY_EDITOR` request that positions the platform text editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditorGeometry {
+    /// The focused window (keys 0 through 2).
     pub address: WindowAddress,
+    /// The nonzero presented scene revision the rectangle belongs to (key 3).
     pub scene_revision: u64,
     /// Window-local logical caret/exclusion rectangle, or None to clear it.
     pub caret: Option<Rect>,
@@ -277,98 +301,5 @@ impl EditorGeometry {
                 v => Some(decode_rectangle(v, 4)?),
             },
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::vector::Point;
-
-    fn request() -> MeasureText {
-        MeasureText {
-            address: WindowAddress {
-                context_id: 1,
-                surface_id: 2,
-                generation: 3,
-            },
-            text: Text {
-                text: "A😀日".into(),
-                origin: Point::new(0., 0.).unwrap(),
-                size: Scalar::new(16.).unwrap(),
-                family: String::new(),
-                weight: 400,
-                italic: false,
-                color: crate::vector::Color(0xff_ff_ff_ff),
-                max_width: None,
-            },
-        }
-    }
-    #[test]
-    fn measurement_and_editor_roundtrip_and_reject_malformed_input() {
-        let request = request();
-        let value = Value::Map(request.payload().unwrap());
-        assert_eq!(MeasureText::decode(2, &value).unwrap(), request);
-        MeasureText::decode(3, &value).unwrap_err();
-        let mut oversized = request.clone();
-        oversized.text.text = "a".repeat(MAX_MEASURE_TEXT_BYTES + 1);
-        oversized.payload().unwrap_err();
-        let mut duplicate = request.payload().unwrap();
-        duplicate.push((3, Value::Null));
-        MeasureText::decode(2, &Value::Map(duplicate)).unwrap_err();
-        for caret in [None, Some(Rect::new(1., 2., 1., 16.).unwrap())] {
-            let editor = EditorGeometry {
-                address: request.address,
-                scene_revision: u64::MAX,
-                caret,
-            };
-            assert_eq!(
-                EditorGeometry::decode(2, &Value::Map(editor.payload().unwrap())).unwrap(),
-                editor
-            );
-        }
-        EditorGeometry {
-            address: request.address,
-            scene_revision: 0,
-            caret: None,
-        }
-        .payload()
-        .unwrap_err();
-    }
-    #[test]
-    fn measurements_reject_wrong_owner_geometry_limits_and_unicode_offsets() {
-        let request = request();
-        let geometry = TextGeometry {
-            start: 1,
-            end: 5,
-            x: Scalar::ZERO,
-            y: Scalar::ZERO,
-            width: Scalar::ONE,
-            height: Scalar::ONE,
-            baseline: Scalar::ZERO,
-            rtl: false,
-        };
-        let mut measured = TextMeasurement {
-            truncated_at: None,
-            width: Scalar::ONE,
-            height: Scalar::ONE,
-            lines: vec![],
-            clusters: vec![geometry],
-        };
-        measured.validate_text(&request.text.text).unwrap();
-        let value = Value::Map(measured.payload(request.address).unwrap());
-        assert_eq!(
-            TextMeasurement::decode(request.address, &value).unwrap(),
-            measured
-        );
-        let wrong = WindowAddress {
-            context_id: 8,
-            ..request.address
-        };
-        TextMeasurement::decode(wrong, &value).unwrap_err();
-        measured.clusters[0].end = 2;
-        assert!(measured.validate_text(&request.text.text).is_err());
-        measured.clusters = vec![measured.clusters[0].clone(); MAX_TEXT_GEOMETRY + 1];
-        measured.payload(request.address).unwrap_err();
     }
 }

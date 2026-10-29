@@ -1,4 +1,10 @@
-//! Immutable track configuration, channel generations, and readiness state.
+//! Media tracks: configuration, channel generations, and readiness (media §2 through §8).
+//!
+//! A [`TrackConfiguration`] is the immutable `CREATE_TRACK` schema, with a [`KindConfiguration`]
+//! for each media kind. A track's media travels on an authenticated channel; [`ChannelOpenState`]
+//! decides how to answer each `CHANNEL_OPEN`, and [`TrackState`] holds the generation, milestone
+//! bits, and flow. Control records such as [`ActivateTrack`], [`AdvanceChannel`], and
+//! [`WaitTrack`] have typed codecs here.
 
 use crate::{
     HARD_MAX_RECORD_BODY,
@@ -9,21 +15,35 @@ use crate::{
         validate_header_object,
     },
     resource::{ChannelFlow, ResourceError},
-    revision::{ChannelGeneration, TrackRevision},
+    revision::{ChannelGeneration, SurfaceRevision, TrackRevision},
 };
 use sha2::{Digest, Sha256};
 
+/// Milestone bit 0: the channel was accepted (media §7).
 pub const MILESTONE_CHANNEL_ACCEPTED: u64 = 1 << 0;
+/// Milestone bit 1: the first media record was accepted.
 pub const MILESTONE_FIRST_MEDIA: u64 = 1 << 1;
+/// Milestone bit 2: the decoder is initialized.
 pub const MILESTONE_DECODER_INITIALIZED: u64 = 1 << 2;
+/// Milestone bit 3: a random-access video unit, or a full raster or image, was accepted.
 pub const MILESTONE_RANDOM_ACCESS: u64 = 1 << 3;
+/// Milestone bit 4: the first decoded or composed output is ready.
 pub const MILESTONE_OUTPUT_READY: u64 = 1 << 4;
+/// Milestone bit 5: first presentation for the current surface generation.
+///
+/// It requires an eligible node to be visible.
 pub const MILESTONE_PRESENTED: u64 = 1 << 5;
+/// Milestone bit 6: the timed playback clock started.
 pub const MILESTONE_CLOCK_STARTED: u64 = 1 << 6;
+/// Milestone bit 7: end of stream was accepted.
 pub const MILESTONE_EOS_ACCEPTED: u64 = 1 << 7;
+/// Milestone bit 8: buffered playback ended.
 pub const MILESTONE_BUFFERED_ENDED: u64 = 1 << 8;
+/// Milestone bit 9: the channel is detached; it survives a generation advance.
 pub const MILESTONE_CHANNEL_DETACHED: u64 = 1 << 9;
+/// Milestone bit 10: the track is lost; it survives a generation advance.
 pub const MILESTONE_TRACK_LOST: u64 = 1 << 10;
+/// Every assigned milestone bit.
 pub const MILESTONE_KNOWN_MASK: u64 = (1 << 11) - 1;
 
 /// Unsigned Q32.32 linear amplitude used by `audio-gain-v1`.
@@ -31,10 +51,14 @@ pub const MILESTONE_KNOWN_MASK: u64 = (1 << 11) - 1;
 pub struct AudioGain(u64);
 
 impl AudioGain {
+    /// Zero gain.
     pub const SILENT: Self = Self(0);
+    /// Gain of one: the audio plays unchanged.
     pub const UNITY: Self = Self(1_u64 << 32);
+    /// The largest gain, two (200 percent).
     pub const MAX: Self = Self(2_u64 << 32);
 
+    /// Returns the gain for Q32.32 value `raw`, or `None` above [`AudioGain::MAX`].
     pub const fn new(raw: u64) -> Option<Self> {
         if raw <= Self::MAX.0 {
             Some(Self(raw))
@@ -43,10 +67,12 @@ impl AudioGain {
         }
     }
 
+    /// Returns the Q32.32 value.
     pub const fn raw(self) -> u64 {
         self.0
     }
 
+    /// Returns the gain for `percent`, or `None` above 200.
     pub fn from_percent(percent: u32) -> Option<Self> {
         if percent > 200 {
             return None;
@@ -58,6 +84,7 @@ impl AudioGain {
         clippy::cast_precision_loss,
         reason = "a presentation ratio; f32 precision is the intent"
     )]
+    /// Returns the gain as a linear amplitude factor.
     pub fn as_f32(self) -> f32 {
         self.0 as f32 / (1_u64 << 32) as f32
     }
@@ -73,29 +100,78 @@ struct AcceptedOpen {
     media_admitted: bool,
 }
 
+/// What [`ChannelOpenState::open`] decided about a `CHANNEL_OPEN` (media §5.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelOpenDecision {
+    /// Accept the channel with this `CHANNEL_ACCEPTED` payload.
     Fresh(PayloadMap),
+    /// Rebind an exact retry after transport loss with the original acceptance.
     ExactReplay(PayloadMap),
+    /// Reject with `CHANNEL_BUSY`: the accepted transport is still live.
     Busy,
+    /// Reject with `BAD_MESSAGE`: the generation was opened with other bytes.
     DifferentBytes,
+    /// Reject: the open names a generation other than the current one, or media already arrived.
     StaleGeneration,
 }
 
+/// One `CHANNEL_OPEN` a presenter is deciding on, for [`ChannelOpenState::open`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChannelOpenAttempt<'a> {
+    /// The channel generation the open names.
+    pub generation: ChannelGeneration,
+    /// The open's client nonce, which identifies a retry.
+    pub nonce: [u8; 16],
+    /// The complete `CHANNEL_OPEN` record body; only its digest is kept.
+    pub complete_open_bytes: &'a [u8],
+    /// The `CHANNEL_ACCEPTED` payload prepared for this open, replayed to an exact retry.
+    pub acceptance: PayloadMap,
+}
+
+impl std::fmt::Debug for ChannelOpenAttempt<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChannelOpenAttempt")
+            .field("generation", &self.generation)
+            .field("open_len", &self.complete_open_bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One received media record, as [`TrackState::admit_media`] checks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivedMedia {
+    /// The channel generation the record arrived on.
+    pub generation: ChannelGeneration,
+    /// The record body length, charged against the channel's flow allowance.
+    pub body_length: u32,
+    /// The media epoch from the record prefix.
+    pub epoch: u32,
+    /// The media ID from the record prefix; nonzero and increasing.
+    pub media_id: u64,
+    /// Whether the record is a random-access unit, such as a key frame.
+    pub random_access: bool,
+}
+
+/// A presenter's channel-open retry state for one track identity.
 #[derive(Debug, Default)]
 pub struct ChannelOpenState {
     accepted: Option<AcceptedOpen>,
 }
 
 impl ChannelOpenState {
+    /// Decides how to answer a `CHANNEL_OPEN` for the track at `current_generation`.
     pub fn open(
         &mut self,
         current_generation: ChannelGeneration,
-        generation: ChannelGeneration,
-        nonce: [u8; 16],
-        complete_open_bytes: &[u8],
-        acceptance: PayloadMap,
+        attempt: ChannelOpenAttempt<'_>,
     ) -> ChannelOpenDecision {
+        let ChannelOpenAttempt {
+            generation,
+            nonce,
+            complete_open_bytes,
+            acceptance,
+        } = attempt;
         if generation != current_generation {
             return ChannelOpenDecision::StaleGeneration;
         }
@@ -147,6 +223,7 @@ impl ChannelOpenState {
         Ok(())
     }
 
+    /// Records that the accepted transport for `generation` closed.
     pub fn transport_lost(&mut self, generation: ChannelGeneration) {
         if let Some(accepted) = &mut self.accepted
             && accepted.generation == generation
@@ -155,16 +232,20 @@ impl ChannelOpenState {
         }
     }
 
+    /// Forgets the accepted open after the track moves to a new generation.
     pub fn advance(&mut self) {
         self.accepted = None;
     }
 }
 
+/// How a track presents media (`CREATE_TRACK` key 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 #[non_exhaustive]
 pub enum TrackMode {
+    /// Present media as soon as it is ready.
     Live = 1,
+    /// Present media at exact timestamps under `timed-media-v1`.
     Timed = 2,
 }
 
@@ -184,24 +265,42 @@ impl TryFrom<u64> for TrackMode {
     }
 }
 
+/// Immutable video configuration (media §3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoConfiguration {
+    /// Canonical codec name, such as `h264` (key 0).
     pub codec: String,
+    /// Packetization identifier, such as `h264-annexb-au-v1` (key 1).
     pub packetization: String,
+    /// Codec extradata, at most 65,536 bytes (key 2).
     pub extradata: Vec<u8>,
+    /// Coded width, `1..=8192` (key 3).
     pub coded_width: u32,
+    /// Coded height, `1..=8192` (key 4).
     pub coded_height: u32,
+    /// Codec profile (key 5).
     pub profile: i32,
+    /// Codec level (key 6).
     pub level: i32,
+    /// Most frames the decoder may reorder, at most 64 (key 8).
     pub maximum_reorder_depth: u8,
+    /// Color primaries code (key 10).
     pub color_primaries: u64,
+    /// Transfer characteristic code (key 11).
     pub transfer: u64,
+    /// Matrix coefficients code (key 12).
     pub matrix: u64,
+    /// Signal range code (key 13).
     pub signal_range: u64,
+    /// Nonzero sample-aspect-ratio numerator (key 14).
     pub aspect_numerator: u64,
+    /// Nonzero sample-aspect-ratio denominator (key 15).
     pub aspect_denominator: u64,
+    /// Largest encoded access unit, nonzero (key 16).
     pub maximum_access_unit_bytes: u32,
+    /// RFC 6381 codec string, at most 64 printable ASCII bytes (key 17).
     pub codec_string: Option<String>,
+    /// Matching decoder configuration body, at most 4,096 bytes (key 18).
     pub decoder_configuration: Option<Vec<u8>>,
 }
 
@@ -345,27 +444,36 @@ impl VideoConfiguration {
     }
 }
 
+/// Immutable audio configuration (media §3.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioConfiguration {
+    /// Canonical codec name, such as `opus` (key 0).
     pub codec: String,
+    /// Packetization identifier, such as `opus-packet-v1` (key 1).
     pub packetization: String,
+    /// Codec extradata, at most 65,536 bytes (key 2).
     pub extradata: Vec<u8>,
+    /// Sample rate, `8000..=192000` (key 3).
     pub sample_rate: u32,
+    /// Channel count, `1..=8` (key 4).
     pub channels: u8,
+    /// Channel mask, or zero for the default layout (key 5).
     pub channel_mask: u64,
+    /// Largest encoded access unit, `1..=1048576` (key 6).
     pub maximum_access_unit_bytes: u32,
+    /// RFC 6381 codec string (key 8).
     pub codec_string: Option<String>,
 }
 
 impl AudioConfiguration {
     fn validate(&self) -> Result<(), MessageError> {
-        media::validate_audio_initialization(
-            &self.codec,
-            &self.packetization,
-            &self.extradata,
-            self.sample_rate,
-            u16::from(self.channels),
-        )
+        media::validate_audio_initialization(media::AudioInitialization {
+            codec: &self.codec,
+            packetization: &self.packetization,
+            extradata: &self.extradata,
+            sample_rate: self.sample_rate,
+            channels: u16::from(self.channels),
+        })
         .map_err(|_| invalid_value("audio configuration", 1, "is not canonical"))?;
         if self.extradata.len() > 65_536
             || !(8_000..=192_000).contains(&self.sample_rate)
@@ -454,13 +562,20 @@ impl AudioConfiguration {
     }
 }
 
+/// Immutable raster configuration (media §3.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RasterConfiguration {
+    /// Width, `1..=8192` (key 0).
     pub width: u32,
+    /// Height, `1..=8192` (key 1).
     pub height: u32,
+    /// Straight (`1`) or premultiplied (`2`) alpha (key 3).
     pub alpha_mode: u64,
+    /// Whether delta frames may follow full frames (key 4).
     pub delta_enabled: bool,
+    /// Most operations in one delta frame, `1..=16` (key 5).
     pub maximum_delta_operations: u8,
+    /// Whether frames may be zstd-compressed (key 6).
     pub zstd_enabled: bool,
 }
 
@@ -534,21 +649,27 @@ impl RasterConfiguration {
     }
 }
 
+/// Immutable encoded-image configuration (media §3.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageConfiguration {
+    /// PNG (`1`) or JPEG (`2`) (key 0).
     pub encoding: u64,
+    /// Decoded width, `1..=8192` (key 1).
     pub width: u32,
+    /// Decoded height, `1..=8192` (key 2).
     pub height: u32,
+    /// Exact encoded byte length (key 3).
     pub encoded_length: u32,
+    /// SHA-256 of the exact encoded bytes (key 4).
     pub sha256: Option<[u8; 32]>,
+    /// Requests a lookup in the context's immutable image cache (key 6).
     pub cache_lookup: bool,
 }
 
 impl ImageConfiguration {
-    /// Check the encoding, dimensions, and declared length against the media specification.
+    /// Checks the encoding, dimensions, and declared length against the media specification.
     ///
-    /// Public so a producer can reject a container before it becomes a track configuration,
-    /// instead of each SDK binding reimplementing these bounds.
+    /// A producer can call it to reject a container before building a track configuration.
     ///
     /// # Errors
     ///
@@ -622,8 +743,11 @@ impl ImageConfiguration {
 /// Immutable logical extent and byte ceiling of a retained vector track.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorConfiguration {
+    /// Logical width, `1..=16384` (key 0).
     pub width: u32,
+    /// Logical height, `1..=16384` (key 1).
     pub height: u32,
+    /// Largest encoded scene (key 2).
     pub maximum_scene_bytes: u32,
 }
 impl VectorConfiguration {
@@ -663,17 +787,24 @@ impl VectorConfiguration {
     }
 }
 
+/// The kind-specific configuration in `CREATE_TRACK` key 12.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KindConfiguration {
+    /// A video track.
     Video(VideoConfiguration),
+    /// An audio track.
     Audio(AudioConfiguration),
+    /// A raster track.
     Raster(RasterConfiguration),
+    /// An encoded-image track.
     EncodedImage(ImageConfiguration),
+    /// A vector-scene track.
     VectorScene(VectorConfiguration),
 }
 
 impl KindConfiguration {
+    /// Returns the track kind this configuration is for.
     pub const fn kind(&self) -> TrackKind {
         match self {
             Self::Video(_) => TrackKind::Video,
@@ -713,8 +844,10 @@ impl KindConfiguration {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(u64)]
 pub enum TrackDirection {
+    /// Producer to presenter, the default.
     #[default]
     Downlink = 0,
+    /// Presenter to producer, such as microphone input (`audio-input-v1`).
     Uplink = 1,
 }
 
@@ -734,23 +867,40 @@ impl TryFrom<u64> for TrackDirection {
     }
 }
 
+/// The `CREATE_TRACK` and `PROBE_TRACK_CONFIG` schema (media §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackConfiguration {
+    /// Immutable direction; omitted on the wire for downlink (key 16).
     pub direction: TrackDirection,
+    /// Owning context (key 0).
     pub context_id: u64,
+    /// Owning surface (key 1).
     pub surface_id: u64,
+    /// Track ID; zero for a probe (key 2).
     pub track_id: u64,
+    /// Intended surface slot (key 4).
     pub slot: u64,
+    /// Live or timed presentation (key 5).
     pub mode: TrackMode,
+    /// Realtime or bulk lane (key 6).
     pub lane: LaneClass,
+    /// Largest media-record body, nonzero (key 7).
     pub maximum_record_body: u32,
+    /// Largest frame or access-unit rate in millihertz (key 8).
     pub maximum_rate_millihertz: u64,
+    /// Largest encoded bit rate (key 9).
     pub maximum_encoded_bits_per_second: u64,
+    /// Largest media record rate (key 10).
     pub maximum_records_per_second: u64,
+    /// Requested in-flight body-byte allowance (key 11).
     pub maximum_inflight_body_bytes: u64,
+    /// Kind-specific configuration; it also sets the track kind (keys 3 and 12).
     pub kind: KindConfiguration,
+    /// Target latency in microseconds, for live mode (key 13).
     pub target_latency_us: u64,
+    /// Largest latency in microseconds (key 14).
     pub maximum_latency_us: u64,
+    /// Requested retained-pixel charge (key 15).
     pub retained_pixel_charge: u64,
 }
 
@@ -941,18 +1091,27 @@ impl TrackConfiguration {
     }
 }
 
+/// A track's mutable presenter state.
 #[derive(Debug, Clone)]
 pub struct TrackState {
+    /// Track revision; advances on each change.
     pub revision: TrackRevision,
+    /// Current channel generation.
     pub channel_generation: ChannelGeneration,
+    /// Milestone bits for the current generation, such as [`MILESTONE_OUTPUT_READY`].
     pub milestones: u64,
+    /// Current media epoch.
     pub media_epoch: u32,
+    /// ID of the last accepted media record.
     pub last_media_id: u64,
+    /// Flow accounting for the current generation.
     pub flow: ChannelFlow,
+    /// Whether the presenter lost the track.
     pub lost: bool,
 }
 
 impl TrackState {
+    /// Creates the state of a newly created track.
     pub fn new() -> Self {
         Self {
             revision: TrackRevision::ONE,
@@ -1007,14 +1166,14 @@ impl TrackState {
     /// stale, the record exceeds the flow allowance or overflows accounting, the media ID is zero
     /// or not increasing, the epoch moved backward, or a new epoch does not begin with a
     /// random-access unit.
-    pub fn admit_media(
-        &mut self,
-        generation: ChannelGeneration,
-        body_length: u32,
-        epoch: u32,
-        media_id: u64,
-        random_access: bool,
-    ) -> Result<(), MessageError> {
+    pub fn admit_media(&mut self, media: ReceivedMedia) -> Result<(), MessageError> {
+        let ReceivedMedia {
+            generation,
+            body_length,
+            epoch,
+            media_id,
+            random_access,
+        } = media;
         if self.lost || generation != self.channel_generation {
             return Err(invalid_value(
                 "media record",
@@ -1130,263 +1289,353 @@ fn required_i32(map: &StrictMap<'_>, key: u64) -> Result<i32, MessageError> {
         .map_err(|_| invalid_value("track configuration", key, "does not fit in i32"))
 }
 
-#[cfg(test)]
-mod tests {
+/// The `ADVANCE_CHANNEL` payload: reattach a track on a new channel generation (media §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvanceChannel {
+    /// The owning context.
+    pub context_id: u64,
+    /// The track's surface.
+    pub surface_id: u64,
+    /// The track to advance.
+    pub track_id: u64,
+    /// The channel generation the producer believes is current.
+    pub current_generation: ChannelGeneration,
+    /// The new generation, exactly `current_generation` plus one.
+    pub next_generation: ChannelGeneration,
+    /// Why the channel advances, a `channel_advance_reason` registry value.
+    pub reason: u64,
+}
 
-    /// The exact keys and order of a `MAX_CHANNEL_DATA` body.
+impl AdvanceChannel {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (2, Value::Unsigned(self.track_id)),
+            (3, Value::Unsigned(self.current_generation.get())),
+            (4, Value::Unsigned(self.next_generation.get())),
+            (5, Value::Unsigned(self.reason)),
+        ]
+    }
+
+    /// Decodes an `ADVANCE_CHANNEL` payload; generation and reason checks need track state.
     ///
-    /// Pinned against a literal rather than against another call to the same function: this is the
-    /// regression the three hand-written copies could not have, because each was its own authority
-    /// on what the map should contain.
-    #[test]
-    fn a_flow_grant_carries_the_owner_tuple_then_the_two_maxima() {
-        let address = TrackAddress {
-            context_id: 1,
-            surface_id: 2,
-            track_id: 3,
-            channel_generation: ChannelGeneration::new(4),
-        };
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `ADVANCE_CHANNEL` map or a field is
+    /// missing or not an unsigned integer.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("ADVANCE_CHANNEL", value, &[0, 1, 2, 3, 4, 5])?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            surface_id: map.required_u64(1)?,
+            track_id: map.required_u64(2)?,
+            current_generation: ChannelGeneration::new(map.required_u64(3)?),
+            next_generation: ChannelGeneration::new(map.required_u64(4)?),
+            reason: map.required_u64(5)?,
+        })
+    }
+}
 
-        assert_eq!(
-            max_channel_data_payload(address, 65_536, 128),
-            vec![
-                (0, Value::Unsigned(1)),
-                (1, Value::Unsigned(2)),
-                (2, Value::Unsigned(3)),
-                (3, Value::Unsigned(4)),
-                (4, Value::Unsigned(65_536)),
-                (5, Value::Unsigned(128)),
-            ]
-        );
+/// The `SET_AUDIO_GAIN` payload: an audio track's linear output gain (media §15.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetAudioGain {
+    /// The owning context.
+    pub context_id: u64,
+    /// The track's surface.
+    pub surface_id: u64,
+    /// The audio track.
+    pub track_id: u64,
+    /// The new gain, zero through 2.0.
+    pub gain: AudioGain,
+}
+
+impl SetAudioGain {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (2, Value::Unsigned(self.track_id)),
+            (3, Value::Unsigned(self.gain.raw())),
+        ]
     }
 
-    #[test]
-    fn a_keyframe_request_carries_its_minimum_epoch_and_reason() {
-        let address = TrackAddress {
-            context_id: 7,
-            surface_id: 8,
-            track_id: 9,
-            channel_generation: ChannelGeneration::new(2),
-        };
+    /// Decodes a `SET_AUDIO_GAIN` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `SET_AUDIO_GAIN` map, a field is
+    /// missing or not an unsigned integer, or the gain exceeds 2.0.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("SET_AUDIO_GAIN", value, &[0, 1, 2, 3])?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            surface_id: map.required_u64(1)?,
+            track_id: map.required_u64(2)?,
+            gain: AudioGain::new(map.required_u64(3)?)
+                .ok_or_else(|| invalid_value("SET_AUDIO_GAIN", 3, "exceeds 2.0"))?,
+        })
+    }
+}
 
-        assert_eq!(
-            need_keyframe_payload(address, 5, 2),
-            vec![
-                (0, Value::Unsigned(7)),
-                (1, Value::Unsigned(8)),
-                (2, Value::Unsigned(9)),
-                (3, Value::Unsigned(2)),
-                (4, Value::Unsigned(5)),
-                (5, Value::Unsigned(2)),
-            ]
-        );
+/// One slot of an `ACTIVATE_TRACK` request (media §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotBinding {
+    /// The visual or audio slot to update.
+    pub slot: u64,
+    /// The track to activate in the slot, or zero to clear it.
+    pub track_id: u64,
+    /// The channel generation the track must be on.
+    pub channel_generation: ChannelGeneration,
+    /// The `MILESTONE_*` bit the track's current generation must have reached.
+    pub required_milestone: u64,
+}
+
+impl SlotBinding {
+    fn value(&self) -> Value {
+        Value::Map(vec![
+            (0, Value::Unsigned(self.slot)),
+            (1, Value::Unsigned(self.track_id)),
+            (2, Value::Unsigned(self.channel_generation.get())),
+            (3, Value::Unsigned(self.required_milestone)),
+        ])
     }
 
-    #[test]
-    fn a_full_frame_request_takes_its_reason_rather_than_assuming_one() {
-        // One presenter parameterised this reason and another hardcoded 1. Same value, but the
-        // shared encoder has to accept it or the two cannot both use this.
-        let address = TrackAddress {
-            context_id: 1,
-            surface_id: 1,
-            track_id: 1,
-            channel_generation: ChannelGeneration::new(1),
-        };
+    fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("slot binding", value, &[0, 1, 2, 3])?;
+        Ok(Self {
+            slot: map.required_u64(0)?,
+            track_id: map.required_u64(1)?,
+            channel_generation: ChannelGeneration::new(map.required_u64(2)?),
+            required_milestone: map.required_u64(3)?,
+        })
+    }
+}
 
-        assert_eq!(
-            need_full_frame_payload(address, 1).last(),
-            Some(&(4, Value::Unsigned(1)))
-        );
-        assert_eq!(
-            need_full_frame_payload(address, 3).last(),
-            Some(&(4, Value::Unsigned(3)))
-        );
+/// The `ACTIVATE_TRACK` payload: atomically rebind one or more of a surface's slots (media §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivateTrack {
+    /// The owning context.
+    pub context_id: u64,
+    /// The surface whose slots change.
+    pub surface_id: u64,
+    /// The slots to update, all applied or none.
+    pub bindings: Vec<SlotBinding>,
+    /// The surface revision the activation expects.
+    pub expected_surface_revision: SurfaceRevision,
+}
+
+impl ActivateTrack {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (
+                2,
+                Value::Array(self.bindings.iter().map(SlotBinding::value).collect()),
+            ),
+            (3, Value::Unsigned(self.expected_surface_revision.get())),
+        ]
     }
 
-    #[test]
-    fn every_channel_notification_opens_with_the_same_owner_tuple() {
-        // The property that makes a wrong-track notification impossible to misread: all three
-        // answer "which track" in keys 0 through 3, in one order.
-        let address = TrackAddress {
-            context_id: 11,
-            surface_id: 12,
-            track_id: 13,
-            channel_generation: ChannelGeneration::new(14),
-        };
-        let expected = [
-            (0, Value::Unsigned(11)),
-            (1, Value::Unsigned(12)),
-            (2, Value::Unsigned(13)),
-            (3, Value::Unsigned(14)),
+    /// Decodes an `ACTIVATE_TRACK` payload; slot and track checks need surface state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `ACTIVATE_TRACK` map, a field is
+    /// missing or mistyped, or a binding is not a strict four-key map.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("ACTIVATE_TRACK", value, &[0, 1, 2, 3])?;
+        let bindings = map
+            .required(2)?
+            .as_array()
+            .ok_or_else(|| invalid_value("ACTIVATE_TRACK", 2, "is not an array"))?
+            .iter()
+            .map(SlotBinding::decode)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            surface_id: map.required_u64(1)?,
+            bindings,
+            expected_surface_revision: SurfaceRevision::new(map.required_u64(3)?),
+        })
+    }
+}
+
+/// The `WAIT_TRACK` payload: a bounded, correlated wait for one track condition (media §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitTrack {
+    /// The owning context.
+    pub context_id: u64,
+    /// The track's surface.
+    pub surface_id: u64,
+    /// The track to watch.
+    pub track_id: u64,
+    /// The wait condition, 1 through 9.
+    ///
+    /// 1 track revision above the value, 2 milestone set, 3 raster frame presented, 4 video PTS
+    /// presented, 5 playback started, 6 playback ended, 7 channel accepted, 8 channel closed, 9
+    /// track lost.
+    pub condition: u64,
+    /// The threshold conditions 1 through 4 compare against; absent for 5 through 9.
+    pub condition_value: Option<u64>,
+    /// How long to wait, nonzero and at most [`crate::MAX_TRACK_WAIT_TIMEOUT_US`].
+    pub timeout_us: u64,
+    /// The channel generation the condition applies to; nonzero.
+    pub channel_generation: ChannelGeneration,
+}
+
+impl WaitTrack {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        let mut payload = vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (2, Value::Unsigned(self.track_id)),
+            (3, Value::Unsigned(self.condition)),
         ];
-
-        for payload in [
-            max_channel_data_payload(address, 1, 1),
-            need_keyframe_payload(address, 0, 0),
-            need_full_frame_payload(address, 1),
-        ] {
-            assert_eq!(&payload[..4], &expected[..], "payload: {payload:?}");
+        if let Some(value) = self.condition_value {
+            payload.push((4, Value::Unsigned(value)));
         }
-    }
-    use super::*;
-
-    #[test]
-    fn audio_gain_covers_the_kitim_volume_range() {
-        assert_eq!(AudioGain::from_percent(0), Some(AudioGain::SILENT));
-        assert_eq!(AudioGain::from_percent(100), Some(AudioGain::UNITY));
-        assert_eq!(AudioGain::from_percent(200), Some(AudioGain::MAX));
-        assert_eq!(AudioGain::from_percent(201), None);
-        assert_eq!(AudioGain::new(AudioGain::MAX.raw() + 1), None);
+        payload.push((5, Value::Unsigned(self.timeout_us)));
+        payload.push((6, Value::Unsigned(self.channel_generation.get())));
+        payload
     }
 
-    #[test]
-    fn channel_generation_resets_generation_local_state() {
-        let mut state = TrackState::new();
-        state
-            .accept_channel(ChannelGeneration::ONE, 100, 4, 100)
-            .unwrap();
-        state
-            .admit_media(ChannelGeneration::ONE, 20, 1, 1, true)
-            .unwrap();
-        state
-            .advance_channel(ChannelGeneration::ONE, ChannelGeneration::new(2))
-            .unwrap();
-        assert_eq!(state.milestones, 0);
-        assert_eq!(state.flow.sent_body_bytes, 0);
-        assert_eq!(state.last_media_id, 1);
-    }
-
-    #[test]
-    fn lower_flow_update_is_harmless() {
-        let mut state = TrackState::new();
-        state
-            .accept_channel(ChannelGeneration::ONE, 100, 4, 100)
-            .unwrap();
-        state.flow.raise_maxima(50, 2);
-        assert_eq!(state.flow.maximum_body_bytes, 100);
-        assert_eq!(state.flow.maximum_media_records, 4);
-    }
-
-    #[test]
-    fn uncertain_channel_open_replays_only_before_media() {
-        let mut open = ChannelOpenState::default();
-        let acceptance = vec![(0, Value::Unsigned(1))];
-        assert!(matches!(
-            open.open(
-                ChannelGeneration::ONE,
-                ChannelGeneration::ONE,
-                [1; 16],
-                b"open",
-                acceptance.clone()
-            ),
-            ChannelOpenDecision::Fresh(_)
-        ));
-        assert_eq!(
-            open.open(
-                ChannelGeneration::ONE,
-                ChannelGeneration::ONE,
-                [1; 16],
-                b"open",
-                acceptance.clone()
-            ),
-            ChannelOpenDecision::Busy
-        );
-        open.transport_lost(ChannelGeneration::ONE);
-        assert_eq!(
-            open.open(
-                ChannelGeneration::ONE,
-                ChannelGeneration::ONE,
-                [1; 16],
-                b"open",
-                acceptance
-            ),
-            ChannelOpenDecision::ExactReplay(vec![(0, Value::Unsigned(1))])
-        );
-        open.admit_media(ChannelGeneration::ONE).unwrap();
-        open.transport_lost(ChannelGeneration::ONE);
-        assert_eq!(
-            open.open(
-                ChannelGeneration::ONE,
-                ChannelGeneration::ONE,
-                [1; 16],
-                b"open",
-                vec![]
-            ),
-            ChannelOpenDecision::StaleGeneration
-        );
-    }
-
-    #[test]
-    fn strict_raster_track_configuration_round_trips() {
-        let configuration = TrackConfiguration {
-            direction: TrackDirection::default(),
-            context_id: 1,
-            surface_id: 2,
-            track_id: 3,
-            slot: 0,
-            mode: TrackMode::Live,
-            lane: LaneClass::Bulk,
-            maximum_record_body: 72 + 64 * 64 * 4,
-            maximum_rate_millihertz: 60_000,
-            maximum_encoded_bits_per_second: 100_000_000,
-            maximum_records_per_second: 60,
-            maximum_inflight_body_bytes: 1_000_000,
-            kind: KindConfiguration::Raster(RasterConfiguration {
-                width: 64,
-                height: 64,
-                alpha_mode: 1,
-                delta_enabled: true,
-                maximum_delta_operations: 16,
-                zstd_enabled: true,
-            }),
-            target_latency_us: 50_000,
-            maximum_latency_us: 250_000,
-            retained_pixel_charge: 64 * 64,
+    /// Decodes a `WAIT_TRACK` payload, checking the condition, value, timeout, and generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `WAIT_TRACK` map, a field is missing
+    /// or mistyped, the condition is unknown or its value is missing or superfluous, the timeout is
+    /// zero or above [`crate::MAX_TRACK_WAIT_TIMEOUT_US`], or the generation is zero.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("WAIT_TRACK", value, &[0, 1, 2, 3, 4, 5, 6])?;
+        let wait = Self {
+            context_id: map.required_u64(0)?,
+            surface_id: map.required_u64(1)?,
+            track_id: map.required_u64(2)?,
+            condition: map.required_u64(3)?,
+            condition_value: map.optional_u64(4)?,
+            timeout_us: map.required_u64(5)?,
+            channel_generation: ChannelGeneration::new(map.required_u64(6)?),
         };
-        let payload = Value::Map(configuration.payload(false).unwrap());
-        assert_eq!(
-            TrackConfiguration::decode(3, &payload, false).unwrap(),
-            configuration
-        );
+        let value_is_valid = match wait.condition {
+            1..=4 => wait.condition_value.is_some(),
+            5..=9 => wait.condition_value.is_none(),
+            _ => false,
+        };
+        if !value_is_valid {
+            return Err(invalid_value(
+                "WAIT_TRACK",
+                3,
+                "is unknown or disagrees with its value",
+            ));
+        }
+        if wait.timeout_us == 0 || wait.timeout_us > crate::MAX_TRACK_WAIT_TIMEOUT_US {
+            return Err(invalid_value(
+                "WAIT_TRACK",
+                5,
+                "is zero or above 30 seconds",
+            ));
+        }
+        if wait.channel_generation.get() == 0 {
+            return Err(invalid_value("WAIT_TRACK", 6, "must be nonzero"));
+        }
+        Ok(wait)
+    }
+}
+
+/// The `FLUSH` payload: discard queued media and start a new epoch (media §15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flush {
+    /// The owning context.
+    pub context_id: u64,
+    /// The track's surface.
+    pub surface_id: u64,
+    /// The track to flush.
+    pub track_id: u64,
+    /// The new media epoch, which must exceed the current one.
+    pub epoch: u32,
+}
+
+impl Flush {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (2, Value::Unsigned(self.track_id)),
+            (3, Value::Unsigned(u64::from(self.epoch))),
+        ]
     }
 
-    #[test]
-    fn canonical_audio_track_configuration_round_trips() {
-        let mut opus_head = b"OpusHead".to_vec();
-        opus_head.extend_from_slice(&[1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]);
-        let maximum_record_body = media::audio_body_len(4_096).unwrap();
-        let configuration = TrackConfiguration {
-            direction: TrackDirection::default(),
-            context_id: 1,
-            surface_id: 2,
-            track_id: 3,
-            slot: 2,
-            mode: TrackMode::Timed,
-            lane: LaneClass::Realtime,
-            maximum_record_body,
-            maximum_rate_millihertz: 50_000,
-            maximum_encoded_bits_per_second: 512_000,
-            maximum_records_per_second: 50,
-            maximum_inflight_body_bytes: u64::from(maximum_record_body) * 4,
-            kind: KindConfiguration::Audio(AudioConfiguration {
-                codec: "opus".into(),
-                packetization: media::AUDIO_PACKETIZATION_OPUS.into(),
-                extradata: opus_head,
-                sample_rate: 48_000,
-                channels: 2,
-                channel_mask: 3,
-                maximum_access_unit_bytes: 4_096,
-                codec_string: Some("opus".into()),
-            }),
-            target_latency_us: 0,
-            maximum_latency_us: 2_000_000,
-            retained_pixel_charge: 0,
-        };
-        let payload = Value::Map(configuration.payload(false).unwrap());
-        assert_eq!(
-            TrackConfiguration::decode(3, &payload, false).unwrap(),
-            configuration
-        );
+    /// Decodes a `FLUSH` payload; whether the epoch advances needs track state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `FLUSH` map, a field is missing or
+    /// not an unsigned integer, or the epoch does not fit in `u32`.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("FLUSH", value, &[0, 1, 2, 3])?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            surface_id: map.required_u64(1)?,
+            track_id: map.required_u64(2)?,
+            epoch: map.required_u32(3)?,
+        })
+    }
+}
+
+/// The `CHANNEL_EOS` payload: the ordered end of a track generation's media (media §14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelEos {
+    /// The owning context.
+    pub context_id: u64,
+    /// The track's surface.
+    pub surface_id: u64,
+    /// The track whose ingress closes.
+    pub track_id: u64,
+    /// The channel generation that ends.
+    pub channel_generation: ChannelGeneration,
+    /// The media epoch of the last media record.
+    pub epoch: u32,
+    /// The track-connection sequence of the last media record, or zero when none was sent.
+    pub last_media_sequence: u64,
+}
+
+impl ChannelEos {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (2, Value::Unsigned(self.track_id)),
+            (3, Value::Unsigned(self.channel_generation.get())),
+            (4, Value::Unsigned(u64::from(self.epoch))),
+            (5, Value::Unsigned(self.last_media_sequence)),
+        ]
+    }
+
+    /// Decodes a `CHANNEL_EOS` payload; identity and sequence checks need channel state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `CHANNEL_EOS` map, a field is missing
+    /// or not an unsigned integer, or the epoch does not fit in `u32`.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("CHANNEL_EOS", value, &[0, 1, 2, 3, 4, 5])?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            surface_id: map.required_u64(1)?,
+            track_id: map.required_u64(2)?,
+            channel_generation: ChannelGeneration::new(map.required_u64(3)?),
+            epoch: map.required_u32(4)?,
+            last_media_sequence: map.required_u64(5)?,
+        })
     }
 }
 
@@ -1396,9 +1645,13 @@ mod tests {
 /// answer "which track" before they answer anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackAddress {
+    /// Owning context.
     pub context_id: u64,
+    /// Owning surface.
     pub surface_id: u64,
+    /// The track.
     pub track_id: u64,
+    /// The channel generation the notification is about.
     pub channel_generation: ChannelGeneration,
 }
 

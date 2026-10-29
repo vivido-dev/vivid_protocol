@@ -55,7 +55,9 @@ wire implementation:
 cargo add vivid_protocol
 ```
 
-For a WebAssembly target:
+For a WebAssembly target, turn off the default features, which add the native socket transport a
+browser cannot use. wasm32 builds always decode zstd rasters in pure Rust and never build the C
+zstd library:
 
 ```sh
 cargo add vivid_protocol --no-default-features

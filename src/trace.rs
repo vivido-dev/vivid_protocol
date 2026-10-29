@@ -3,6 +3,12 @@
 //! Trace records deliberately cannot carry a control or media body. Callers submit only validated
 //! transport metadata to a bounded queue; formatting and file or callback delivery happen on a
 //! separate worker so diagnostics cannot delay the data plane.
+//!
+//! A [`TraceGuard`] owns that worker. Build one with [`TraceGuard::file`], which writes private
+//! NDJSON, or [`TraceGuard::callback`], which hands each [`TraceRecord`] to your code and makes
+//! tracing testable without touching the filesystem. Each guard names its component and hop with a
+//! [`TraceSource`] and timestamps records with a [`TraceClock`], so tests can supply their own
+//! time. [`TraceEmitter`] handles, cloned from the guard, submit [`TraceEvent`]s and never block.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -14,50 +20,105 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::messages;
+use crate::{messages, time::Monotonic};
 
+/// Records the trace worker may have queued before new ones are counted as dropped.
+///
+/// Emitting never blocks the data plane, so a slow file or callback sheds records instead. 256
+/// absorbs a burst of control traffic; a sustained overload shows up as a `dropped` record.
 const TRACE_QUEUE_CAPACITY: usize = 256;
+/// Schema version written into every NDJSON line; change it when a field changes meaning.
 const TRACE_VERSION: u64 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TraceComponent {
-    Protocol,
-    Sdk,
-    Vivido,
-    Vvmux,
-    Vvbridge,
-    Vivi,
-    Vvrd,
-    Veston,
-    Vvsway,
-}
+/// The component that emits trace records, such as `"vivido"` or `"vvmux"`.
+///
+/// Names are 1 to 32 bytes of lowercase ASCII letters, digits, `_`, and `-`, so no name can break
+/// the NDJSON encoding. Products name themselves; this crate does not keep a list of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TraceComponent(&'static str);
 
 impl TraceComponent {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Protocol => "vivid_protocol",
-            Self::Sdk => "vivid_sdk",
-            Self::Vivido => "vivido",
-            Self::Vvmux => "vvmux",
-            Self::Vvbridge => "vvbridge",
-            Self::Vivi => "vivi",
-            Self::Vvrd => "vvrd",
-            Self::Veston => "veston",
-            Self::Vvsway => "vvsway",
+    /// This crate itself, which [`Connection::trace`](crate::wire::Connection::trace) uses.
+    pub const PROTOCOL: Self = Self("vivid_protocol");
+
+    /// Names a component, panicking when `name` is not a valid component name.
+    ///
+    /// In a `const` item the check happens at compile time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`try_new`](Self::try_new) would return an error.
+    pub const fn new(name: &'static str) -> Self {
+        match Self::try_new(name) {
+            Ok(component) => component,
+            Err(_) => panic!("trace component names are 1 to 32 bytes of [a-z0-9_-]"),
         }
+    }
+
+    /// Names a component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidTraceName`] when `name` is empty, longer than 32 bytes, or contains a byte
+    /// other than a lowercase ASCII letter, a digit, `_`, or `-`.
+    pub const fn try_new(name: &'static str) -> Result<Self, InvalidTraceName> {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.len() > 32 {
+            return Err(InvalidTraceName(()));
+        }
+        let mut index = 0;
+        while index < bytes.len() {
+            if !matches!(bytes[index], b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-') {
+                return Err(InvalidTraceName(()));
+            }
+            index += 1;
+        }
+        Ok(Self(name))
+    }
+
+    /// The component name as it appears in trace records.
+    pub const fn name(self) -> &'static str {
+        self.0
     }
 }
 
+impl fmt::Display for TraceComponent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+/// A trace component name outside `[a-z0-9_-]{1,32}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidTraceName(());
+
+impl fmt::Display for InvalidTraceName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "trace component names are 1 to 32 bytes of lowercase ASCII letters, digits, '_' or '-'",
+        )
+    }
+}
+
+impl std::error::Error for InvalidTraceName {}
+
+/// Where on the path between producer and presenter a trace record was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TraceHop {
+    /// At a producer.
     Producer,
+    /// At a terminating presenter.
     Presenter,
+    /// On a gateway's inner session.
     Inner,
+    /// On a gateway's outer session.
     Outer,
+    /// At a byte-transparent relay.
     Relay,
+    /// In a browser binding.
     Browser,
+    /// Inside one process, with no network hop.
     Local,
 }
 
@@ -75,12 +136,17 @@ impl TraceHop {
     }
 }
 
+/// Which way a traced record moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TraceDirection {
+    /// The component sent it.
     Send,
+    /// The component received it.
     Receive,
+    /// A gateway mapped it from one session to another.
     Map,
+    /// A local event with no record on the wire.
     Local,
 }
 
@@ -95,18 +161,29 @@ impl TraceDirection {
     }
 }
 
+/// The kind of object a traced record names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TraceObjectKind {
+    /// The session itself; object ID zero.
     Session,
+    /// A surface.
     Surface,
+    /// A track.
     Track,
+    /// A scene node.
     Node,
+    /// A scene transaction.
     Transaction,
+    /// A context.
     Context,
+    /// A session lease.
     Lease,
+    /// A terminal anchor.
     Anchor,
+    /// A connection.
     Connection,
+    /// The trace stream itself, such as a drop report.
     Trace,
 }
 
@@ -127,13 +204,19 @@ impl TraceObjectKind {
     }
 }
 
+/// How handling of a traced record ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TraceOutcome {
+    /// It succeeded.
     Ok,
+    /// It failed.
     Error,
+    /// The trace queue overflowed and records were lost.
     Dropped,
+    /// Policy withheld the object's identity from the trace.
     Restricted,
+    /// A state transition rather than a record result.
     State,
 }
 
@@ -155,18 +238,31 @@ impl TraceOutcome {
 /// values rendered as hexadecimal. There is intentionally no free-form diagnostic or body field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceRecord {
+    /// Microseconds on the guard's [`TraceClock`].
     pub monotonic_ts_us: u64,
+    /// The component that emitted the record.
     pub component: TraceComponent,
+    /// Where on the path it was taken.
     pub hop: TraceHop,
+    /// Which way the record moved.
     pub direction: TraceDirection,
+    /// The traced record's type.
     pub record_type: u16,
+    /// The traced record's body length; the body itself is never traced.
     pub body_length: u64,
+    /// The traced record's connection sequence.
     pub connection_sequence: u64,
+    /// The kind of object the record names.
     pub object_kind: TraceObjectKind,
+    /// The object's local ID, unless policy withheld it.
     pub object_id: Option<u64>,
+    /// The envelope's request ID, when nonzero.
     pub request_id: Option<u64>,
+    /// The envelope's causation ID, when present.
     pub causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+    /// Hop-local session hint; never a session tag or key.
     pub local_session_hint: [u8; 16],
+    /// How handling ended.
     pub outcome: TraceOutcome,
 }
 
@@ -206,12 +302,97 @@ impl TraceRecord {
     }
 }
 
-#[derive(Debug)]
+/// Who emits a guard's records: the component, its hop, and a per-session correlation hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceSource {
+    /// The emitting component.
+    pub component: TraceComponent,
+    /// Where the component sits on the path between producer and presenter.
+    pub hop: TraceHop,
+    /// A random value that correlates one session's records without naming the session.
+    pub local_session_hint: [u8; 16],
+}
+
+/// The clock that timestamps a guard's records.
+///
+/// Every timestamp is a [`Monotonic`] value from one origin, as everywhere else in this crate.
+/// [`TraceClock::process`] reads the process's monotonic clock; [`TraceClock::new`] takes any
+/// source, such as a test's fake clock. NDJSON files label every timestamp with the
+/// `process_monotonic` clock domain, so a custom clock should count from a process-local origin.
+#[derive(Clone)]
+pub struct TraceClock(Arc<dyn Fn() -> Monotonic + Send + Sync>);
+
+impl TraceClock {
+    /// Timestamps records with `now`, which must not go backwards.
+    pub fn new(now: impl Fn() -> Monotonic + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    /// Timestamps records with microseconds of the process monotonic clock since this call.
+    pub fn process() -> Self {
+        let origin = Instant::now();
+        Self::new(move || {
+            Monotonic::from_micros(u64::try_from(origin.elapsed().as_micros()).unwrap_or(u64::MAX))
+        })
+    }
+
+    fn now(&self) -> Monotonic {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for TraceClock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("TraceClock").finish_non_exhaustive()
+    }
+}
+
+/// The metadata of one record a component sent, received, mapped, or noted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceEvent {
+    /// Whether the record was sent, received, mapped across a hop, or is local state.
+    pub direction: TraceDirection,
+    /// The record type from the record header.
+    pub record_type: u16,
+    /// The record body length in bytes; the body itself is never traced.
+    pub body_length: u64,
+    /// The record's sequence number on its connection.
+    pub connection_sequence: u64,
+    /// What kind of object the record addresses.
+    pub object_kind: TraceObjectKind,
+    /// The addressed object, when tracing it is permitted.
+    pub object_id: Option<u64>,
+    /// The control request ID, for correlated control records.
+    pub request_id: Option<u64>,
+    /// The causation ID a control envelope carries, if any.
+    pub causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+    /// How handling the record turned out.
+    pub outcome: TraceOutcome,
+}
+
 struct TraceContext {
-    start: Instant,
-    component: TraceComponent,
-    hop: TraceHop,
-    local_session_hint: [u8; 16],
+    clock: TraceClock,
+    source: TraceSource,
+}
+
+impl TraceContext {
+    fn record(&self, event: TraceEvent) -> TraceRecord {
+        TraceRecord {
+            monotonic_ts_us: self.clock.now().as_micros(),
+            component: self.source.component,
+            hop: self.source.hop,
+            direction: event.direction,
+            record_type: event.record_type,
+            body_length: event.body_length,
+            connection_sequence: event.connection_sequence,
+            object_kind: event.object_kind,
+            object_id: event.object_id,
+            request_id: event.request_id,
+            causation_id: event.causation_id,
+            local_session_hint: self.source.local_session_hint,
+            outcome: event.outcome,
+        }
+    }
 }
 
 enum TraceMessage {
@@ -231,46 +412,17 @@ impl fmt::Debug for TraceEmitter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TraceEmitter")
-            .field("component", &self.context.component)
-            .field("hop", &self.context.hop)
+            .field("component", &self.context.source.component)
+            .field("hop", &self.context.source.hop)
             .field("dropped", &self.dropped.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
 impl TraceEmitter {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one argument per trace record column; see docs/RUST-GUIDELINES-REVIEW.md"
-    )]
-    pub fn emit(
-        &self,
-        direction: TraceDirection,
-        record_type: u16,
-        body_length: u64,
-        connection_sequence: u64,
-        object_kind: TraceObjectKind,
-        object_id: Option<u64>,
-        request_id: Option<u64>,
-        causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
-        outcome: TraceOutcome,
-    ) {
-        let record = TraceRecord {
-            monotonic_ts_us: u64::try_from(self.context.start.elapsed().as_micros())
-                .unwrap_or(u64::MAX),
-            component: self.context.component,
-            hop: self.context.hop,
-            direction,
-            record_type,
-            body_length,
-            connection_sequence,
-            object_kind,
-            object_id,
-            request_id,
-            causation_id,
-            local_session_hint: self.context.local_session_hint,
-            outcome,
-        };
+    /// Queues `event`, or counts it as dropped when the worker is behind; never blocks.
+    pub fn emit(&self, event: TraceEvent) {
+        let record = self.context.record(event);
         match self.sender.try_send(TraceMessage::Record(record)) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(_)) => {
@@ -283,33 +435,19 @@ impl TraceEmitter {
         }
     }
 
-    /// Emit metadata for a control body after extracting only its public request and causation IDs.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one argument per trace record column; see docs/RUST-GUIDELINES-REVIEW.md"
-    )]
-    pub fn emit_control(
-        &self,
-        direction: TraceDirection,
-        record_type: u16,
-        body: &[u8],
-        connection_sequence: u64,
-        object_kind: TraceObjectKind,
-        object_id: Option<u64>,
-        outcome: TraceOutcome,
-    ) {
+    /// Emits `event` for the control record `body`.
+    ///
+    /// The length, request ID, and causation ID come from the body itself.
+    ///
+    /// Only those public envelope fields are read; nothing else in `body` reaches the trace.
+    pub fn emit_control(&self, event: TraceEvent, body: &[u8]) {
         let (request_id, causation_id) = control_correlation(body);
-        self.emit(
-            direction,
-            record_type,
-            u64::try_from(body.len()).unwrap_or(u64::MAX),
-            connection_sequence,
-            object_kind,
-            object_id,
+        self.emit(TraceEvent {
+            body_length: u64::try_from(body.len()).unwrap_or(u64::MAX),
             request_id,
             causation_id,
-            outcome,
-        );
+            ..event
+        });
     }
 
     /// Emit a policy-restricted track state without its hop-local track ID.
@@ -320,17 +458,17 @@ impl TraceEmitter {
         body_length: u64,
         connection_sequence: u64,
     ) {
-        self.emit(
+        self.emit(TraceEvent {
             direction,
             record_type,
             body_length,
             connection_sequence,
-            TraceObjectKind::Track,
-            None,
-            None,
-            None,
-            TraceOutcome::Restricted,
-        );
+            object_kind: TraceObjectKind::Track,
+            object_id: None,
+            request_id: None,
+            causation_id: None,
+            outcome: TraceOutcome::Restricted,
+        });
     }
 }
 
@@ -352,26 +490,26 @@ impl fmt::Debug for TraceGuard {
 }
 
 impl TraceGuard {
-    /// Starts a trace worker that hands each record to `callback` on a background thread.
+    /// Starts a trace worker that hands records to `callback`.
+    ///
+    /// The worker runs on a background thread, names records with `source`, and timestamps them
+    /// with `clock`.
+    ///
+    /// When the queue overflows, the worker reports the loss as a [`TraceOutcome::Dropped`]
+    /// record before the next one.
     ///
     /// # Errors
     ///
     /// Returns any error from spawning the worker thread.
     pub fn callback(
-        component: TraceComponent,
-        hop: TraceHop,
-        local_session_hint: [u8; 16],
+        source: TraceSource,
+        clock: TraceClock,
         mut callback: impl FnMut(TraceRecord) + Send + 'static,
     ) -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(TRACE_QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let callback_shutdown = Arc::new(AtomicBool::new(false));
-        let context = Arc::new(TraceContext {
-            start: Instant::now(),
-            component,
-            hop,
-            local_session_hint,
-        });
+        let context = Arc::new(TraceContext { clock, source });
         let worker_context = Arc::clone(&context);
         let worker_dropped = Arc::clone(&dropped);
         let worker_callback_shutdown = Arc::clone(&callback_shutdown);
@@ -384,13 +522,7 @@ impl TraceGuard {
                     };
                     let lost = worker_dropped.swap(0, Ordering::Relaxed);
                     if lost != 0 {
-                        callback(TraceRecord {
-                            monotonic_ts_us: u64::try_from(
-                                worker_context.start.elapsed().as_micros(),
-                            )
-                            .unwrap_or(u64::MAX),
-                            component: worker_context.component,
-                            hop: worker_context.hop,
+                        callback(worker_context.record(TraceEvent {
                             direction: TraceDirection::Local,
                             record_type: 0,
                             body_length: 0,
@@ -399,9 +531,8 @@ impl TraceGuard {
                             object_id: None,
                             request_id: None,
                             causation_id: None,
-                            local_session_hint: worker_context.local_session_hint,
                             outcome: TraceOutcome::Dropped,
-                        });
+                        }));
                     }
                     callback(record);
                     if worker_callback_shutdown.load(Ordering::Acquire) {
@@ -420,18 +551,19 @@ impl TraceGuard {
         })
     }
 
-    /// Starts a trace worker that appends records to a new, private NDJSON file at `path`.
+    /// Starts a trace worker that appends records to a private NDJSON file.
+    ///
+    /// The worker creates a new file at `path`, names records with `source`, and timestamps them
+    /// with `clock`.
+    ///
+    /// The file is created with `create_new`, so an existing file or symlink is never followed or
+    /// truncated; on Unix it gets mode `0600`. Write errors drop the affected lines.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::AlreadyExists`] when `path` exists, and any error creating its
     /// parent directory, the file, or the worker thread.
-    pub fn file(
-        path: &Path,
-        component: TraceComponent,
-        hop: TraceHop,
-        local_session_hint: [u8; 16],
-    ) -> io::Result<Self> {
+    pub fn file(path: &Path, source: TraceSource, clock: TraceClock) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -444,11 +576,12 @@ impl TraceGuard {
             options.mode(0o600)
         };
         let mut writer = BufWriter::new(options.open(path)?);
-        Self::callback(component, hop, local_session_hint, move |record| {
+        Self::callback(source, clock, move |record| {
             let _ = writer.write_all(record.ndjson_line().as_bytes());
         })
     }
 
+    /// A new submission handle for this guard's worker.
     pub fn emitter(&self) -> TraceEmitter {
         self.emitter.clone()
     }
@@ -472,6 +605,9 @@ impl Drop for TraceGuard {
     }
 }
 
+/// Returns the request and causation IDs of a control `body`.
+///
+/// Both are `None` when the body does not decode.
 pub fn control_correlation(
     body: &[u8],
 ) -> (Option<u64>, Option<[u8; messages::CAUSATION_ID_BYTES]>) {
@@ -484,6 +620,7 @@ pub fn control_correlation(
     })
 }
 
+/// Returns the kind of object a record of `record_type` names with `object_id`.
 pub fn object_kind(record_type: u16, object_id: u64) -> TraceObjectKind {
     if object_id == 0 {
         return TraceObjectKind::Session;
@@ -536,142 +673,4 @@ fn hex(bytes: &[u8]) -> String {
         encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     encoded
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-    use std::time::Duration;
-
-    use super::*;
-
-    #[test]
-    fn trace_line_has_the_common_vocabulary_and_no_free_form_body() {
-        let body = messages::Hello {
-            producer_name: "private title".into(),
-            producer_version: "1".into(),
-            required_profiles: vec![
-                crate::registry::TERMINAL_SURFACE.into(),
-                crate::registry::CORE_CONTROL.into(),
-            ],
-            optional_profiles: vec![],
-            maximum_control_body: crate::CONTROL_MAX_RECORD_BODY,
-            client_nonce: [1; 32],
-            authentication: messages::HelloAuthentication::Root { proof: [2; 32] },
-            target_profile: crate::registry::TERMINAL_SURFACE.into(),
-            extensions: vec![],
-        }
-        .encode(7)
-        .unwrap();
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let output = Arc::clone(&records);
-        let guard = TraceGuard::callback(
-            TraceComponent::Protocol,
-            TraceHop::Local,
-            [0x5a; 16],
-            move |record| output.lock().unwrap().push(record),
-        )
-        .unwrap();
-        guard.emitter().emit_control(
-            TraceDirection::Send,
-            messages::HELLO,
-            &body,
-            1,
-            TraceObjectKind::Session,
-            None,
-            TraceOutcome::Ok,
-        );
-        drop(guard);
-        let line = records.lock().unwrap()[0].ndjson_line();
-        for required in [
-            "\"version\":1",
-            "\"monotonic_ts_us\"",
-            "\"clock_domain\":\"process_monotonic\"",
-            "\"component\":\"vivid_protocol\"",
-            "\"direction\":\"send\"",
-            "\"request_id\":7",
-            "\"local_session_hint\"",
-        ] {
-            assert!(line.contains(required), "{required}");
-        }
-        for forbidden in [
-            "secret-token",
-            "private title",
-            "endpoint",
-            "cookie",
-            "descriptor",
-            "command",
-        ] {
-            assert!(!line.contains(forbidden), "{forbidden}");
-        }
-    }
-
-    #[test]
-    fn full_queue_is_nonblocking_and_reports_loss() {
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let output = Arc::clone(&records);
-        let guard = TraceGuard::callback(
-            TraceComponent::Protocol,
-            TraceHop::Local,
-            [1; 16],
-            move |record| {
-                std::thread::sleep(Duration::from_millis(1));
-                output.lock().unwrap().push(record);
-            },
-        )
-        .unwrap();
-        let emitter = guard.emitter();
-        for sequence in 0..1024 {
-            emitter.emit(
-                TraceDirection::Local,
-                1,
-                0,
-                sequence,
-                TraceObjectKind::Session,
-                None,
-                None,
-                None,
-                TraceOutcome::State,
-            );
-        }
-        drop(guard);
-        assert!(
-            records
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|record| record.outcome == TraceOutcome::Dropped)
-        );
-    }
-
-    #[test]
-    fn callback_can_disable_its_own_trace_without_deadlocking() {
-        let guard_slot = Arc::new(Mutex::new(None::<TraceGuard>));
-        let callback_slot = Arc::clone(&guard_slot);
-        let (done, completed) = std::sync::mpsc::sync_channel(1);
-        let guard = TraceGuard::callback(
-            TraceComponent::Protocol,
-            TraceHop::Local,
-            [2; 16],
-            move |_| {
-                drop(callback_slot.lock().unwrap().take());
-                done.send(()).unwrap();
-            },
-        )
-        .unwrap();
-        let emitter = guard.emitter();
-        *guard_slot.lock().unwrap() = Some(guard);
-        emitter.emit(
-            TraceDirection::Local,
-            1,
-            0,
-            1,
-            TraceObjectKind::Session,
-            None,
-            None,
-            None,
-            TraceOutcome::State,
-        );
-        completed.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
 }

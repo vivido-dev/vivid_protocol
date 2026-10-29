@@ -1,4 +1,8 @@
-//! Portable, bounded PCM microphone packets for `audio-input-v1`.
+//! Portable, bounded PCM microphone packets for `audio-input-v1` (media §17).
+//!
+//! The uplink track has one canonical configuration, returned by [`configuration`]: 48 kHz mono
+//! 16-bit PCM in 20 ms packets, so the receiver needs no codec. [`supports`] checks that a
+//! requested track matches it exactly, and [`InputPacket`] holds one validated packet.
 use crate::CodecError;
 use crate::media::{self, AudioPacket};
 use crate::messages::LaneClass;
@@ -6,11 +10,17 @@ use crate::track::{
     AudioConfiguration, KindConfiguration, TrackConfiguration, TrackDirection, TrackMode,
 };
 
+/// Microphone sample rate in hertz.
 pub const SAMPLE_RATE: u32 = 48_000;
+/// Samples in one 20 ms packet.
 pub const SAMPLES: usize = 960;
+/// Bytes of mono 16-bit PCM in one packet.
 pub const PCM_BYTES: usize = SAMPLES * 2;
+/// `AUDIO_PACKET` body bytes: the 48-byte prefix and one packet of PCM.
 pub const BODY_BYTES: u32 = crate::const_u32(PCM_BYTES) + 48;
+/// Duration of one packet in microseconds.
 pub const PACKET_US: u64 = 20_000;
+/// Packets the uplink may have in flight.
 pub const QUEUE_PACKETS: usize = 10;
 
 /// Canonical microphone configuration, requiring no receiver codec.
@@ -44,6 +54,7 @@ pub fn configuration(context_id: u64, surface_id: u64, track_id: u64) -> TrackCo
     }
 }
 
+/// Returns whether `config` is exactly the canonical microphone configuration.
 pub fn supports(config: &TrackConfiguration) -> bool {
     config.validate(config.track_id == 0).is_ok()
         && *config == configuration(config.context_id, config.surface_id, config.track_id)
@@ -52,9 +63,13 @@ pub fn supports(config: &TrackConfiguration) -> bool {
 /// One validated, owned 20 ms packet. Device pointers never cross threads.
 #[derive(Clone, Debug)]
 pub struct InputPacket {
+    /// Media epoch.
     pub epoch: u32,
+    /// Nonzero packet ID; IDs strictly increase.
     pub packet_id: u64,
+    /// Capture time in signed microseconds.
     pub pts_us: i64,
+    /// One packet of mono 16-bit little-endian PCM.
     pub pcm: [u8; PCM_BYTES],
 }
 
@@ -108,53 +123,5 @@ impl InputPacket {
         })?;
         Self::decode(&body)?;
         Ok(body)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cbor::Value;
-
-    #[test]
-    fn uplink_roundtrip_and_constraints() {
-        let config = configuration(1, 2, 3);
-        let payload = Value::Map(config.payload(false).unwrap());
-        assert_eq!(
-            TrackConfiguration::decode(3, &payload, false).unwrap(),
-            config
-        );
-        let mut invalid = config.clone();
-        invalid.slot = 2;
-        assert!(invalid.validate(false).is_err());
-        invalid = config.clone();
-        invalid.mode = TrackMode::Timed;
-        assert!(invalid.validate(false).is_err());
-        invalid = config.clone();
-        invalid.lane = LaneClass::Bulk;
-        assert!(invalid.validate(false).is_err());
-        invalid = config;
-        invalid.direction = TrackDirection::Downlink;
-        invalid.slot = 2;
-        let payload = invalid.payload(false).unwrap();
-        assert!(!payload.iter().any(|(key, _)| *key == 16));
-        assert_eq!(
-            TrackConfiguration::decode(3, &Value::Map(payload), false).unwrap(),
-            invalid
-        );
-    }
-
-    #[test]
-    fn pcm_shape_is_checked_before_copying() {
-        let packet = InputPacket {
-            epoch: 1,
-            packet_id: 1,
-            pts_us: 0,
-            pcm: [0; PCM_BYTES],
-        };
-        let body = packet.encode().unwrap();
-        assert_eq!(body.len(), BODY_BYTES as usize);
-        InputPacket::decode(&body[..body.len() - 2]).unwrap_err();
-        assert_eq!(InputPacket::decode(&body).unwrap().pcm, packet.pcm);
     }
 }

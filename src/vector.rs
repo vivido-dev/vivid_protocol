@@ -7,13 +7,25 @@ use crate::cbor::{self, Value};
 use std::collections::BTreeSet;
 use std::fmt;
 
+/// Hard ceiling on encoded scene bytes, excluding the frame prefix (limit key 0).
 pub const MAX_SCENE_BYTES: usize = 2 * 1024 * 1024;
+/// Bytes before the display list in a `VECTOR_FRAME` body: the 4-byte epoch and 8-byte revision.
+const FRAME_PREFIX_BYTES: usize = 12;
+/// Bytes before the pixels in a `VECTOR_ASSET` body: the 8-byte ID, then 4-byte width and height.
+const ASSET_PREFIX_BYTES: usize = 16;
+/// Hard ceiling on commands per scene (limit key 1).
 pub const MAX_COMMANDS: usize = 4096;
+/// Hard ceiling on segments per path (limit key 2).
 pub const MAX_PATH_SEGMENTS: usize = 4096;
+/// Hard ceiling on path segments per scene (limit key 3).
 pub const MAX_TOTAL_SEGMENTS: usize = 65536;
+/// Hard ceiling on save depth and on active clip depth (limit key 4).
 pub const MAX_STACK_DEPTH: usize = 32;
+/// Hard ceiling on UTF-8 text bytes per scene (limit key 5).
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
+/// Hard ceiling on stops per gradient (limit key 6).
 pub const MAX_GRADIENT_STOPS: usize = 64;
+/// Most entries a styled stroke's dash array may hold.
 pub const MAX_DASH_ENTRIES: usize = 32;
 /// Hard ceiling for one dash length, corner radius, shadow blur, or spread, in logical pixels.
 pub const MAX_PAINT_EXTENT: f64 = 4096.;
@@ -31,8 +43,11 @@ const BEZIER_CIRCLE_KAPPA: f64 = 0.552_284_749_830_793_6;
     reason = "MAX_DASH_ENTRIES is 32, exact in f64"
 )]
 const MAX_DASH_OFFSET: f64 = MAX_PAINT_EXTENT * MAX_DASH_ENTRIES as f64;
+/// Hard ceiling on bytes per decoded image asset (limit key 7).
 pub const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
+/// Hard ceiling on retained image assets per channel (limit key 8).
 pub const MAX_RETAINED_ASSETS: usize = 256;
+/// Hard ceiling on retained image bytes per channel (limit key 9).
 pub const MAX_RETAINED_ASSET_BYTES: usize = 64 * 1024 * 1024;
 
 /// The authenticated WELCOME limits for a vector-capable presenter, in registered key order.
@@ -72,9 +87,11 @@ impl Limits {
         }
         Ok(Self(values))
     }
+    /// Returns the twelve limits in key order.
     pub fn values(&self) -> &[u64; 12] {
         &self.0
     }
+    /// Encodes the limits as the `WELCOME` key 15 map.
     pub fn to_value(&self) -> Value {
         Value::Map(
             self.0
@@ -142,8 +159,11 @@ impl Command {
 /// A complete scene replacement carried by an authenticated bulk track channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
+    /// Nonzero media epoch.
     pub epoch: u32,
+    /// Nonzero scene revision; it increases across every track of the window.
     pub revision: u64,
+    /// The display list that replaces the previous scene.
     pub canvas: Canvas,
 }
 impl Frame {
@@ -158,7 +178,7 @@ impl Frame {
             return Err(InvalidScene("scene epoch and revision must be nonzero"));
         }
         let commands = self.canvas.encode()?;
-        let mut body = Vec::with_capacity(12 + commands.len());
+        let mut body = Vec::with_capacity(FRAME_PREFIX_BYTES + commands.len());
         body.extend_from_slice(&self.epoch.to_be_bytes());
         body.extend_from_slice(&self.revision.to_be_bytes());
         body.extend(commands);
@@ -171,7 +191,7 @@ impl Frame {
     /// Returns [`InvalidScene`] when `body` is shorter than its 12-byte prefix or longer than the
     /// scene ceiling allows, the epoch or revision is zero, or the canvas fails [`Canvas::decode`].
     pub fn decode(body: &[u8]) -> Result<Self> {
-        if body.len() < 12 || body.len() > MAX_SCENE_BYTES + 12 {
+        if body.len() < FRAME_PREFIX_BYTES || body.len() > MAX_SCENE_BYTES + FRAME_PREFIX_BYTES {
             return Err(InvalidScene("invalid vector frame length"));
         }
         let epoch = u32::from_be_bytes(
@@ -190,7 +210,7 @@ impl Frame {
         Ok(Self {
             epoch,
             revision,
-            canvas: Canvas::decode(&body[12..])?,
+            canvas: Canvas::decode(&body[FRAME_PREFIX_BYTES..])?,
         })
     }
 }
@@ -198,15 +218,20 @@ impl Frame {
 /// Immutable straight-alpha sRGB RGBA8 asset. The authenticated channel supplies its namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageAsset {
+    /// Nonzero asset ID; IDs strictly increase within a channel generation.
     pub id: u64,
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
+    /// Exactly `width * height * 4` straight-alpha sRGB RGBA8 bytes.
     pub rgba: Vec<u8>,
 }
 
 /// Ordered removal from a channel's asset namespace; existing scenes keep their references.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssetRelease {
+    /// The asset to remove from future scene lookup.
     pub id: u64,
 }
 impl AssetRelease {
@@ -266,7 +291,7 @@ impl ImageAsset {
     /// Returns any error from [`ImageAsset::validate`].
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let mut body = Vec::with_capacity(16 + self.rgba.len());
+        let mut body = Vec::with_capacity(ASSET_PREFIX_BYTES + self.rgba.len());
         body.extend_from_slice(&self.id.to_be_bytes());
         body.extend_from_slice(&self.width.to_be_bytes());
         body.extend_from_slice(&self.height.to_be_bytes());
@@ -280,7 +305,7 @@ impl ImageAsset {
     /// Returns [`InvalidScene`] when `body` is shorter than its 16-byte prefix or longer than the
     /// asset ceiling allows, or the asset fails [`ImageAsset::validate`].
     pub fn decode(body: &[u8]) -> Result<Self> {
-        if body.len() < 16 || body.len() > 16 + MAX_ASSET_BYTES {
+        if body.len() < ASSET_PREFIX_BYTES || body.len() > ASSET_PREFIX_BYTES + MAX_ASSET_BYTES {
             return Err(InvalidScene("invalid vector asset length"));
         }
         let id = u64::from_be_bytes(
@@ -308,7 +333,7 @@ impl ImageAsset {
             id,
             width,
             height,
-            rgba: body[16..].to_vec(),
+            rgba: body[ASSET_PREFIX_BYTES..].to_vec(),
         })
     }
 }
@@ -344,7 +369,9 @@ type Result<T> = std::result::Result<T, InvalidScene>;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Scalar(i64);
 impl Scalar {
+    /// Zero.
     pub const ZERO: Self = Self(0);
+    /// One logical unit.
     pub const ONE: Self = Self(1_i64 << 32);
     /// Converts `value` to fixed point.
     ///
@@ -368,9 +395,11 @@ impl Scalar {
         clippy::cast_precision_loss,
         reason = "constructed values stay below 2^53 in magnitude, so f64 holds them exactly"
     )]
+    /// Returns the value in logical units.
     pub fn get(self) -> f64 {
         self.0 as f64 / FIXED_ONE
     }
+    /// Returns the Q32.32 fixed-point representation.
     pub const fn raw(self) -> i64 {
         self.0
     }
@@ -387,9 +416,12 @@ impl Scalar {
     }
 }
 
+/// A point `[x, y]` in window-local logical units.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Point {
+    /// Horizontal coordinate.
     pub x: Scalar,
+    /// Vertical coordinate.
     pub y: Scalar,
 }
 impl Point {
@@ -407,10 +439,14 @@ impl Point {
     }
 }
 
+/// A rectangle `[origin, width, height]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
+    /// Top-left corner.
     pub origin: Point,
+    /// Width.
     pub width: Scalar,
+    /// Height.
     pub height: Scalar,
 }
 impl Rect {
@@ -443,6 +479,7 @@ impl Rect {
         Scalar::new(self.origin.y.get() + self.height.get())?;
         Ok(())
     }
+    /// Returns whether `p` lies inside the rectangle; the right and bottom edges are outside.
     pub fn contains(self, p: Point) -> bool {
         let x = p.x.get() - self.origin.x.get();
         let y = p.y.get() - self.origin.y.get();
@@ -450,6 +487,7 @@ impl Rect {
     }
 }
 
+/// An affine transform `[a, b, c, d, e, f]` with the usual mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Transform(pub [Scalar; 6]);
 impl Default for Transform {
@@ -483,18 +521,27 @@ impl Transform {
     }
 }
 
+/// One segment of a path contour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Segment {
+    /// Starts a contour at a point (tag 0).
     Move(Point),
+    /// A straight line to a point (tag 1).
     Line(Point),
+    /// A quadratic curve through a control point to an end point (tag 2).
     Quad(Point, Point),
+    /// A cubic curve through two control points to an end point (tag 3).
     Cubic(Point, Point, Point),
+    /// Closes the open contour (tag 4).
     Close,
 }
+/// A path `[even_odd, segments]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Path {
+    /// Contours; each starts with [`Segment::Move`].
     pub segments: Vec<Segment>,
+    /// Uses the even-odd fill rule instead of nonzero.
     pub even_odd: bool,
 }
 impl Path {
@@ -713,6 +760,7 @@ impl PathBuilder {
         self.point(x, y, Segment::Move)
     }
 
+    /// Adds a straight line to `(x, y)`.
     #[must_use]
     pub fn line_to(self, x: f64, y: f64) -> Self {
         self.point(x, y, Segment::Line)
@@ -748,8 +796,9 @@ impl PathBuilder {
         self.push(Segment::Close)
     }
 
-    /// Fill by the even-odd rule rather than by winding, which is what puts a hole in a shape
-    /// drawn as two nested subpaths.
+    /// Fills by the even-odd rule instead of by winding.
+    ///
+    /// That is what puts a hole in a shape drawn as two nested subpaths.
     #[must_use]
     pub fn even_odd(mut self) -> Self {
         self.even_odd = true;
@@ -761,12 +810,15 @@ impl PathBuilder {
         self.segments.len()
     }
 
+    /// Returns whether no segment has been added.
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }
 
-    /// Finish, checking everything the wire requires: a non-empty path, within the segment
-    /// ceiling, beginning with a move, and closing only a subpath that was opened.
+    /// Finishes the path, checking everything the wire requires.
+    ///
+    /// The path must be non-empty, within the segment ceiling, begin with a move, and close only a
+    /// subpath that was opened.
     ///
     /// # Errors
     ///
@@ -872,8 +924,10 @@ impl Corners {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ColorSpace {
+    /// Interpolates in sRGB, the default.
     #[default]
     Srgb,
+    /// Interpolates in Oklab (`overlay-paint-v1`).
     Oklab,
 }
 
@@ -881,38 +935,59 @@ pub enum ColorSpace {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Extend {
+    /// Repeats the edge pixels outside the image.
     #[default]
     Pad,
+    /// Tiles the image.
     Repeat,
+    /// Tiles the image, mirroring alternate tiles.
     Reflect,
 }
+/// One gradient stop `[offset, color]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GradientStop {
+    /// Position along the gradient, from 0 to 65535; offsets never decrease.
     pub offset: u16,
+    /// Color at this stop.
     pub color: Color,
 }
+/// How a fill or stroke is painted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Brush {
+    /// One color (tag 0).
     Solid(Color),
+    /// A linear gradient (tag 1).
     Linear {
+        /// Where the gradient starts.
         start: Point,
+        /// Where the gradient ends; it differs from the start.
         end: Point,
+        /// At least two stops.
         stops: Vec<GradientStop>,
+        /// Interpolation color space.
         color_space: ColorSpace,
     },
+    /// A radial gradient (tag 2).
     Radial {
+        /// Center of the gradient.
         center: Point,
+        /// Positive radius.
         radius: Scalar,
+        /// At least two stops.
         stops: Vec<GradientStop>,
+        /// Interpolation color space.
         color_space: ColorSpace,
     },
     /// Fill with a retained image. The image sits at its natural pixel size, anchored at the
     /// origin, unless `transform` repositions or scales it; `extend` governs sampling outside
     /// its extent. The asset must already exist on the same channel.
     Image {
+        /// The image asset painted (`overlay-paint-v1`).
         asset: u64,
+        /// Maps the image into drawing space; `None` is the identity.
         transform: Option<Transform>,
+        /// What the brush paints outside the image.
         extend: Extend,
     },
 }
@@ -950,15 +1025,24 @@ impl Brush {
     }
 }
 
+/// A text run the host shapes (command tag 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Text {
+    /// UTF-8 text.
     pub text: String,
+    /// Where the run starts.
     pub origin: Point,
+    /// Positive font size.
     pub size: Scalar,
+    /// Font family of at most 256 bytes; empty selects the host default.
     pub family: String,
+    /// Font weight, 1 through 1000.
     pub weight: u16,
+    /// Uses an italic face.
     pub italic: bool,
+    /// Text color.
     pub color: Color,
+    /// Positive width the host fits the run into.
     pub max_width: Option<Scalar>,
 }
 /// A blurred rounded rectangle cast behind (or inside) a region, as CSS box-shadow defines it.
@@ -968,12 +1052,19 @@ pub struct Text {
 /// is the caller's job: the shadow command only paints the shadow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shadow {
+    /// The rectangle that casts the shadow.
     pub rect: Rect,
+    /// Corner radii of the rectangle.
     pub radii: Corners,
+    /// Shadow color.
     pub color: Color,
+    /// How far the shadow is displaced.
     pub offset: Point,
+    /// Gaussian blur diameter.
     pub blur: Scalar,
+    /// How far the shape grows, or shrinks when negative, before the blur.
     pub spread: Scalar,
+    /// Paints inside the rectangle instead of outside it.
     pub inset: bool,
 }
 impl Shadow {
@@ -996,35 +1087,49 @@ impl Shadow {
     }
 }
 
+/// How a stroke ends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Cap {
+    /// Ends flat at the end point.
     #[default]
     Butt,
+    /// Ends with a half circle.
     Round,
+    /// Ends with a half square past the end point.
     Square,
 }
 
+/// How stroke segments meet.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Join {
+    /// A sharp corner, limited by the miter limit.
     #[default]
     Miter,
+    /// A flattened corner.
     Bevel,
+    /// A rounded corner.
     Round,
 }
 
 /// A stroke with caps, joins, and an optional dash pattern. Tag 1 remains the plain stroke.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrokeStyle {
+    /// Positive stroke width.
     pub width: Scalar,
+    /// End caps.
     pub cap: Cap,
+    /// Corner joins.
     pub join: Join,
+    /// Ratio past which a miter join becomes a bevel.
     pub miter_limit: Scalar,
+    /// Alternating dash and gap lengths; empty draws a solid line.
     pub dashes: Vec<Scalar>,
+    /// Distance into the dash pattern where the stroke starts.
     pub dash_offset: Scalar,
 }
-/// The miter limit a stroke has unless it asks for another, as SVG and CSS use.
+/// The default miter limit, as SVG and CSS use.
 pub const DEFAULT_MITER_LIMIT: Scalar = Scalar(4_i64 << 32);
 
 impl Default for StrokeStyle {
@@ -1084,12 +1189,17 @@ impl StrokeStyle {
     }
 }
 
+/// What a hit region does with pointer input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HitRole {
+    /// Ordinary input for the producer (role 0).
     Input,
+    /// Host-handled window drag (role 1).
     Drag,
+    /// Host-handled resize; the mask names the edges: left 1, top 2, right 4, bottom 8.
     Resize(u8),
+    /// Passes input to what lies below (role 2).
     Transparent,
 }
 
@@ -1100,26 +1210,46 @@ pub enum HitRole {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CursorShape {
+    /// The platform's default arrow.
     #[default]
     Default,
+    /// A pointing hand, for links and buttons.
     Pointer,
+    /// A text I-beam.
     Text,
+    /// Moving an object.
     Move,
+    /// Precise selection.
     Crosshair,
+    /// The action is unavailable.
     NotAllowed,
+    /// Something can be grabbed.
     Grab,
+    /// Something is being dragged.
     Grabbing,
+    /// Busy; input is not accepted.
     Wait,
+    /// Busy, but input is still accepted.
     Progress,
+    /// Resizing the left edge.
     ResizeLeft,
+    /// Resizing the right edge.
     ResizeRight,
+    /// Resizing the top edge.
     ResizeUp,
+    /// Resizing the bottom edge.
     ResizeDown,
+    /// Resizing the top-left corner.
     ResizeUpLeft,
+    /// Resizing the top-right corner.
     ResizeUpRight,
+    /// Resizing the bottom-left corner.
     ResizeDownLeft,
+    /// Resizing the bottom-right corner.
     ResizeDownRight,
+    /// Resizing horizontally.
     ResizeLeftRight,
+    /// Resizing vertically.
     ResizeUpDown,
 }
 impl CursorShape {
@@ -1127,6 +1257,7 @@ impl CursorShape {
     pub fn index(self) -> u64 {
         self as u64
     }
+    /// Returns the shape with wire index `index`, or `None` when it is unassigned.
     pub fn from_index(index: u64) -> Option<Self> {
         const ALL: [CursorShape; 20] = [
             CursorShape::Default,
@@ -1160,34 +1291,56 @@ impl CursorShape {
 /// travel together rather than being looked up separately and risking a stale pairing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HitRegion {
+    /// The application's region ID.
     pub id: u64,
+    /// What the region does with input.
     pub role: HitRole,
+    /// The cursor the region asks for.
     pub cursor: Option<CursorShape>,
 }
+/// One display-list command; the wire tag is in parentheses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
+    /// Fills a path with a brush (tag 0).
     Fill(Path, Brush),
+    /// Strokes a path with a brush and positive width (tag 1).
     Stroke(Path, Brush, Scalar),
+    /// Saves the transform, opacity, and clip state (tag 2).
     Save,
+    /// Restores the last saved state (tag 3).
     Restore,
+    /// Concatenates an affine transform (tag 4).
     Transform(Transform),
+    /// Intersects the clip with a path (tag 5).
     Clip(Path),
+    /// Sets drawing opacity, 0 through 65535 (tag 6).
     Opacity(u16),
+    /// Draws a text run (tag 7).
     Text(Text),
     /// A host-shaped layout in this window's retained namespace (overlay-text-layout-v1).
     TextLayout {
+        /// Nonzero ID of a layout the host retained from a batch measurement.
         layout: u64,
+        /// Where the layout's origin is drawn.
         origin: Point,
     },
+    /// Draws an image asset into a rectangle (tag 8).
     Image {
+        /// The image asset.
         asset: u64,
+        /// Destination rectangle.
         rect: Rect,
+        /// Opacity, 0 through 65535.
         opacity: u16,
     },
+    /// Declares a hit region (tag 9); later regions take precedence.
     Hit {
+        /// Nonzero region ID, unique within the scene.
         id: u64,
+        /// The region's shape.
         path: Path,
+        /// What the region does with input.
         role: HitRole,
         /// Cursor shown while this region is hovered (overlay-pointer-v1).
         cursor: Option<CursorShape>,
@@ -1198,14 +1351,17 @@ pub enum Command {
     StyledStroke(Path, Brush, StrokeStyle),
 }
 
+/// A display list built one command at a time.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Canvas {
     commands: Vec<Command>,
 }
 impl Canvas {
+    /// Creates an empty display list.
     pub fn new() -> Self {
         Self::default()
     }
+    /// Returns the commands in drawing order.
     pub fn commands(&self) -> &[Command] {
         &self.commands
     }

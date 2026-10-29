@@ -1,8 +1,17 @@
-//! Retry-safe delegated session leases, suspension, and bounded resume state.
+//! Retry-safe session leases, suspension, and bounded resumption (security §6 and §7).
+//!
+//! A context hands another producer a session lease with `CREATE_SESSION_LEASE`
+//! ([`SessionLeaseDefinition`]). The presenter's [`LeaseMachine`] runs the lease through its
+//! states: it reserves the lease for one activation attempt, replays the same `WELCOME` for an
+//! exact retry, suspends the session on unclean transport loss, and admits a resume at the current
+//! generation. [`RevokeSessionLease`] ends a lease.
+
+use std::fmt;
 
 use sha2::{Digest, Sha256};
 
 use crate::{
+    auth::{ATTEMPT_ID_BYTES, NONCE_BYTES},
     cbor::Value,
     messages::{MessageError, PayloadMap, StrictMap, invalid_value, require_nonzero},
     registry,
@@ -10,13 +19,17 @@ use crate::{
     revision::ResumeGeneration,
 };
 
+/// Longest activation timeout a lease may request: 60 seconds.
 pub const MAX_ACTIVATION_TIMEOUT_US: u64 = 60_000_000;
 
+/// What happens to a lease's session when its transport closes (`CREATE_SESSION_LEASE` key 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 #[non_exhaustive]
 pub enum CleanupPolicy {
+    /// Clean up on every disconnect (`0`).
     Immediate = 0,
+    /// Suspend on unclean transport loss so the session can resume (`1`).
     SuspendOnUncleanLoss = 1,
 }
 
@@ -36,16 +49,26 @@ impl TryFrom<u64> for CleanupPolicy {
     }
 }
 
+/// The `CREATE_SESSION_LEASE` request (security §6.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLeaseDefinition {
+    /// Owning context (key 0).
     pub context_id: u64,
+    /// Nonzero lease ID, unique within the context (key 1).
     pub lease_id: u64,
+    /// SHA-256 verifier of the activation secret; never the secret (key 2).
     pub activation_verifier: [u8; 32],
+    /// Nonzero activation timeout, at most 60 seconds (key 3).
     pub activation_timeout_us: u64,
+    /// Requested disconnect grace in microseconds (key 4).
     pub requested_disconnect_grace_us: u64,
+    /// Cleanup policy (key 5).
     pub cleanup_policy: CleanupPolicy,
+    /// Profiles the session may use, sorted, unique, and closed under prerequisites (key 6).
     pub permitted_profiles: Vec<String>,
+    /// Resource contract reserved for the session (key 7).
     pub requested_contract: ResourceContract,
+    /// Client public key for deployment-specific proof of possession (key 8).
     pub client_public_key: Option<Vec<u8>>,
 }
 
@@ -163,15 +186,23 @@ impl SessionLeaseDefinition {
     }
 }
 
+/// A session lease's state (security §6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum LeaseState {
+    /// Created; no activation yet.
     Issued = 1,
+    /// One activation attempt holds the lease until its `WELCOME` is committed.
     Reserved = 2,
+    /// A session is using the lease.
     Active = 3,
+    /// The session lost its transport and may resume within the grace.
     Suspended = 4,
+    /// The session closed cleanly.
     Closed = 5,
+    /// The owner or a parent revoked the lease.
     Revoked = 6,
+    /// The activation deadline or disconnect grace passed.
     Expired = 7,
 }
 
@@ -196,26 +227,73 @@ impl Attempt {
     }
 }
 
+/// One `HELLO`'s bid to activate or resume a lease, with the reply prepared for it.
+///
+/// An exact retry repeats the attempt ID, client nonce, and `HELLO` bytes of the attempt the lease
+/// holds; it is answered with that attempt's stored reply instead of `welcome`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EstablishmentAttempt<'a> {
+    /// `HELLO`'s attempt ID, which identifies retries of one attempt.
+    pub attempt_id: [u8; ATTEMPT_ID_BYTES],
+    /// `HELLO`'s client nonce.
+    pub client_nonce: [u8; NONCE_BYTES],
+    /// The complete `HELLO` body; only its digest is kept.
+    pub hello_bytes: &'a [u8],
+    /// A digest of the negotiated profile set, which every retry and resume must match.
+    pub profile_fingerprint: [u8; 32],
+    /// The logical session the lease belongs to; nonzero.
+    pub session_id: u64,
+    /// The server nonce of the `WELCOME` prepared for this attempt.
+    pub server_nonce: [u8; NONCE_BYTES],
+    /// The prepared `WELCOME` body, replayed to an exact retry.
+    pub welcome: Vec<u8>,
+}
+
+impl fmt::Debug for EstablishmentAttempt<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EstablishmentAttempt")
+            .field("session_id", &self.session_id)
+            .field("hello_len", &self.hello_bytes.len())
+            .field("welcome_len", &self.welcome.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// How a lease answers an activation or resume attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptDecision {
+    /// A new attempt: send this `WELCOME`.
     Fresh {
+        /// The logical session ID.
         session_id: u64,
+        /// The server nonce.
         server_nonce: [u8; 32],
+        /// The complete `WELCOME` body.
         welcome: Vec<u8>,
     },
+    /// An exact retry: send the original `WELCOME` again.
     ExactReplay {
+        /// The logical session ID.
         session_id: u64,
+        /// The server nonce.
         server_nonce: [u8; 32],
+        /// The complete `WELCOME` body.
         welcome: Vec<u8>,
     },
 }
 
+/// A lease transition the state machine refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LeaseTransitionError {
+    /// Another attempt already holds the lease, or the retry differs.
     AuthenticationFailed,
+    /// The lease's state does not allow the transition.
     BadState,
+    /// The resume names a generation other than the current one.
     StaleResumeGeneration,
+    /// The lease revision or resume generation cannot advance.
     Exhausted,
 }
 
@@ -232,6 +310,7 @@ impl std::fmt::Display for LeaseTransitionError {
 
 impl std::error::Error for LeaseTransitionError {}
 
+/// A presenter's state machine for one session lease.
 #[derive(Clone)]
 pub struct LeaseMachine {
     state: LeaseState,
@@ -264,6 +343,7 @@ impl std::fmt::Debug for LeaseMachine {
 }
 
 impl LeaseMachine {
+    /// Creates a machine in [`LeaseState::Issued`].
     pub fn new(cleanup_policy: CleanupPolicy, disconnect_grace_us: u64) -> Self {
         Self {
             state: LeaseState::Issued,
@@ -277,41 +357,43 @@ impl LeaseMachine {
         }
     }
 
+    /// Returns the current state.
     pub const fn state(&self) -> LeaseState {
         self.state
     }
 
+    /// Returns the lease revision; it advances on each transition.
     pub const fn revision(&self) -> u64 {
         self.revision
     }
 
+    /// Returns the current resume generation.
     pub const fn resume_generation(&self) -> ResumeGeneration {
         self.resume_generation
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one argument per HELLO binding field; see docs/RUST-GUIDELINES-REVIEW.md"
-    )]
     /// Reserves an issued lease for a fresh activation attempt, or recognizes an exact retry.
     ///
     /// # Errors
     ///
-    /// Returns [`LeaseTransitionError::BadState`] when `session_id` is zero,
+    /// Returns [`LeaseTransitionError::BadState`] when the attempt's session ID is zero,
     /// [`LeaseTransitionError::AuthenticationFailed`] when a resume attempt is pending, the lease
     /// is not issued and this is not an exact retry of the reserved or active attempt, or the
     /// profile fingerprint differs, and [`LeaseTransitionError::Exhausted`] when the revision
     /// cannot advance.
     pub fn begin_activation(
         &mut self,
-        attempt_id: [u8; 16],
-        client_nonce: [u8; 32],
-        hello_bytes: &[u8],
-        profile_fingerprint: [u8; 32],
-        session_id: u64,
-        server_nonce: [u8; 32],
-        welcome: Vec<u8>,
+        attempt: EstablishmentAttempt<'_>,
     ) -> Result<AttemptDecision, LeaseTransitionError> {
+        let EstablishmentAttempt {
+            attempt_id,
+            client_nonce,
+            hello_bytes,
+            profile_fingerprint,
+            session_id,
+            server_nonce,
+            welcome,
+        } = attempt;
         if session_id == 0 {
             return Err(LeaseTransitionError::BadState);
         }
@@ -452,10 +534,6 @@ impl LeaseMachine {
         Ok(self.state)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one argument per HELLO binding field; see docs/RUST-GUIDELINES-REVIEW.md"
-    )]
     /// Reserves a suspended lease for a resume attempt, or recognizes an exact retry.
     ///
     /// # Errors
@@ -468,14 +546,17 @@ impl LeaseMachine {
     pub fn begin_resume(
         &mut self,
         expected_generation: ResumeGeneration,
-        attempt_id: [u8; 16],
-        client_nonce: [u8; 32],
-        hello_bytes: &[u8],
-        profile_fingerprint: [u8; 32],
-        session_id: u64,
-        server_nonce: [u8; 32],
-        welcome: Vec<u8>,
+        attempt: EstablishmentAttempt<'_>,
     ) -> Result<AttemptDecision, LeaseTransitionError> {
+        let EstablishmentAttempt {
+            attempt_id,
+            client_nonce,
+            hello_bytes,
+            profile_fingerprint,
+            session_id,
+            server_nonce,
+            welcome,
+        } = attempt;
         if matches!(self.state, LeaseState::Reserved | LeaseState::Active) {
             if self.profile_fingerprint != Some(profile_fingerprint)
                 || self.logical_session_id != Some(session_id)
@@ -605,113 +686,35 @@ impl LeaseMachine {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The `REVOKE_SESSION_LEASE` payload: end a lease and its child session (security §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevokeSessionLease {
+    /// The context that issued the lease.
+    pub context_id: u64,
+    /// The lease to revoke.
+    pub lease_id: u64,
+}
 
-    #[test]
-    fn lost_welcome_retries_same_nonsecret_outcome() {
-        let mut lease = LeaseMachine::new(CleanupPolicy::SuspendOnUncleanLoss, 1_000_000);
-        let first = lease
-            .begin_activation(
-                [1; 16],
-                [2; 32],
-                b"hello",
-                [4; 32],
-                7,
-                [3; 32],
-                b"welcome".to_vec(),
-            )
-            .unwrap();
-        let retry = lease
-            .begin_activation(
-                [1; 16],
-                [2; 32],
-                b"hello",
-                [4; 32],
-                99,
-                [9; 32],
-                b"other".to_vec(),
-            )
-            .unwrap();
-        assert!(matches!(
-            first,
-            AttemptDecision::Fresh { session_id: 7, .. }
-        ));
-        assert!(matches!(
-            retry,
-            AttemptDecision::ExactReplay { session_id: 7, .. }
-        ));
-        assert_eq!(
-            lease.begin_activation([4; 16], [2; 32], b"hello", [4; 32], 8, [3; 32], Vec::new()),
-            Err(LeaseTransitionError::AuthenticationFailed)
-        );
+impl RevokeSessionLease {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.lease_id)),
+        ]
     }
 
-    #[test]
-    fn active_lease_suspends_and_resume_generation_advances_once() {
-        let mut lease = LeaseMachine::new(CleanupPolicy::SuspendOnUncleanLoss, 1_000_000);
-        lease
-            .begin_activation([1; 16], [2; 32], b"hello", [4; 32], 7, [3; 32], Vec::new())
-            .unwrap();
-        lease.commit_welcome().unwrap();
-        lease.admit_post_hello().unwrap();
-        assert_eq!(
-            lease.confirm_transport_lost(false).unwrap(),
-            LeaseState::Suspended
-        );
-        lease
-            .begin_resume(
-                ResumeGeneration::ZERO,
-                [4; 16],
-                [5; 32],
-                b"resume",
-                [4; 32],
-                7,
-                [6; 32],
-                Vec::new(),
-            )
-            .unwrap();
-        assert_eq!(lease.resume_generation(), ResumeGeneration::ONE);
-        assert_eq!(
-            lease.begin_resume(
-                ResumeGeneration::ZERO,
-                [7; 16],
-                [8; 32],
-                b"different",
-                [4; 32],
-                7,
-                [9; 32],
-                Vec::new(),
-            ),
-            Err(LeaseTransitionError::AuthenticationFailed)
-        );
-    }
-
-    #[test]
-    fn transport_loss_before_post_hello_allows_only_exact_activation_retry() {
-        let mut lease = LeaseMachine::new(CleanupPolicy::SuspendOnUncleanLoss, 1_000_000);
-        lease
-            .begin_activation(
-                [1; 16],
-                [2; 32],
-                b"hello",
-                [4; 32],
-                7,
-                [3; 32],
-                b"welcome".to_vec(),
-            )
-            .unwrap();
-        lease.commit_welcome().unwrap();
-        assert_eq!(
-            lease.confirm_transport_lost(false).unwrap(),
-            LeaseState::Active
-        );
-        assert!(matches!(
-            lease
-                .begin_activation([1; 16], [2; 32], b"hello", [4; 32], 99, [9; 32], Vec::new(),)
-                .unwrap(),
-            AttemptDecision::ExactReplay { session_id: 7, .. }
-        ));
+    /// Decodes a `REVOKE_SESSION_LEASE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `REVOKE_SESSION_LEASE` map or a field
+    /// is missing or not an unsigned integer.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("REVOKE_SESSION_LEASE", value, &[0, 1])?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            lease_id: map.required_u64(1)?,
+        })
     }
 }

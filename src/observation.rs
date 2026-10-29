@@ -16,11 +16,17 @@ use crate::{cbor::Value, messages, messages::PayloadMap};
 
 /// Observation classes, core §10's `SET_OBSERVATION` mask.
 pub mod class {
+    /// Observation class 0: surface changes.
     pub const SURFACE: u64 = 1 << 0;
+    /// Observation class 1: track changes.
     pub const TRACK: u64 = 1 << 1;
+    /// Observation class 2: scene changes.
     pub const SCENE: u64 = 1 << 2;
+    /// Observation class 3: playback transitions.
     pub const PLAYBACK: u64 = 1 << 3;
+    /// Observation class 4: lease and context changes visible to the principal.
     pub const AUTHORITY: u64 = 1 << 4;
+    /// Every assigned observation class bit.
     pub const KNOWN_MASK: u64 = (1 << 5) - 1;
 }
 
@@ -46,11 +52,16 @@ pub fn is_actionable(record_type: u16) -> bool {
     )
 }
 
-/// What an observation coalesces on: the same record about the same object replaces the earlier one.
+/// The identity an observation coalesces on.
+///
+/// The same record about the same object replaces the earlier one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationKey {
+    /// The observation's record type.
     pub record_type: u16,
+    /// The context the object belongs to.
     pub context_id: u64,
+    /// The object the observation is about.
     pub object_id: u64,
 }
 
@@ -64,8 +75,11 @@ struct Entry {
 /// One observation ready to write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation {
+    /// Record type to write.
     pub record_type: u16,
+    /// Record object ID.
     pub object_id: u64,
+    /// Envelope payload; the queue adds the observation sequence.
     pub payload: PayloadMap,
 }
 
@@ -81,6 +95,7 @@ pub struct ObservationQueue {
 }
 
 impl ObservationQueue {
+    /// Creates an unsubscribed queue holding at most `capacity` observations, and at least one.
     pub fn new(capacity: u64) -> Self {
         Self {
             mask: 0,
@@ -112,10 +127,12 @@ impl ObservationQueue {
         Ok(())
     }
 
+    /// Returns the subscribed observation classes.
     pub fn mask(&self) -> u64 {
         self.mask
     }
 
+    /// Returns whether nothing, not even a gap report, is waiting.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.lost.is_none()
     }
@@ -197,221 +214,29 @@ impl ObservationQueue {
 /// Where the observation sequence rides in every observation payload.
 pub const OBSERVATION_SEQUENCE_KEY: u64 = 90;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The `SET_OBSERVATION` payload: replace the session's observation mask (core §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetObservation {
+    /// The [`class`] bits to subscribe to; [`ObservationQueue::subscribe`] rejects unknown bits.
+    pub mask: u64,
+}
 
-    fn key(record_type: u16, object_id: u64) -> ObservationKey {
-        ObservationKey {
-            record_type,
-            context_id: 1,
-            object_id,
-        }
+impl SetObservation {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![(0, Value::Unsigned(self.mask))]
     }
 
-    fn payload(value: u64) -> PayloadMap {
-        vec![(0, Value::Unsigned(value))]
-    }
-
-    fn subscribed(capacity: u64, mask: u64) -> ObservationQueue {
-        let mut queue = ObservationQueue::new(capacity);
-        queue.subscribe(mask).unwrap();
-        queue
-    }
-
-    #[test]
-    fn an_unsubscribed_class_is_not_queued() {
-        let mut queue = subscribed(8, class::TRACK);
-        assert!(!queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 1),
-            payload(1)
-        ));
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn unassigned_mask_bits_are_refused() {
-        let mut queue = ObservationQueue::new(8);
-        assert!(queue.subscribe(1 << 9).is_err());
-        assert_eq!(queue.mask(), 0);
-    }
-
-    #[test]
-    fn the_same_object_coalesces_latest_wins() {
-        let mut queue = subscribed(8, class::SURFACE);
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 1),
-            payload(1),
-        );
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 1),
-            payload(2),
-        );
-        let drained = queue.drain();
-        assert_eq!(drained.len(), 1, "one entry per object");
-        assert_eq!(
-            drained[0].payload[0].1.as_u64(),
-            Some(2),
-            "the latest value wins"
-        );
-    }
-
-    #[test]
-    fn different_objects_do_not_coalesce() {
-        let mut queue = subscribed(8, class::SURFACE);
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 1),
-            payload(1),
-        );
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 2),
-            payload(2),
-        );
-        assert_eq!(queue.drain().len(), 2);
-    }
-
-    #[test]
-    fn every_observation_carries_a_strictly_increasing_sequence() {
-        let mut queue = subscribed(8, class::SURFACE);
-        for object in 1..=3 {
-            queue.push(
-                class::SURFACE,
-                key(messages::SURFACE_CHANGED, object),
-                payload(object),
-            );
-        }
-        let sequences = queue
-            .drain()
-            .into_iter()
-            .map(|observation| {
-                observation
-                    .payload
-                    .iter()
-                    .find(|entry| entry.0 == OBSERVATION_SEQUENCE_KEY)
-                    .and_then(|entry| entry.1.as_u64())
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(sequences, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn overflow_drops_and_reports_a_gap_before_what_follows() {
-        let mut queue = subscribed(2, class::SURFACE | class::TRACK);
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 1),
-            payload(1),
-        );
-        queue.push(class::TRACK, key(messages::TRACK_CHANGED, 2), payload(2));
-        // The third entry evicts the first.
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 3),
-            payload(3),
-        );
-
-        let drained = queue.drain();
-        assert_eq!(
-            drained[0].record_type,
-            messages::OBSERVATION_GAP,
-            "the gap comes first"
-        );
-        assert_eq!(
-            drained[0].payload[0].1.as_u64(),
-            Some(1),
-            "the first lost sequence"
-        );
-        assert_eq!(
-            drained[0].payload[1].1.as_u64(),
-            Some(class::SURFACE),
-            "the classes the loss spanned"
-        );
-        assert_eq!(drained.len(), 3, "the gap plus the two survivors");
-    }
-
-    #[test]
-    fn repeated_losses_collapse_into_one_gap_naming_every_class() {
-        let mut queue = subscribed(1, class::SURFACE | class::TRACK);
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 1),
-            payload(1),
-        );
-        queue.push(class::TRACK, key(messages::TRACK_CHANGED, 2), payload(2));
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 3),
-            payload(3),
-        );
-        let drained = queue.drain();
-        assert_eq!(drained[0].record_type, messages::OBSERVATION_GAP);
-        assert_eq!(
-            drained[0].payload[1].1.as_u64(),
-            Some(class::SURFACE | class::TRACK),
-            "one gap names every class that lost an entry"
-        );
-        assert_eq!(drained.len(), 2, "the gap plus the one survivor");
-    }
-
-    #[test]
-    fn unsubscribing_discards_what_was_queued_for_that_class() {
-        let mut queue = subscribed(8, class::SURFACE | class::TRACK);
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 1),
-            payload(1),
-        );
-        queue.push(class::TRACK, key(messages::TRACK_CHANGED, 2), payload(2));
-        queue.subscribe(class::TRACK).unwrap();
-        let drained = queue.drain();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].record_type, messages::TRACK_CHANGED);
-    }
-
-    #[test]
-    fn the_actionable_set_is_recognised() {
-        for record in [
-            messages::TARGET_CHANGED,
-            messages::TRACK_LOST,
-            messages::NEED_KEYFRAME,
-            messages::NEED_FULL_FRAME,
-            messages::MAX_CHANNEL_DATA,
-            messages::INPUT_REVOKED,
-            messages::CONTEXT_CHANGED,
-            messages::SESSION_LEASE_CHANGED,
-            messages::ERROR,
-        ] {
-            assert!(
-                is_actionable(record),
-                "{record:#06x} must never be coalesced"
-            );
-        }
-        for record in [
-            messages::SURFACE_CHANGED,
-            messages::TRACK_CHANGED,
-            messages::SCENE_CHANGED,
-        ] {
-            assert!(!is_actionable(record));
-        }
-    }
-
-    #[test]
-    fn a_drained_queue_reports_empty() {
-        let mut queue = subscribed(4, class::SURFACE);
-        queue.push(
-            class::SURFACE,
-            key(messages::SURFACE_CHANGED, 1),
-            payload(1),
-        );
-        assert!(!queue.is_empty());
-        queue.drain();
-        assert!(queue.is_empty());
-        assert!(queue.drain_next().is_none());
+    /// Decodes a `SET_OBSERVATION` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`messages::MessageError`] when `value` is not a strict `SET_OBSERVATION` map or the
+    /// mask is missing or not an unsigned integer.
+    pub fn decode(value: &Value) -> Result<Self, messages::MessageError> {
+        let map = messages::StrictMap::new("SET_OBSERVATION", value, &[0])?;
+        Ok(Self {
+            mask: map.required_u64(0)?,
+        })
     }
 }

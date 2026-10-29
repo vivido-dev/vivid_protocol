@@ -1,12 +1,110 @@
-//! Framing, deterministic control-message codecs, and media record layouts for the Vivid terminal
-//! media protocol.
+//! The wire model of Vivid Protocol 1.5: framing, control codecs, and media layouts.
 //!
-//! This crate is transport- and renderer-independent. Producers and presenters share it to keep
-//! the Vivid version, numeric registries, validation limits, and binary layouts synchronized.
+//! Vivid carries surfaces, scenes, and media from a *producer*, such as a program running in a
+//! terminal, to a *presenter*, such as the terminal emulator, over authenticated local
+//! connections. This crate is transport- and renderer-independent. Producers, presenters,
+//! gateways, and browser bindings share it so they agree on the protocol version, the numeric
+//! registries, every validation limit, and every binary layout. The normative specification is
+//! `vivid-protocol-1.5-spec.md` in this crate's repository.
 //!
 //! Binary-layout codecs report [`CodecError`]; control-message codecs report
 //! [`messages::MessageError`]. Both convert into [`std::io::Error`] for callers that use `?` in
 //! I/O code.
+//!
+//! # Modules
+//!
+//! - **Connections:** [`wire`] framing and transport, `discovery` of endpoints, and [`cbor`].
+//! - **Sessions:** [`messages`] control records, [`auth`] proofs and keys, [`lease`], [`context`],
+//!   [`resource`] contracts, and the [`registry`] of numeric assignments.
+//! - **Presentation:** [`target`], [`surface`], [`scene`], [`geometry`], and terminal [`anchor`]s.
+//! - **Media:** [`track`], [`media`] record layouts, [`timed`] playback, [`audio_input`], and
+//!   [`vector`] display lists.
+//! - **Input and files:** desktop [`input`], presenter [`grant`]s, [`hid`] usages, and
+//!   [`file_drop`].
+//! - **Overlays:** [`overlay`] windows and their [`overlay::wire`] records.
+//! - **Bookkeeping:** [`identity`], [`revision`], [`idempotency`], [`observation`], [`time`],
+//!   `trace`, and [`web`] carrier limits.
+//!
+//! `wire::Connection`, `discovery`, and `trace` need the default `native` feature or
+//! `native-transport`; everything else, including wasm32 builds, works without them.
+//!
+//! # Quick start
+//!
+//! A producer opens a control connection, which writes the preface, and sends a root-authenticated
+//! `HELLO`. A presenter checks the preface, the first record, and the proof before allocating
+//! anything for the session. Here both sides share an in-memory buffer instead of a socket:
+//!
+//! ```
+//! use std::io::{self, Write};
+//! use std::sync::{Arc, Mutex};
+//!
+//! use vivid_protocol::auth::{self, Secret32};
+//! use vivid_protocol::messages::{self, Hello, HelloAuthentication};
+//! use vivid_protocol::registry;
+//! use vivid_protocol::wire::{
+//!     self, Connection, ConnectionKind, HEADER_SIZE, PREFACE_SIZE, RecordHeader,
+//! };
+//!
+//! /// Bytes the producer wrote, for the presenter half of the example to read.
+//! #[derive(Clone, Default)]
+//! struct Buffer(Arc<Mutex<Vec<u8>>>);
+//!
+//! impl Write for Buffer {
+//!     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+//!         self.0.lock().unwrap().extend_from_slice(bytes);
+//!         Ok(bytes.len())
+//!     }
+//!     fn flush(&mut self) -> io::Result<()> {
+//!         Ok(())
+//!     }
+//! }
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let root_secret = Secret32::new([7; 32]);
+//!
+//! // Producer: the proof covers the exact preface the connection writes.
+//! let buffer = Buffer::default();
+//! let kind = ConnectionKind::Control;
+//! let connection = Connection::from_streams(io::empty(), buffer.clone(), kind)?;
+//! let preface = wire::encode_preface(kind, vivid_protocol::CONTROL_MAX_RECORD_BODY);
+//! let mut hello = Hello {
+//!     producer_name: "example".into(),
+//!     producer_version: "1.0".into(),
+//!     required_profiles: vec![registry::TERMINAL_SURFACE.into(), registry::CORE_CONTROL.into()],
+//!     optional_profiles: vec![],
+//!     maximum_control_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+//!     client_nonce: [1; 32],
+//!     authentication: HelloAuthentication::Root { proof: [0; 32] },
+//!     target_profile: registry::TERMINAL_SURFACE.into(),
+//!     extensions: vec![],
+//! };
+//! hello.authenticate_root(&root_secret, &preface)?;
+//! connection.writer().write_record(messages::HELLO, 0, 0, &hello.encode(1)?)?;
+//!
+//! // Presenter: validate the preface and first record, then the proof.
+//! let bytes = buffer.0.lock().unwrap().clone();
+//! let (preface_bytes, records) = bytes.split_at(PREFACE_SIZE);
+//! let preface_bytes: [u8; PREFACE_SIZE] = preface_bytes.try_into()?;
+//! let accepted = wire::accept_preface(preface_bytes, &mut io::sink())?;
+//! let header = RecordHeader::decode(records[..HEADER_SIZE].try_into()?);
+//! accepted.kind.validate_first_record(&header)?;
+//! let (_request_id, received) = Hello::decode(&records[HEADER_SIZE..])?;
+//! let HelloAuthentication::Root { proof } = &received.authentication else {
+//!     return Err("expected root authentication".into());
+//! };
+//! assert!(auth::verify_root_hello_proof(
+//!     &root_secret,
+//!     &preface_bytes,
+//!     &received.authless_payload()?,
+//!     proof,
+//! ));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A real producer then reads `WELCOME`, verifies its confirmation with [`auth`], and creates
+//! surfaces, tracks, and scene nodes with the records in [`messages`], [`surface`], [`track`], and
+//! [`scene`].
 
 #![forbid(unsafe_code)]
 

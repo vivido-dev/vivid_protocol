@@ -1,22 +1,38 @@
-//! Negotiated synchronized timed playback. Positions are clock observations, never ingress ACKs.
+//! Timed playback records: `PLAY`, keyframe requests, and presentation holds (media §13 and §15).
+//!
+//! [`PlayOptions`] decodes the playback fields of `PLAY`, and [`NeedKeyframe`] is the presenter's
+//! recovery request. Under `timed-media-sync-v1`, a [`PlaybackHold`] tells the producer that
+//! playback is frozen and why; its [`HeldPosition`] is a clock observation, never inferred from
+//! media that arrived.
 use crate::{
     cbor::Value,
     messages::{MessageError, PayloadMap, StrictMap, invalid_value},
     track::TrackAddress,
 };
 
+/// `NEED_KEYFRAME` reason 6: presentation resumed with decoder replacement.
 pub const PRESENTATION_RESUMED: u64 = 6;
+/// Hold reason bit 0: no eligible node is visible.
 pub const HOLD_NOT_VISIBLE: u64 = 1;
+/// Hold reason bit 1: the track's channel is detached.
 pub const HOLD_DETACHED: u64 = 2;
+/// Hold reason bit 2: a downstream hop is replacing its decoders.
 pub const HOLD_DOWNSTREAM: u64 = 4;
+/// Hold reason bit 3: presenter policy holds playback.
 pub const HOLD_POLICY: u64 = 8;
 
+/// A `NEED_KEYFRAME` request from the presenter (media §13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NeedKeyframe {
+    /// The track and channel generation (keys 0 through 3).
     pub address: TrackAddress,
+    /// Lowest epoch the presenter accepts (key 4).
     pub minimum_epoch: u32,
+    /// Why a keyframe is needed, such as [`PRESENTATION_RESUMED`] (key 5).
     pub reason: u64,
+    /// Signed resume PTS, for reason 6 only (key 7).
     pub presentation_pts_us: Option<i64>,
+    /// Nonzero hold serial; required for reason 6 and forbidden otherwise (key 8).
     pub hold_serial: Option<u64>,
 }
 
@@ -76,19 +92,27 @@ impl NeedKeyframe {
     }
 }
 
+/// When timed playback starts after `PLAY` (key 9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum StartPolicy {
+    /// Once the minimum buffer is ready (`1`).
     #[default]
     AfterMinimumBuffer,
+    /// Once every active track of the group is ready, `timed-media-sync-v1` (`2`).
     Synchronized,
 }
 
+/// The playback fields of a `PLAY` request (media §15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayOptions {
+    /// Exact start PTS (key 3).
     pub start_pts_us: i64,
+    /// Minimum buffer in microseconds (key 4).
     pub minimum_buffer_us: u64,
+    /// Maximum latency in microseconds (key 5).
     pub maximum_latency_us: u64,
+    /// Start policy (key 9).
     pub start_policy: StartPolicy,
     /// Correlates a resume with the current surface hold; absent for ordinary starts/seeks.
     pub hold_serial: Option<u64>,
@@ -198,22 +222,36 @@ impl PlayOptions {
 /// The clock identity qualifies the PTS across independent audio and video epochs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeldPosition {
+    /// Nonzero clock track ID (key 0).
     pub track_id: u64,
+    /// Nonzero channel generation (key 1).
     pub channel_generation: u64,
+    /// Media epoch (key 2).
     pub epoch: u32,
+    /// Signed frozen PTS in microseconds (key 3).
     pub pts_us: i64,
+    /// Whether the position is the last validated observation rather than a fresh one (key 4).
     pub estimated: bool,
 }
 
+/// A `PLAYBACK_HOLD` event (media §15.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaybackHold {
+    /// Owning context (key 0).
     pub context_id: u64,
+    /// The surface; also the record object ID (key 1).
     pub surface_id: u64,
+    /// Nonzero transition serial that increases for the surface (key 2).
     pub serial: u64,
+    /// Whether playback is held (key 3).
     pub held: bool,
+    /// Hold reason bits, such as [`HOLD_NOT_VISIBLE`] (key 4).
     pub reasons: u64,
+    /// The producer's play intent, independent of the hold (key 5).
     pub playing_intent: bool,
+    /// Whether resuming needs decoder recovery (key 6).
     pub recovery_required: bool,
+    /// Frozen position, absent while unknown (key 7).
     pub position: Option<HeldPosition>,
 }
 

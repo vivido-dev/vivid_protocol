@@ -7,7 +7,7 @@ use vivid_protocol::{
     messages::{
         self, ErrorDetail, ErrorReply, Hello, HelloAuthentication, Welcome, WelcomeAuthentication,
     },
-    registry::{self, CORE_CONTROL, DESKTOP_SURFACE},
+    registry::{CORE_CONTROL, DESKTOP_SURFACE},
     resource::ResourceContract,
 };
 
@@ -98,7 +98,7 @@ fn error_detail_checks_constructor_and_mutated_public_fields() {
             fatal: false,
             diagnostic: String::new(),
         };
-        assert_eq!(reply.encode().is_ok(), registry::error::is_registered(code));
+        assert_eq!(reply.encode().is_ok(), messages::is_registered_error(code));
         let body = messages::encode_payload(
             1,
             vec![
@@ -112,7 +112,7 @@ fn error_detail_checks_constructor_and_mutated_public_fields() {
         .unwrap();
         assert_eq!(
             messages::parse_error_reply(&body).is_ok(),
-            registry::error::is_registered(code)
+            messages::is_registered_error(code)
         );
     }
 }

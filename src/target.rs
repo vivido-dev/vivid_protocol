@@ -14,12 +14,19 @@ use crate::{
 
 /// Reason bits on `TARGET_CHANGED`, desktop §1.
 pub mod reason {
+    /// `TARGET_CHANGED` reason bit 0: the virtual-desktop bounds changed.
     pub const VIRTUAL_BOUNDS: u64 = 1 << 0;
+    /// Reason bit 1: an output was added or removed.
     pub const OUTPUT_SET: u64 = 1 << 1;
+    /// Reason bit 2: an output's geometry changed.
     pub const OUTPUT_GEOMETRY: u64 = 1 << 2;
+    /// Reason bit 3: an output's scale or rotation changed.
     pub const SCALE_OR_ROTATION: u64 = 1 << 3;
+    /// Reason bit 4: the presentation window changed.
     pub const PRESENTATION_WINDOW: u64 = 1 << 4;
+    /// Reason bit 5: the target was recreated.
     pub const TARGET_RECREATION: u64 = 1 << 5;
+    /// Every assigned reason bit.
     pub const KNOWN_MASK: u64 = (1 << 6) - 1;
 }
 
@@ -30,18 +37,28 @@ pub mod reason {
 /// topology, which is why this type has no room for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputDescriptor {
+    /// Session-local output ID; never a device identity (key 0).
     pub output_id: u64,
+    /// Origin X in virtual logical pixels (key 1).
     pub origin_x: i32,
+    /// Origin Y in virtual logical pixels (key 2).
     pub origin_y: i32,
+    /// Logical width (key 3).
     pub width: u32,
+    /// Logical height (key 4).
     pub height: u32,
+    /// Scale numerator (key 5).
     pub scale_numerator: u32,
+    /// Scale denominator (key 6).
     pub scale_denominator: u32,
+    /// Clockwise rotation (key 7).
     pub rotation: Rotation,
+    /// Whether this is the primary output (key 8).
     pub primary: bool,
 }
 
 impl OutputDescriptor {
+    /// Encodes the output as its descriptor map.
     pub fn encode(&self) -> Value {
         Value::Map(vec![
             (0, Value::Unsigned(self.output_id)),
@@ -108,21 +125,29 @@ impl OutputDescriptor {
 /// The `desktop-surface-v1` target descriptor, desktop §1 keys 0 through 6.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopTarget {
+    /// Virtual-desktop origin X in logical pixels (key 0).
     pub origin_x: i32,
+    /// Virtual-desktop origin Y in logical pixels (key 1).
     pub origin_y: i32,
+    /// Virtual-desktop width in logical pixels (key 2).
     pub width: u32,
+    /// Virtual-desktop height in logical pixels (key 3).
     pub height: u32,
+    /// Output descriptors; exactly one is primary when the list is nonempty (key 4).
     pub outputs: Vec<OutputDescriptor>,
     /// False while a resize or reconfiguration is still in flight.
     pub settled: bool,
+    /// Topology revision (key 6).
     pub topology_revision: u64,
 }
 
 impl DesktopTarget {
+    /// Returns the virtual-desktop size.
     pub fn extent(&self) -> TargetExtent {
         TargetExtent::new(self.width, self.height)
     }
 
+    /// Encodes the descriptor as its `WELCOME` key 5 map.
     pub fn encode(&self) -> PayloadMap {
         vec![
             (0, Value::from(i64::from(self.origin_x))),
@@ -174,9 +199,11 @@ impl DesktopTarget {
         Ok(target)
     }
 
-    /// Desktop §1's structural rules: nonzero virtual extent, exactly one primary output when the
-    /// list is nonempty, unique output IDs, and every output inside the virtual rectangle after
-    /// checked transform arithmetic.
+    /// Checks desktop §1's structural rules.
+    ///
+    /// The virtual extent is nonzero, exactly one output is primary when the list is nonempty,
+    /// output IDs are unique, and every output lies inside the virtual rectangle after checked
+    /// transform arithmetic.
     ///
     /// # Errors
     ///
@@ -237,6 +264,7 @@ impl DesktopTarget {
         Ok(())
     }
 
+    /// Returns the primary output, if there is one.
     pub fn primary(&self) -> Option<&OutputDescriptor> {
         self.outputs.iter().find(|output| output.primary)
     }
@@ -293,10 +321,15 @@ pub enum TargetTransition {
     /// Only the settled flag flipped from false to true. Core §2.2 is explicit that this repeats
     /// the current generation exactly rather than advancing it, so a producer can distinguish
     /// "the resize finished" from "the target moved again".
-    Settled { generation: TargetGeneration },
+    Settled {
+        /// The target generation producers now hold.
+        generation: TargetGeneration,
+    },
     /// A real change: the generation advances and the reason mask says what moved.
     Advanced {
+        /// The target generation producers now hold.
         generation: TargetGeneration,
+        /// `TARGET_CHANGED` reason bits, such as [`reason::OUTPUT_SET`].
         reason: u64,
     },
 }
@@ -322,10 +355,12 @@ impl DesktopTargetState {
         })
     }
 
+    /// Returns the current descriptor.
     pub fn current(&self) -> &DesktopTarget {
         &self.current
     }
 
+    /// Returns the current target generation.
     pub fn generation(&self) -> TargetGeneration {
         self.generation
     }
@@ -370,233 +405,4 @@ fn required_i32(map: &StrictMap<'_>, key: u64) -> Result<i32, MessageError> {
         .as_i64()
         .and_then(|value| i32::try_from(value).ok())
         .ok_or_else(|| invalid_value("desktop target", key, "must fit in a signed 32-bit integer"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn output(id: u64, origin_x: i32, width: u32, primary: bool) -> OutputDescriptor {
-        OutputDescriptor {
-            output_id: id,
-            origin_x,
-            origin_y: 0,
-            width,
-            height: 1080,
-            scale_numerator: 1,
-            scale_denominator: 1,
-            rotation: Rotation::None,
-            primary,
-        }
-    }
-
-    fn single() -> DesktopTarget {
-        DesktopTarget {
-            origin_x: 0,
-            origin_y: 0,
-            width: 1920,
-            height: 1080,
-            outputs: vec![output(1, 0, 1920, true)],
-            settled: true,
-            topology_revision: 1,
-        }
-    }
-
-    fn dual() -> DesktopTarget {
-        DesktopTarget {
-            width: 3840,
-            outputs: vec![output(1, 0, 1920, true), output(2, 1920, 1920, false)],
-            ..single()
-        }
-    }
-
-    #[test]
-    fn descriptor_round_trips() {
-        for target in [single(), dual()] {
-            assert_eq!(DesktopTarget::decode(&target.encode()).unwrap(), target);
-        }
-    }
-
-    #[test]
-    fn a_descriptor_carries_no_device_identity() {
-        // Desktop §1 forbids serials, user names, desktop names, window titles, and login-session
-        // identifiers. The encoding is all integers and one boolean, so there is nowhere to put
-        // them — assert that structurally rather than by scanning strings.
-        for (_, value) in dual().encode() {
-            let leaves = match value {
-                Value::Array(entries) => entries,
-                other => vec![other],
-            };
-            for leaf in leaves {
-                match leaf {
-                    Value::Map(entries) => assert!(
-                        entries
-                            .iter()
-                            .all(|(_, item)| !matches!(item, Value::Text(_) | Value::Bytes(_))),
-                        "an output descriptor carried free-form data"
-                    ),
-                    Value::Text(_) | Value::Bytes(_) => panic!("target descriptor carried text"),
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn outputs_must_lie_inside_the_virtual_rectangle() {
-        let mut target = single();
-        target.outputs[0].width = 2560;
-        assert!(target.validate().is_err());
-    }
-
-    #[test]
-    fn exactly_one_output_is_primary() {
-        let mut none_primary = dual();
-        none_primary.outputs[0].primary = false;
-        assert!(none_primary.validate().is_err());
-
-        let mut both_primary = dual();
-        both_primary.outputs[1].primary = true;
-        assert!(both_primary.validate().is_err());
-    }
-
-    #[test]
-    fn output_ids_are_unique_and_extents_are_nonzero() {
-        let mut duplicate = dual();
-        duplicate.outputs[1].output_id = 1;
-        assert!(duplicate.validate().is_err());
-
-        let mut empty = single();
-        empty.outputs[0].width = 0;
-        DesktopTarget::decode(&empty.encode()).unwrap_err();
-
-        let mut zero_scale = single();
-        zero_scale.outputs[0].scale_denominator = 0;
-        DesktopTarget::decode(&zero_scale.encode()).unwrap_err();
-    }
-
-    #[test]
-    fn an_empty_topology_is_allowed() {
-        let headless = DesktopTarget {
-            outputs: Vec::new(),
-            ..single()
-        };
-        headless.validate().unwrap();
-    }
-
-    #[test]
-    fn settling_repeats_the_generation_exactly() {
-        let unsettled = DesktopTarget {
-            settled: false,
-            ..single()
-        };
-        let mut state = DesktopTargetState::new(unsettled).unwrap();
-        assert_eq!(state.generation(), TargetGeneration::ONE);
-
-        // Core §2.2: the final unsettled-to-settled transition of an otherwise byte-identical
-        // descriptor repeats the current generation rather than advancing it.
-        let transition = state.offer(single()).unwrap();
-        assert_eq!(
-            transition,
-            TargetTransition::Settled {
-                generation: TargetGeneration::ONE
-            }
-        );
-        assert_eq!(state.generation(), TargetGeneration::ONE);
-    }
-
-    #[test]
-    fn settling_together_with_a_real_change_still_advances() {
-        let unsettled = DesktopTarget {
-            settled: false,
-            ..single()
-        };
-        let mut state = DesktopTargetState::new(unsettled).unwrap();
-        let grown = DesktopTarget {
-            settled: true,
-            ..dual()
-        };
-        let transition = state.offer(grown).unwrap();
-        match transition {
-            TargetTransition::Advanced { generation, reason } => {
-                assert_eq!(generation.get(), 2);
-                assert!(reason & reason::VIRTUAL_BOUNDS != 0);
-                assert!(reason & reason::OUTPUT_SET != 0);
-            }
-            other => panic!("expected an advance, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_identical_descriptor_owes_nothing() {
-        let mut state = DesktopTargetState::new(single()).unwrap();
-        assert_eq!(state.offer(single()).unwrap(), TargetTransition::Unchanged);
-        assert_eq!(state.generation(), TargetGeneration::ONE);
-    }
-
-    #[test]
-    fn scale_and_rotation_changes_are_reported_separately_from_geometry() {
-        let mut state = DesktopTargetState::new(single()).unwrap();
-        let scaled = DesktopTarget {
-            outputs: vec![OutputDescriptor {
-                scale_numerator: 3,
-                scale_denominator: 2,
-                ..output(1, 0, 1920, true)
-            }],
-            ..single()
-        };
-        match state.offer(scaled).unwrap() {
-            TargetTransition::Advanced { reason, .. } => {
-                assert_eq!(
-                    reason & reason::SCALE_OR_ROTATION,
-                    reason::SCALE_OR_ROTATION
-                );
-                assert_eq!(reason & reason::OUTPUT_GEOMETRY, 0);
-                assert_eq!(reason & reason::VIRTUAL_BOUNDS, 0);
-            }
-            other => panic!("expected an advance, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_rotated_output_reports_scale_or_rotation() {
-        let mut state = DesktopTargetState::new(single()).unwrap();
-        let rotated = DesktopTarget {
-            outputs: vec![OutputDescriptor {
-                rotation: Rotation::Ninety,
-                ..output(1, 0, 1920, true)
-            }],
-            ..single()
-        };
-        match state.offer(rotated).unwrap() {
-            TargetTransition::Advanced { reason, .. } => {
-                assert!(reason & reason::SCALE_OR_ROTATION != 0);
-            }
-            other => panic!("expected an advance, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_invalid_offer_leaves_the_state_untouched() {
-        let mut state = DesktopTargetState::new(single()).unwrap();
-        let mut broken = dual();
-        broken.outputs[1].primary = true;
-        state.offer(broken).unwrap_err();
-        assert_eq!(state.current(), &single());
-        assert_eq!(state.generation(), TargetGeneration::ONE);
-    }
-
-    #[test]
-    fn the_extent_feeds_normalized_projection() {
-        let state = DesktopTargetState::new(dual()).unwrap();
-        assert_eq!(state.current().extent(), TargetExtent::new(3840, 1080));
-        assert_eq!(state.current().primary().unwrap().output_id, 1);
-    }
-
-    #[test]
-    fn decoding_rejects_unknown_keys() {
-        let mut map = single().encode();
-        map.push((7, Value::Unsigned(0)));
-        DesktopTarget::decode(&map).unwrap_err();
-    }
 }

@@ -1,59 +1,107 @@
-//! Finite resource contracts and channel-local absolute flow accounting.
+//! Finite resource contracts, reservations, and flow accounting (security §4 and §5).
+//!
+//! A [`ResourceContract`] bounds every [`Resource`] a context may use; zero denies it, and there is
+//! no unlimited value. A [`ReservationLedger`] reserves contracts against a fixed capacity and
+//! releases them. [`ChannelFlow`] enforces a channel's absolute byte and record allowance, and
+//! [`TokenBucket`] enforces a sustained rate.
 
 use std::{fmt, time::Duration};
 
 use crate::cbor::Value;
 
+/// Number of entries in a resource contract.
 pub const RESOURCE_COUNT: usize = 33;
 
+/// One entry of a resource contract; the discriminant is its contract key (security §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 #[non_exhaustive]
 pub enum Resource {
+    /// Maximum surfaces (key 0).
     Surfaces = 0,
+    /// Maximum tracks, aggregate (key 1).
     Tracks = 1,
+    /// Maximum nodes (key 2).
     Nodes = 2,
+    /// Maximum video tracks (key 3).
     VideoTracks = 3,
+    /// Maximum audio tracks (key 4).
     AudioTracks = 4,
+    /// Maximum raster tracks (key 5).
     RasterTracks = 5,
+    /// Maximum encoded-image tracks (key 6).
     ImageTracks = 6,
+    /// Maximum decoder instances (key 7).
     DecoderInstances = 7,
+    /// Maximum coded pixels per video/raster track (key 8).
     CodedPixelsPerTrack = 8,
+    /// Maximum reserved decoded pixels per second (key 9).
     DecodedPixelsPerSecond = 9,
+    /// Maximum reserved encoded bits per second (key 10).
     EncodedBitsPerSecond = 10,
+    /// Maximum reserved media records per second (key 11).
     MediaRecordsPerSecond = 11,
+    /// Maximum audio sample rate per track (key 12).
     AudioSampleRate = 12,
+    /// Maximum audio channels per track (key 13).
     AudioChannelsPerTrack = 13,
+    /// Maximum aggregate in-flight media body bytes (key 14).
     InflightMediaBytes = 14,
+    /// Maximum concurrent track connections (key 15).
     TrackConnections = 15,
+    /// Maximum retained decoded/poster pixels (key 16).
     RetainedPixels = 16,
+    /// Maximum media-record body (key 17).
     MediaRecordBody = 17,
+    /// Maximum control-record body (key 18).
     ControlRecordBody = 18,
+    /// Maximum pending correlated requests (key 19).
     PendingRequests = 19,
+    /// Maximum registered waits (key 20).
     RegisteredWaits = 20,
+    /// Maximum idempotency entries (key 21).
     IdempotencyEntries = 21,
+    /// Maximum child session leases (key 22).
     ChildSessionLeases = 22,
+    /// Maximum disconnect grace in microseconds (key 23).
     DisconnectGraceUs = 23,
+    /// Maximum input events per second (key 24).
     InputEventsPerSecond = 24,
+    /// Maximum observation-queue entries (key 25).
     ObservationQueueEntries = 25,
+    /// Maximum encoded-image cache bytes (key 26).
     ImageCacheBytes = 26,
+    /// Maximum open scene transactions (key 27).
     OpenSceneTransactions = 27,
+    /// Maximum child contexts (key 28).
     ChildContexts = 28,
+    /// Maximum suspended child sessions (key 29).
     SuspendedChildSessions = 29,
+    /// Maximum pending channel-open attempts (key 30).
     PendingChannelOpenAttempts = 30,
+    /// Maximum active terminal anchors (key 31).
     ActiveTerminalAnchors = 31,
+    /// Maximum seen terminal anchor IDs (key 32).
     SeenTerminalAnchorIds = 32,
 }
 
+/// A resource contract or accounting rule a value broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResourceError {
+    /// The contract is not a CBOR map.
     NotAMap,
+    /// The contract omits this key.
     MissingKey(u64),
+    /// The contract has a key that is not assigned.
     UnknownKey(u64),
+    /// The value at this key is not an unsigned integer.
     InvalidValue(u64),
+    /// Checked arithmetic overflowed.
     Overflow,
+    /// The request exceeds what the contract still allows for this resource.
     ExceedsContract(Resource),
+    /// Traffic exceeds the channel's absolute allowance.
     FlowControl,
 }
 
@@ -83,28 +131,34 @@ impl fmt::Display for ResourceError {
 
 impl std::error::Error for ResourceError {}
 
+/// Finite limits on every resource a context may use; zero denies that resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceContract {
     values: [u64; RESOURCE_COUNT],
 }
 
 impl ResourceContract {
+    /// Creates a contract from all values in key order.
     pub const fn new(values: [u64; RESOURCE_COUNT]) -> Self {
         Self { values }
     }
 
+    /// Returns a contract that denies every resource.
     pub const fn denied() -> Self {
         Self::new([0; RESOURCE_COUNT])
     }
 
+    /// Returns the limit for `resource`.
     pub const fn get(&self, resource: Resource) -> u64 {
         self.values[resource as usize]
     }
 
+    /// Sets the limit for `resource`.
     pub fn set(&mut self, resource: Resource, value: u64) {
         self.values[resource as usize] = value;
     }
 
+    /// Returns the smaller of each pair of limits.
     #[must_use]
     pub fn component_min(&self, other: &Self) -> Self {
         let mut values = [0; RESOURCE_COUNT];
@@ -114,6 +168,7 @@ impl ResourceContract {
         Self::new(values)
     }
 
+    /// Encodes the contract as its CBOR map, with every key present.
     pub fn to_value(&self) -> Value {
         Value::Map(
             self.values
@@ -152,6 +207,7 @@ impl ResourceContract {
     }
 }
 
+/// Static reservations made against a fixed capacity.
 #[derive(Debug, Clone)]
 pub struct ReservationLedger {
     capacity: ResourceContract,
@@ -159,6 +215,7 @@ pub struct ReservationLedger {
 }
 
 impl ReservationLedger {
+    /// Creates a ledger with nothing reserved.
     pub fn new(capacity: ResourceContract) -> Self {
         Self {
             capacity,
@@ -166,6 +223,7 @@ impl ReservationLedger {
         }
     }
 
+    /// Returns what remains of each resource.
     pub fn available(&self) -> ResourceContract {
         let mut values = [0; RESOURCE_COUNT];
         for (index, value) in values.iter_mut().enumerate() {
@@ -216,15 +274,21 @@ impl ReservationLedger {
     }
 }
 
+/// Absolute, cumulative flow accounting for one channel generation (media §6).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChannelFlow {
+    /// Media body bytes sent so far.
     pub sent_body_bytes: u64,
+    /// Media records sent so far.
     pub sent_media_records: u64,
+    /// Cumulative body bytes the receiver allows.
     pub maximum_body_bytes: u64,
+    /// Cumulative media records the receiver allows.
     pub maximum_media_records: u64,
 }
 
 impl ChannelFlow {
+    /// Creates accounting with nothing sent and the given initial allowance.
     pub fn new(maximum_body_bytes: u64, maximum_media_records: u64) -> Self {
         Self {
             maximum_body_bytes,
@@ -256,12 +320,14 @@ impl ChannelFlow {
         Ok(())
     }
 
+    /// Raises the allowance; lower values, such as reordered updates, are ignored.
     pub fn raise_maxima(&mut self, body_bytes: u64, records: u64) {
         self.maximum_body_bytes = self.maximum_body_bytes.max(body_bytes);
         self.maximum_media_records = self.maximum_media_records.max(records);
     }
 }
 
+/// Enforces a sustained per-second rate with a burst of one second.
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     rate_per_second: u64,
@@ -271,6 +337,7 @@ pub struct TokenBucket {
 }
 
 impl TokenBucket {
+    /// Creates a full bucket for `rate_per_second`, holding at least one `maximum_record_charge`.
     pub fn new(rate_per_second: u64, maximum_record_charge: u64) -> Self {
         let capacity = rate_per_second.max(maximum_record_charge);
         Self {
@@ -353,63 +420,5 @@ impl TokenBucket {
                 Resource::MediaRecordsPerSecond,
             ))?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_token_bucket_reports_the_exact_wait_for_a_charge_it_cannot_yet_admit() {
-        let mut bucket = TokenBucket::new(1_000, 1_000);
-        assert_eq!(
-            bucket.time_until(1_000),
-            Ok(None),
-            "a full bucket admits its capacity now"
-        );
-        bucket.charge(1_000).unwrap();
-        // Empty, earning 1000 tokens per second: 250 tokens is a quarter of a second.
-        assert_eq!(bucket.time_until(250), Ok(Some(Duration::from_millis(250))));
-        // Waiting exactly that long must be enough, not one token short.
-        bucket.replenish(Duration::from_millis(250)).unwrap();
-        assert_eq!(bucket.time_until(250), Ok(None));
-        bucket.charge(250).unwrap();
-    }
-
-    #[test]
-    fn a_charge_larger_than_the_bucket_is_refused_rather_than_waited_out() {
-        let bucket = TokenBucket::new(1_000, 1_000);
-        bucket.time_until(1_001).unwrap_err();
-        // A bucket that earns nothing can never admit a charge it does not already hold.
-        let mut idle = TokenBucket::new(0, 10);
-        assert_eq!(idle.time_until(10), Ok(None));
-        idle.charge(10).unwrap();
-        idle.time_until(1).unwrap_err();
-    }
-
-    #[test]
-    fn contract_requires_all_fields() {
-        let value = ResourceContract::denied().to_value();
-        assert_eq!(
-            ResourceContract::from_value(&value).unwrap(),
-            ResourceContract::denied()
-        );
-        assert!(matches!(
-            ResourceContract::from_value(&Value::Map(vec![])),
-            Err(ResourceError::MissingKey(0))
-        ));
-    }
-
-    #[test]
-    fn flow_is_absolute_and_lower_updates_are_ignored() {
-        let mut flow = ChannelFlow::new(10, 2);
-        flow.admit(7).unwrap();
-        assert_eq!(flow.admit(4), Err(ResourceError::FlowControl));
-        flow.raise_maxima(20, 3);
-        flow.admit(4).unwrap();
-        flow.raise_maxima(1, 1);
-        assert_eq!(flow.maximum_body_bytes, 20);
-        assert_eq!(flow.maximum_media_records, 3);
     }
 }

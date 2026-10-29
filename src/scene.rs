@@ -1,4 +1,9 @@
-//! Owner-scoped retained scenes with atomic transactions.
+//! Owner-scoped retained scenes with atomic transactions (core §9).
+//!
+//! A scene is a set of [`SceneNode`]s, each placing one surface on the presentation target. A
+//! producer changes it inside a transaction: [`BeginTxn`], node mutations, then [`CommitTxn`].
+//! [`Scene`] validates the whole transaction before applying any of it, and advances the scene
+//! revision once per commit.
 
 use std::collections::BTreeMap;
 
@@ -11,13 +16,18 @@ use crate::{
     revision::{SceneRevision, TargetGeneration},
 };
 
+/// How a surface fills its node rectangle (node key 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 #[non_exhaustive]
 pub enum Fit {
+    /// Stretch to fill, ignoring aspect ratio.
     Fill = 1,
+    /// Scale to fit inside, preserving aspect ratio.
     Contain = 2,
+    /// Scale to cover, preserving aspect ratio and cropping.
     Cover = 3,
+    /// No scaling.
     None = 4,
 }
 
@@ -35,18 +45,30 @@ impl TryFrom<u64> for Fit {
     }
 }
 
+/// One retained scene node that places a surface (core §9.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneNode {
+    /// Owning context (key 0).
     pub owning_context_id: u64,
+    /// Nonzero node ID within that context (key 1).
     pub node_id: u64,
+    /// Context of the referenced surface (key 2).
     pub surface_context_id: u64,
+    /// The referenced surface (key 3).
     pub surface_id: u64,
+    /// Target-profile geometry (key 4).
     pub geometry: PayloadMap,
+    /// How the surface fills the node (key 5).
     pub fit: Fit,
+    /// Linear (`true`) or nearest sampling (key 6).
     pub linear_sampling: bool,
+    /// Stacking order (key 7).
     pub z_index: i64,
+    /// Whether the node is shown (key 9).
     pub visible: bool,
+    /// Opacity, 0 through 65535 (key 10).
     pub opacity: u16,
+    /// Target-profile clip (key 11).
     pub clip: Option<PayloadMap>,
 }
 
@@ -148,6 +170,7 @@ struct Transaction {
     mutations: Vec<Mutation>,
 }
 
+/// A presenter's retained scene: committed nodes and open transactions (core §9).
 #[derive(Debug)]
 pub struct Scene {
     session: SessionIdentity,
@@ -179,10 +202,12 @@ impl Scene {
         })
     }
 
+    /// Returns the scene revision; it advances on each commit.
     pub const fn revision(&self) -> SceneRevision {
         self.revision
     }
 
+    /// Returns the presentation-target generation the scene was laid out for.
     pub const fn target_generation(&self) -> TargetGeneration {
         self.target_generation
     }
@@ -283,6 +308,7 @@ impl Scene {
         Ok(())
     }
 
+    /// Discards an open transaction, returning whether it existed.
     pub fn abort(&mut self, context_id: u64, transaction_id: u64) -> bool {
         self.transactions
             .remove(&(context_id, transaction_id))
@@ -396,6 +422,7 @@ impl Scene {
         Ok(removed)
     }
 
+    /// Returns the committed node `identity`, if any.
     pub fn node(&self, identity: NodeIdentity) -> Option<&SceneNode> {
         if identity.context.session != self.session {
             return None;
@@ -415,58 +442,96 @@ impl Scene {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::identity::PresenterInstanceId;
+/// The `BEGIN_TXN` payload: open a scene transaction in a context (core §9.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeginTxn {
+    /// The context that owns the transaction's nodes.
+    pub context_id: u64,
+    /// The nonzero transaction ID, also carried in envelope key 1.
+    pub transaction_id: u64,
+}
 
-    fn node(owner: u64, surface_owner: u64) -> SceneNode {
-        SceneNode {
-            owning_context_id: owner,
-            node_id: 7,
-            surface_context_id: surface_owner,
-            surface_id: 9,
-            geometry: vec![],
-            fit: Fit::Contain,
-            linear_sampling: true,
-            z_index: 0,
-            visible: true,
-            opacity: u16::MAX,
-            clip: None,
-        }
+impl BeginTxn {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.transaction_id)),
+        ]
     }
 
-    fn session() -> SessionIdentity {
-        SessionIdentity::new(PresenterInstanceId([1; 16]), 1).unwrap()
+    /// Decodes a `BEGIN_TXN` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `BEGIN_TXN` map or a field is missing
+    /// or not an unsigned integer.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("BEGIN_TXN", value, &[0, 1])?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            transaction_id: map.required_u64(1)?,
+        })
+    }
+}
+
+/// The `DELETE_NODE` payload: remove a node within the envelope's transaction (core §9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteNode {
+    /// The context that owns the node.
+    pub context_id: u64,
+    /// The node to delete.
+    pub node_id: u64,
+}
+
+impl DeleteNode {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.node_id)),
+        ]
     }
 
-    fn node_identity(context_id: u64) -> NodeIdentity {
-        session().context(context_id).unwrap().node(7).unwrap()
+    /// Decodes a `DELETE_NODE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `DELETE_NODE` map or a field is
+    /// missing or not an unsigned integer.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("DELETE_NODE", value, &[0, 1])?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            node_id: map.required_u64(1)?,
+        })
+    }
+}
+
+/// The `COMMIT_TXN` payload; the transaction and expected target generation travel in the
+/// envelope (core §9.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitTxn {
+    /// When the scene becomes active; only next compositor boundary (`0`) is defined.
+    pub presentation_mode: u64,
+}
+
+impl CommitTxn {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![(0, Value::Unsigned(self.presentation_mode))]
     }
 
-    #[test]
-    fn failed_transaction_is_atomic() {
-        let mut scene = Scene::new(session(), TargetGeneration::ONE).unwrap();
-        scene.begin(2, 1).unwrap();
-        scene.create(2, 1, node(2, 2)).unwrap();
-        scene.create(2, 1, node(2, 2)).unwrap();
-        scene.commit(2, 1, TargetGeneration::ONE, None).unwrap_err();
-        assert_eq!(scene.revision(), SceneRevision::ZERO);
-        assert!(scene.node(node_identity(2)).is_none());
-    }
-
-    #[test]
-    fn cleanup_is_scoped_when_numeric_ids_are_reused() {
-        let mut scene = Scene::new(session(), TargetGeneration::ONE).unwrap();
-        for context in [2, 3] {
-            scene.begin(context, 1).unwrap();
-            scene.create(context, 1, node(context, context)).unwrap();
-            scene
-                .commit(context, 1, TargetGeneration::ONE, None)
-                .unwrap();
-        }
-        assert_eq!(scene.remove_surface_references(2, 9).unwrap(), 1);
-        assert!(scene.node(node_identity(2)).is_none());
-        assert!(scene.node(node_identity(3)).is_some());
+    /// Decodes a `COMMIT_TXN` payload; an unsupported mode is for the presenter to report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `COMMIT_TXN` map or the mode is
+    /// missing or not an unsigned integer.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("COMMIT_TXN", value, &[0])?;
+        Ok(Self {
+            presentation_mode: map.required_u64(0)?,
+        })
     }
 }

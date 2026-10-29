@@ -1,4 +1,8 @@
-//! Bounded idempotency-result storage scoped to one logical session.
+//! Bounded idempotency-result storage for one logical session (core §5.2).
+//!
+//! A mutation that carries an envelope idempotency key applies at most once. [`IdempotencyCache`]
+//! reserves the key, stores the reply when the mutation completes, and replays that reply for an
+//! exact retry; reusing a key for a different request is a conflict.
 
 use std::collections::BTreeMap;
 
@@ -17,20 +21,30 @@ struct Entry {
     result: StoredResult,
 }
 
+/// What [`IdempotencyCache::begin`] found for a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeginResult {
+    /// The key is new; apply the request, then complete it.
     Fresh,
+    /// The request already completed; send this stored reply.
     Replay(Vec<u8>),
+    /// The same request is still being applied.
     Pending,
+    /// The request may have applied, but no replayable result exists.
     UnknownOutcome,
+    /// The key was used for a different request.
     ConflictingReuse,
+    /// The cache is full.
     LimitExceeded,
 }
 
+/// Why a result could not be stored for a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CompletionError {
+    /// The key was never reserved.
     NotReserved,
+    /// The key already holds a result.
     AlreadyComplete,
 }
 
@@ -45,6 +59,7 @@ impl std::fmt::Display for CompletionError {
 
 impl std::error::Error for CompletionError {}
 
+/// Bounded results of idempotent mutations, keyed by envelope idempotency key (core §5.2).
 #[derive(Debug)]
 pub struct IdempotencyCache {
     maximum_entries: usize,
@@ -52,6 +67,7 @@ pub struct IdempotencyCache {
 }
 
 impl IdempotencyCache {
+    /// Creates an empty cache holding at most `maximum_entries` keys.
     pub fn new(maximum_entries: usize) -> Self {
         Self {
             maximum_entries,
@@ -59,6 +75,7 @@ impl IdempotencyCache {
         }
     }
 
+    /// Reserves `key` for `complete_request`, or reports what an earlier use left behind.
     pub fn begin(&mut self, key: [u8; 16], complete_request: &[u8]) -> BeginResult {
         let request_hash: [u8; 32] = Sha256::digest(complete_request).into();
         if let Some(entry) = self.entries.get(&key) {
@@ -120,10 +137,12 @@ impl IdempotencyCache {
         Ok(())
     }
 
+    /// Returns how many keys the cache holds.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Returns whether the cache holds no keys.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -131,37 +150,5 @@ impl IdempotencyCache {
     /// Final logical-session cleanup. Suspension intentionally does not call this.
     pub fn clear_on_close(&mut self) {
         self.entries.clear();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exact_retry_replays_without_double_admission() {
-        let mut cache = IdempotencyCache::new(1);
-        assert_eq!(cache.begin([1; 16], b"request"), BeginResult::Fresh);
-        cache.complete([1; 16], b"result".to_vec()).unwrap();
-        assert_eq!(
-            cache.begin([1; 16], b"request"),
-            BeginResult::Replay(b"result".to_vec())
-        );
-        assert_eq!(
-            cache.begin([1; 16], b"different"),
-            BeginResult::ConflictingReuse
-        );
-        assert_eq!(cache.begin([2; 16], b"request"), BeginResult::LimitExceeded);
-    }
-
-    #[test]
-    fn uncertain_pending_result_is_explicit_after_resume() {
-        let mut cache = IdempotencyCache::new(1);
-        assert_eq!(cache.begin([1; 16], b"request"), BeginResult::Fresh);
-        cache.mark_unknown([1; 16]).unwrap();
-        assert_eq!(
-            cache.begin([1; 16], b"request"),
-            BeginResult::UnknownOutcome
-        );
     }
 }

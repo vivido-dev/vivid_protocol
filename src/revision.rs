@@ -70,17 +70,22 @@ impl From<CounterError> for io::Error {
 
 macro_rules! counter_type {
     ($name:ident, $label:literal) => {
+        #[doc = concat!("The ", $label, ", a counter that advances by one and never wraps.")]
         #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(u64);
 
         impl $name {
+            /// Zero, which no live value carries.
             pub const ZERO: Self = Self(0);
+            /// One, the first live value.
             pub const ONE: Self = Self(1);
 
+            /// Wraps a raw wire value.
             pub const fn new(value: u64) -> Self {
                 Self(value)
             }
 
+            /// Returns the raw wire value.
             pub const fn get(self) -> u64 {
                 self.0
             }
@@ -144,31 +149,3 @@ counter_type!(FileDropEpoch, "file-drop epoch");
 counter_type!(FileDropGrantGeneration, "file-drop grant generation");
 counter_type!(FileTransferGeneration, "file-transfer generation");
 counter_type!(MediaEpoch, "media epoch");
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn domains_advance_independently() {
-        assert_eq!(SessionRevision::ONE.advance().unwrap().get(), 2);
-        assert_eq!(SurfaceGeneration::ONE.advance().unwrap().get(), 2);
-        assert_eq!(TrackRevision::ONE.advance().unwrap().get(), 2);
-    }
-
-    #[test]
-    fn exhaustion_and_zero_are_distinct_errors() {
-        let exhausted = ChannelGeneration::new(u64::MAX).advance().unwrap_err();
-        assert!(exhausted.is_exhausted() && !exhausted.is_zero());
-        assert_eq!(exhausted.domain(), "channel generation");
-        assert!(
-            exhausted
-                .to_string()
-                .starts_with("channel generation exhausted")
-        );
-
-        let zero = SurfaceGeneration::ZERO.require_nonzero().unwrap_err();
-        assert!(zero.is_zero() && !zero.is_exhausted());
-        assert_eq!(io::Error::from(zero).kind(), io::ErrorKind::InvalidData);
-    }
-}

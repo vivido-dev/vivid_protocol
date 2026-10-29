@@ -6,7 +6,7 @@ use vivid_protocol::{
     auth::{self, Secret32},
     cbor::Value,
     file_drop::FileTransferOpen,
-    lease::{CleanupPolicy, LeaseMachine},
+    lease::{CleanupPolicy, EstablishmentAttempt, LeaseMachine},
     media::{AudioPacket, VideoPacket},
     messages::{ChannelOpen, LaneClass, LaneOpen, StrictMap, TrackKind, WelcomeAuthentication},
     revision::{FileDropEpoch, FileDropGrantGeneration, FileTransferGeneration, SurfaceGeneration},
@@ -33,16 +33,21 @@ fn assert_redacted(rendered: &str, bytes: &[u8]) {
 
 #[test]
 fn derived_keys_are_opaque() {
-    let prk = auth::extract_handshake_prk(
-        &Secret32::new(secret(1)),
-        &secret(2),
-        &secret(3),
-        &secret(4),
-    );
+    let nonces = auth::HandshakeNonces {
+        client: secret(2),
+        server: secret(3),
+    };
+    let prk = auth::extract_handshake_prk(&Secret32::new(secret(1)), &nonces, &secret(4));
     let (keys, anchor) = auth::derive_session_keys(&prk, 7, 1, &secret(5));
 
     assert_eq!(format!("{prk:?}"), "HandshakePrk([REDACTED])");
     assert_eq!(format!("{keys:?}"), "SessionKeys([REDACTED])");
+    assert_eq!(
+        format!("{:?}", keys.channel_key()),
+        "ChannelKey([REDACTED])"
+    );
+    assert_eq!(format!("{:?}", keys.resume_key()), "ResumeKey([REDACTED])");
+    assert_redacted(&format!("{keys:?}"), keys.channel_key().expose());
     assert_eq!(format!("{anchor:?}"), "AnchorKey([REDACTED])");
     assert_eq!(
         format!("{:?}", AnchorKey::new(secret(6))),
@@ -59,15 +64,15 @@ fn lease_machine_hides_fingerprint_and_attempt() {
     let welcome = secret::<32>(14).to_vec();
     let mut lease = LeaseMachine::new(CleanupPolicy::Immediate, 0);
     lease
-        .begin_activation(
+        .begin_activation(EstablishmentAttempt {
             attempt_id,
             client_nonce,
-            b"hello",
-            fingerprint,
-            9,
+            hello_bytes: b"hello",
+            profile_fingerprint: fingerprint,
+            session_id: 9,
             server_nonce,
-            welcome.clone(),
-        )
+            welcome: welcome.clone(),
+        })
         .unwrap();
 
     let rendered = format!("{lease:?}");

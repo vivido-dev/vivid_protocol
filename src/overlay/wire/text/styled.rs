@@ -1,33 +1,53 @@
-//! Portable styled paragraphs and atomic, optionally retained measurement batches.
+//! Styled paragraphs and batched, optionally retained measurement (`overlay-text-layout-v1`).
+//!
+//! A [`StyledText`] paragraph concatenates [`TextRun`]s, each with its own [`TextStyle`], and may
+//! carry paragraph [`Typography`] under `overlay-typography-v1`. [`MeasureBatch`] measures up to
+//! [`MAX_TEXT_BATCH`] paragraphs atomically; when it asks to retain them, the host keeps each
+//! layout so a scene can draw it without reshaping, until [`ReleaseLayouts`] frees it.
 use super::{
     MAX_MEASURE_TEXT_BYTES, MAX_TEXT_GEOMETRY, MessageError, PayloadMap, Scalar, TextMeasurement,
     Value, WindowAddress, array, bad, boolean, decode_scalar, scalar, small, strict, u,
 };
 use crate::vector::Color;
 
-/// Font family names are bounded everywhere they cross the wire, including in the environment
-/// snapshot a host sends.
+/// Longest font family name, in bytes.
+///
+/// Family names are bounded everywhere they cross the wire, including in the environment snapshot a
+/// host sends.
 pub const MAX_FAMILY_BYTES: usize = 256;
 
+/// Most paragraphs in one batch measurement.
 pub const MAX_TEXT_BATCH: usize = 32;
+/// Most runs in one paragraph, and in one batch in total.
 pub const MAX_TEXT_RUNS: usize = 64;
+/// Most retained text layouts one window may hold.
 pub const MAX_RETAINED_LAYOUTS: usize = 128;
 
+/// What happens to text that does not fit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TextOverflow {
+    /// Clip it (`0`).
     #[default]
     Clip,
+    /// End with an ellipsis at a grapheme boundary (`1`).
     Ellipsis,
 }
 
+/// Paragraph-wide typography controls (`overlay-typography-v1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Typography {
+    /// Clip or ellipsis; ellipsis needs a finite maximum width.
     pub overflow: TextOverflow,
+    /// Extra space between letters, at most 1024 logical pixels.
     pub letter_spacing: Scalar,
+    /// Extra space between words, at most 1024 logical pixels.
     pub word_spacing: Scalar,
+    /// Absolute line height up to 4096 logical pixels, or `None` for font metrics.
     pub line_height: Option<Scalar>,
+    /// Whether optional ligatures (`liga`, `clig`, `dlig`, `calt`) apply.
     pub ligatures: bool,
+    /// Whether kerning (`kern`) applies.
     pub kerning: bool,
 }
 impl Default for Typography {
@@ -93,24 +113,37 @@ impl Typography {
     }
 }
 
+/// How a paragraph's lines align.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TextAlignment {
+    /// Aligned to the paragraph's starting edge (`0`).
     #[default]
     Start,
+    /// Centered (`1`).
     Center,
+    /// Aligned to the paragraph's ending edge (`2`).
     End,
+    /// Stretched to the full width (`3`).
     Justify,
 }
 
+/// The style of one run of styled text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextStyle {
+    /// Positive font size in logical pixels.
     pub size: Scalar,
+    /// Font family of at most 256 bytes; empty selects the host default.
     pub family: String,
+    /// Font weight, 1 through 1000.
     pub weight: u16,
+    /// Uses an italic face.
     pub italic: bool,
+    /// Straight-alpha sRGB color, `0xRRGGBBAA`.
     pub color: Color,
+    /// Draws an underline from the shaped font's metrics.
     pub underline: bool,
+    /// Draws a strikethrough from the shaped font's metrics.
     pub strikethrough: bool,
 }
 impl Default for TextStyle {
@@ -126,23 +159,33 @@ impl Default for TextStyle {
         }
     }
 }
+/// One styled run; runs concatenate into one shaping input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextRun {
+    /// UTF-8 text.
     pub text: String,
+    /// The run's style.
     pub style: TextStyle,
 }
 
+/// One styled paragraph for batch measurement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyledText {
+    /// Paragraph typography; nondefault values need `overlay-typography-v1`.
     pub typography: Typography,
+    /// One to 64 runs.
     pub runs: Vec<TextRun>,
+    /// Positive paragraph width, or `None` for unconstrained.
     pub max_width: Option<Scalar>,
+    /// Line alignment.
     pub alignment: TextAlignment,
+    /// Whether lines soft-wrap; explicit line breaks always apply.
     pub wrap: bool,
     /// Clip after this many complete lines. None preserves all lines.
     pub max_lines: Option<u16>,
 }
 impl StyledText {
+    /// Creates a single-run paragraph that wraps, starts aligned, and has no width limit.
     pub fn new(text: impl Into<String>, style: TextStyle) -> Self {
         Self {
             typography: Typography::default(),
@@ -156,6 +199,7 @@ impl StyledText {
             max_lines: None,
         }
     }
+    /// Returns the runs' text concatenated, the string geometry offsets index into.
     pub fn text(&self) -> String {
         self.runs.iter().map(|run| run.text.as_str()).collect()
     }
@@ -313,10 +357,14 @@ impl StyledText {
     }
 }
 
+/// A `MEASURE_OVERLAY_TEXT_BATCH` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasureBatch {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// One to 32 paragraphs (key 3).
     pub texts: Vec<StyledText>,
+    /// Whether the host retains each measured layout for drawing (key 4).
     pub retain: bool,
 }
 impl MeasureBatch {
@@ -384,9 +432,13 @@ impl MeasureBatch {
     }
 }
 
+/// The `OVERLAY_TEXT_BATCH_MEASURED` reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchMeasured {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// One `(layout ID, measurement)` per paragraph, in request order; IDs are zero unless retained
+    /// (key 3).
     pub layouts: Vec<(u64, TextMeasurement)>,
 }
 impl BatchMeasured {
@@ -454,9 +506,12 @@ impl BatchMeasured {
     }
 }
 
+/// A `RELEASE_OVERLAY_TEXT_LAYOUTS` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseLayouts {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// One to 32 distinct, nonzero layout IDs (key 3).
     pub ids: Vec<u64>,
 }
 impl ReleaseLayouts {
@@ -504,98 +559,5 @@ impl ReleaseLayouts {
         };
         result.payload()?;
         Ok(result)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::vector::{Canvas, Command, Point};
-
-    #[test]
-    fn typography_is_optional_bounded_and_roundtrips_without_changing_legacy_paragraphs() {
-        let mut text = StyledText::new("hello", TextStyle::default());
-        assert_eq!(text.value().unwrap().as_array().unwrap().len(), 5);
-        text.max_width = Some(Scalar::new(100.).unwrap());
-        text.typography = Typography {
-            overflow: TextOverflow::Ellipsis,
-            letter_spacing: Scalar::ONE,
-            word_spacing: Scalar::new(3.).unwrap(),
-            line_height: Some(Scalar::new(24.).unwrap()),
-            ligatures: false,
-            kerning: false,
-        };
-        assert_eq!(StyledText::decode(&text.value().unwrap()).unwrap(), text);
-        text.max_width = None;
-        text.value().unwrap_err();
-        text.max_width = Some(Scalar::ONE);
-        text.typography.letter_spacing = Scalar::new(-1.).unwrap();
-        text.value().unwrap_err();
-        text.typography.letter_spacing = Scalar::ZERO;
-        text.typography.line_height = Some(Scalar::ZERO);
-        text.value().unwrap_err();
-    }
-    #[test]
-    fn batches_roundtrip_and_enforce_aggregate_limits() {
-        let address = WindowAddress {
-            context_id: 1,
-            surface_id: 2,
-            generation: 3,
-        };
-        let text = StyledText::new(
-            "A😀e\u{301}",
-            TextStyle {
-                size: Scalar::new(16.).unwrap(),
-                underline: true,
-                ..Default::default()
-            },
-        );
-        let request = MeasureBatch {
-            address,
-            texts: vec![text.clone(), text.clone()],
-            retain: true,
-        };
-        assert_eq!(
-            MeasureBatch::decode(2, &Value::Map(request.payload().unwrap())).unwrap(),
-            request
-        );
-        MeasureBatch {
-            texts: vec![text.clone(); MAX_TEXT_BATCH + 1],
-            ..request.clone()
-        }
-        .payload()
-        .unwrap_err();
-        let large = StyledText::new("x".repeat(2049), TextStyle::default());
-        MeasureBatch {
-            texts: vec![large.clone(), large],
-            ..request.clone()
-        }
-        .payload()
-        .unwrap_err();
-        let mut invalid = text;
-        invalid.max_lines = Some(0);
-        invalid.value().unwrap_err();
-        let release = ReleaseLayouts {
-            address,
-            ids: vec![u64::MAX, 1],
-        };
-        assert_eq!(
-            ReleaseLayouts::decode(2, &Value::Map(release.payload().unwrap())).unwrap(),
-            release
-        );
-        ReleaseLayouts {
-            ids: vec![1, 1],
-            ..release
-        }
-        .payload()
-        .unwrap_err();
-        let mut canvas = Canvas::new();
-        canvas
-            .push(Command::TextLayout {
-                layout: u64::MAX,
-                origin: Point::new(1., 2.).unwrap(),
-            })
-            .unwrap();
-        assert_eq!(Canvas::decode(&canvas.encode().unwrap()).unwrap(), canvas);
     }
 }

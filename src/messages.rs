@@ -10,78 +10,139 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR,
-    auth::{self, ATTEMPT_ID_BYTES, HandshakePrk, NONCE_BYTES, Secret32},
+    auth::{
+        self, ATTEMPT_ID_BYTES, ChannelKey, HandshakePrk, NONCE_BYTES, ResumeBinding, ResumeKey,
+        Secret32,
+    },
     cbor::{self, Value},
     registry::{self, CORE_CONTROL},
     resource::{ResourceContract, ResourceError},
 };
 
 // Record types are re-exported by name so that each assignment reaches this module
-// deliberately; add new registry::record constants here as well.
+// deliberately; add new registry::record constants here as well. Retired codes stay in the
+// registry, reachable only through `is_retired_record`, so they cannot be sent by name.
+#[doc(inline)]
 pub use crate::registry::record::{
     ABORT_TXN, ACCEPT_FILE_DROP, ACTIVATE_TRACK, ADVANCE_CHANNEL, ADVANCE_FILE_TRANSFER,
-    ANCHOR_GONE, ANCHOR_READY, ANCHOR_STATUS, AUDIO_PACKET, BEGIN_TXN, BLOB_CHUNK, BUFFER_SUBMIT,
-    CANCEL_FILE_DROP, CANCEL_WAIT, CAPS_CHANGED, CHANNEL_ACCEPTED, CHANNEL_ADVANCED, CHANNEL_EOS,
-    CHANNEL_OPEN, COMMIT_TXN, CONTEXT_CHANGED, CONTEXT_READY, CREATE_CONTEXT, CREATE_NODE,
-    CREATE_SESSION_LEASE, CREATE_SURFACE, CREATE_TRACK, DELETE_NODE, DESTROY_SURFACE,
-    DESTROY_TRACK, DRAIN, ERROR, FILE_DATA, FILE_DROP_ACCEPTED, FILE_DROP_BOUND,
-    FILE_DROP_CANCELLED, FILE_DROP_OFFER, FILE_DROP_STATUS, FILE_FINISH, FILE_RESULT,
-    FILE_TRANSFER_ABORT, FILE_TRANSFER_ACCEPTED, FILE_TRANSFER_ADVANCED, FILE_TRANSFER_OPEN, FLUSH,
-    GOODBYE, HELLO, IMAGE_DATA, INPUT_BOUND, INPUT_LEASE_RENEW, INPUT_RESET, INPUT_REVOKED,
-    KEY_INPUT, LANE_ACCEPTED, LANE_OPEN, MAX_CHANNEL_DATA, MAX_FILE_DATA, MEASURE_OVERLAY_TEXT,
-    MEASURE_OVERLAY_TEXT_BATCH, NEED_FULL_FRAME, NEED_KEYFRAME, OBSERVATION_GAP, OK,
-    OVERLAY_ACTION, OVERLAY_ENV_CHANGED, OVERLAY_INPUT_CAPTURE, OVERLAY_INPUT_EVENT,
-    OVERLAY_INPUT_RENEW, OVERLAY_STATUS, OVERLAY_SUBMISSION_OUTCOME, OVERLAY_TEXT_BATCH_MEASURED,
-    OVERLAY_TEXT_MEASURED, OVERLAY_VIEWPORT_CHANGED, OVERLAY_WINDOW_READY, PAUSE, PING, PLAY,
-    PLAYBACK_HOLD, PLAYBACK_STATE, POINTER_AXIS, POINTER_BUTTON, POINTER_MOTION, PONG,
-    PROBE_TRACK_CONFIG, QUERY_ANCHOR, QUERY_FILE_DROP, QUERY_OVERLAY, QUERY_SCENE, QUERY_SESSION,
-    QUERY_SURFACE, QUERY_TRACK, RASTER_FRAME, RELEASE_OVERLAY_TEXT_LAYOUTS, REVOKE_CONTEXT,
-    REVOKE_SESSION_LEASE, SCENE_CHANGED, SCENE_PRESENTED, SCENE_STATUS, SESSION_LEASE_CHANGED,
-    SESSION_LEASE_READY, SESSION_STATUS, SET_AUDIO_GAIN, SET_FILE_DROP_BINDING, SET_INPUT_BINDING,
-    SET_OBSERVATION, SET_OVERLAY_CLIPBOARD, SET_OVERLAY_EDITOR, SET_OVERLAY_SEMANTICS,
-    SET_OVERLAY_WINDOW, SURFACE_CHANGED, SURFACE_READY, SURFACE_STATUS, TARGET_CHANGED,
-    TRACK_ACTIVATED, TRACK_CHANGED, TRACK_LOST, TRACK_READY, TRACK_STATUS, TRACK_SUPPORT,
-    UPDATE_NODE, UPDATE_SURFACE, VECTOR_ASSET, VECTOR_ASSET_RELEASE, VECTOR_FRAME, VIDEO_FRAGMENT,
-    VIDEO_PACKET, WAIT_SATISFIED, WAIT_TRACK, WELCOME,
+    ANCHOR_GONE, ANCHOR_READY, ANCHOR_STATUS, AUDIO_PACKET, BEGIN_TXN, CANCEL_FILE_DROP,
+    CANCEL_WAIT, CAPS_CHANGED, CHANNEL_ACCEPTED, CHANNEL_ADVANCED, CHANNEL_EOS, CHANNEL_OPEN,
+    COMMIT_TXN, CONTEXT_CHANGED, CONTEXT_READY, CREATE_CONTEXT, CREATE_NODE, CREATE_SESSION_LEASE,
+    CREATE_SURFACE, CREATE_TRACK, DELETE_NODE, DESTROY_SURFACE, DESTROY_TRACK, DRAIN, ERROR,
+    FILE_DATA, FILE_DROP_ACCEPTED, FILE_DROP_BOUND, FILE_DROP_CANCELLED, FILE_DROP_OFFER,
+    FILE_DROP_STATUS, FILE_FINISH, FILE_RESULT, FILE_TRANSFER_ABORT, FILE_TRANSFER_ACCEPTED,
+    FILE_TRANSFER_ADVANCED, FILE_TRANSFER_OPEN, FLUSH, GOODBYE, HELLO, IMAGE_DATA, INPUT_BOUND,
+    INPUT_LEASE_RENEW, INPUT_RESET, INPUT_REVOKED, KEY_INPUT, LANE_ACCEPTED, LANE_OPEN,
+    MAX_CHANNEL_DATA, MAX_FILE_DATA, MEASURE_OVERLAY_TEXT, MEASURE_OVERLAY_TEXT_BATCH,
+    NEED_FULL_FRAME, NEED_KEYFRAME, OBSERVATION_GAP, OK, OVERLAY_ACTION, OVERLAY_ENV_CHANGED,
+    OVERLAY_INPUT_CAPTURE, OVERLAY_INPUT_EVENT, OVERLAY_INPUT_RENEW, OVERLAY_STATUS,
+    OVERLAY_SUBMISSION_OUTCOME, OVERLAY_TEXT_BATCH_MEASURED, OVERLAY_TEXT_MEASURED,
+    OVERLAY_VIEWPORT_CHANGED, OVERLAY_WINDOW_READY, PAUSE, PING, PLAY, PLAYBACK_HOLD,
+    PLAYBACK_STATE, POINTER_AXIS, POINTER_BUTTON, POINTER_MOTION, PONG, PROBE_TRACK_CONFIG,
+    QUERY_ANCHOR, QUERY_FILE_DROP, QUERY_OVERLAY, QUERY_SCENE, QUERY_SESSION, QUERY_SURFACE,
+    QUERY_TRACK, RASTER_FRAME, RELEASE_OVERLAY_TEXT_LAYOUTS, REVOKE_CONTEXT, REVOKE_SESSION_LEASE,
+    SCENE_CHANGED, SCENE_PRESENTED, SCENE_STATUS, SESSION_LEASE_CHANGED, SESSION_LEASE_READY,
+    SESSION_STATUS, SET_AUDIO_GAIN, SET_FILE_DROP_BINDING, SET_INPUT_BINDING, SET_OBSERVATION,
+    SET_OVERLAY_CLIPBOARD, SET_OVERLAY_EDITOR, SET_OVERLAY_SEMANTICS, SET_OVERLAY_WINDOW,
+    SURFACE_CHANGED, SURFACE_READY, SURFACE_STATUS, TARGET_CHANGED, TRACK_ACTIVATED, TRACK_CHANGED,
+    TRACK_LOST, TRACK_READY, TRACK_STATUS, TRACK_SUPPORT, UPDATE_NODE, UPDATE_SURFACE,
+    VECTOR_ASSET, VECTOR_ASSET_RELEASE, VECTOR_FRAME, VIDEO_PACKET, WAIT_SATISFIED, WAIT_TRACK,
+    WELCOME,
 };
 
+/// Whether `record_type` is a retired assignment that a 1.5 peer must not send.
+pub const fn is_retired_record(record_type: u16) -> bool {
+    registry::record::is_retired(record_type)
+}
+
+/// Whether `record_type` lies in the range reserved for explicitly negotiated experiments.
+pub const fn is_experimental_record(record_type: u16) -> bool {
+    registry::record::is_experimental(record_type)
+}
+
+/// Whether `record_type` lies in the vendor range, which stays disabled without negotiation.
+pub const fn is_vendor_record(record_type: u16) -> bool {
+    registry::record::is_vendor(record_type)
+}
+
+/// Whether `code` is an `ERROR` code the 1.5 registry assigns.
+pub const fn is_registered_error(code: u64) -> bool {
+    registry::error::is_registered(code)
+}
+
+/// Length of an envelope idempotency key (envelope key 5).
 pub const IDEMPOTENCY_KEY_BYTES: usize = 16;
+/// Length of an envelope causation ID (envelope key 6).
 pub const CAUSATION_ID_BYTES: usize = 16;
+/// Length of the non-secret session tag in `WELCOME` key 1.
 pub const SESSION_TAG_BYTES: usize = 16;
 
+/// `HELLO` authentication kind for root authentication (security §3.1).
 pub const AUTHENTICATION_ROOT: u64 = 0;
+/// `HELLO` authentication kind for first lease activation (security §6.3).
 pub const AUTHENTICATION_LEASE_ACTIVATION: u64 = 1;
+/// `HELLO` authentication kind for resuming a suspended session (security §7.2).
 pub const AUTHENTICATION_RESUME: u64 = 2;
 
+/// `AUTH_FAILED`: Authentication or proof failed.
 pub const ERROR_AUTH_FAILED: u64 = registry::error::AUTH_FAILED;
+/// `UNSUPPORTED_VERSION`: Preface version unsupported.
 pub const ERROR_UNSUPPORTED_VERSION: u64 = registry::error::UNSUPPORTED_VERSION;
+/// `UNSUPPORTED_PROFILE`: Required profile or complete profile behavior unavailable.
 pub const ERROR_UNSUPPORTED_PROFILE: u64 = registry::error::UNSUPPORTED_PROFILE;
+/// `UNSUPPORTED_CONFIG`: Exact surface/track/device configuration unsupported.
 pub const ERROR_UNSUPPORTED_CONFIG: u64 = registry::error::UNSUPPORTED_CONFIG;
+/// `BAD_MESSAGE`: Structurally or semantically invalid message.
 pub const ERROR_BAD_MESSAGE: u64 = registry::error::BAD_MESSAGE;
+/// `BAD_STATE`: Valid message invalid in current state.
 pub const ERROR_BAD_STATE: u64 = registry::error::BAD_STATE;
+/// `DUPLICATE_ID`: Complete scoped identity already live.
 pub const ERROR_DUPLICATE_ID: u64 = registry::error::DUPLICATE_ID;
+/// `NOT_FOUND`: Object absent or outside caller authority.
 pub const ERROR_NOT_FOUND: u64 = registry::error::NOT_FOUND;
+/// `LIMIT_EXCEEDED`: Static count, size, or allocation limit exceeded.
 pub const ERROR_LIMIT_EXCEEDED: u64 = registry::error::LIMIT_EXCEEDED;
+/// `NO_MEMORY`: Bounded allocation failed after admission.
 pub const ERROR_NO_MEMORY: u64 = registry::error::NO_MEMORY;
+/// `FLOW_CONTROL`: Absolute byte/record allowance exceeded.
 pub const ERROR_FLOW_CONTROL: u64 = registry::error::FLOW_CONTROL;
+/// `HASH_MISMATCH`: Declared and computed image hash differ.
 pub const ERROR_HASH_MISMATCH: u64 = registry::error::HASH_MISMATCH;
+/// `NEED_KEYFRAME`: Random-access unit required.
 pub const ERROR_NEED_KEYFRAME: u64 = registry::error::NEED_KEYFRAME;
+/// `STALE_EPOCH`: Media epoch older than accepted epoch.
 pub const ERROR_STALE_EPOCH: u64 = registry::error::STALE_EPOCH;
+/// `STALE_TARGET_GENERATION`: Scene target generation mismatch.
 pub const ERROR_STALE_TARGET_GENERATION: u64 = registry::error::STALE_TARGET_GENERATION;
+/// `ANCHOR_INVALIDATED`: Terminal anchor no longer exists.
 pub const ERROR_ANCHOR_INVALIDATED: u64 = registry::error::ANCHOR_INVALIDATED;
+/// `AUTHORITY_REVOKED`: Context or lease authority ended.
 pub const ERROR_AUTHORITY_REVOKED: u64 = registry::error::AUTHORITY_REVOKED;
+/// `DECODER`: Decoder failed within a track boundary.
 pub const ERROR_DECODER: u64 = registry::error::DECODER;
+/// `DEVICE_LOST`: Required render or audio device lost.
 pub const ERROR_DEVICE_LOST: u64 = registry::error::DEVICE_LOST;
+/// `TIMEOUT`: Bounded deadline elapsed.
 pub const ERROR_TIMEOUT: u64 = registry::error::TIMEOUT;
+/// `PRECONDITION_FAILED`: Typed expected value did not match.
 pub const ERROR_PRECONDITION_FAILED: u64 = registry::error::PRECONDITION_FAILED;
+/// `ALREADY_APPLIED`: Mutation already applied but no replayable secret/result exists.
 pub const ERROR_ALREADY_APPLIED: u64 = registry::error::ALREADY_APPLIED;
+/// `NOT_VISIBLE`: Presentation condition cannot be satisfied at this hop.
 pub const ERROR_NOT_VISIBLE: u64 = registry::error::NOT_VISIBLE;
+/// `CANCELLED`: Pending work cancelled.
 pub const ERROR_CANCELLED: u64 = registry::error::CANCELLED;
+/// `UNKNOWN_OUTCOME`: Resume cannot prove a non-idempotent pre-loss outcome.
 pub const ERROR_UNKNOWN_OUTCOME: u64 = registry::error::UNKNOWN_OUTCOME;
+/// `CHANNEL_BUSY`: Another transport is active for the generation.
 pub const ERROR_CHANNEL_BUSY: u64 = registry::error::CHANNEL_BUSY;
+/// `STALE_CHANNEL_GENERATION`: Open or media record targets an old generation.
 pub const ERROR_STALE_CHANNEL_GENERATION: u64 = registry::error::STALE_CHANNEL_GENERATION;
+/// `LEASE_SUSPENDED`: Mutation is unavailable while logical session is suspended.
 pub const ERROR_LEASE_SUSPENDED: u64 = registry::error::LEASE_SUSPENDED;
+/// `RATE_LIMITED`: Contractual sustained rate exceeded.
 pub const ERROR_RATE_LIMITED: u64 = registry::error::RATE_LIMITED;
+/// `INTEGRITY_FAILED`: Authenticated channel or transcript integrity failed.
 pub const ERROR_INTEGRITY_FAILED: u64 = registry::error::INTEGRITY_FAILED;
 
 /// A control message that does not satisfy its Vivid 1.5 schema.
@@ -96,26 +157,43 @@ pub enum MessageError {
     Encode(cbor::EncodeError),
     /// A resource contract inside the message is invalid.
     Resource(ResourceError),
+    /// The named schema's value is not a CBOR map.
     ExpectedMap(&'static str),
+    /// A required key is absent.
     MissingKey {
+        /// The record or map whose schema failed.
         schema: &'static str,
+        /// The offending key.
         key: u64,
     },
+    /// A key the schema does not define is present.
     UnknownKey {
+        /// The record or map whose schema failed.
         schema: &'static str,
+        /// The offending key.
         key: u64,
     },
+    /// A key holds a value of the wrong CBOR type.
     WrongType {
+        /// The record or map whose schema failed.
         schema: &'static str,
+        /// The offending key.
         key: u64,
     },
+    /// A value has the right type but violates the schema.
     InvalidValue {
+        /// The record or map whose schema failed.
         schema: &'static str,
+        /// The offending key.
         key: u64,
+        /// What the value violates.
         reason: &'static str,
     },
+    /// The record header's object ID differs from the ID the payload names.
     HeaderObjectMismatch {
+        /// Object ID in the record header.
         header: u64,
+        /// Object ID the payload names.
         payload: u64,
     },
 }
@@ -182,20 +260,30 @@ impl From<ResourceError> for MessageError {
     }
 }
 
+/// A CBOR map with integer keys, in strictly increasing key order once encoded.
 pub type PayloadMap = Vec<(u64, Value)>;
 
+/// The deterministic CBOR value every control, lane, and track-control record carries (core §5).
 #[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub struct Envelope {
+    /// Nonzero for a correlated request; zero for an unsolicited event (key 0).
     pub request_id: u64,
+    /// Scene transaction the record belongs to (key 1).
     pub transaction_id: Option<u64>,
+    /// Presentation-target generation the request expects (key 2).
     pub expected_target_generation: Option<u64>,
+    /// The record's own payload (key 3).
     pub payload: PayloadMap,
+    /// Typed preconditions checked before the record applies (key 4).
     pub preconditions: PayloadMap,
+    /// Key that lets a retried mutation replay its first result (key 5).
     pub idempotency_key: Option<[u8; IDEMPOTENCY_KEY_BYTES]>,
+    /// Non-secret ID that ties a record to its cause in traces (key 6).
     pub causation_id: Option<[u8; CAUSATION_ID_BYTES]>,
 }
 
 impl Envelope {
+    /// Creates an envelope with only a request ID and payload.
     pub fn new(request_id: u64, payload: PayloadMap) -> Self {
         Self {
             request_id,
@@ -343,28 +431,45 @@ pub fn empty(request_id: u64) -> Vec<u8> {
     encode_payload(request_id, vec![]).expect("empty payload is valid")
 }
 
+/// Encodes an `OK` reply body for `request_id`.
 pub fn ok(request_id: u64) -> Vec<u8> {
     empty(request_id)
 }
 
+/// The authentication request in `HELLO` key 6.
 #[non_exhaustive]
 pub enum HelloAuthentication {
+    /// Root authentication with a proof over the preface and `HELLO` (security §3.1).
     Root {
+        /// HMAC proof over the preface and the `HELLO` without this field.
         proof: [u8; 32],
     },
+    /// First activation of a session lease (security §6.3).
     LeaseActivation {
+        /// The context that issued the lease.
         context_id: u64,
+        /// The lease being used.
         lease_id: u64,
+        /// The lease's activation secret.
         activation_secret: Secret32,
+        /// Attempt ID that makes a retried establishment recognizable.
         attempt_id: [u8; ATTEMPT_ID_BYTES],
+        /// Proof of possession for the lease's bound key, when it has one.
         proof_of_possession: Option<Vec<u8>>,
     },
+    /// Resumption of a suspended session (security §7.2).
     Resume {
+        /// The context that issued the lease.
         context_id: u64,
+        /// The lease being used.
         lease_id: u64,
+        /// The suspended session.
         session_id: u64,
+        /// The lease's current resume generation.
         resume_generation: u64,
+        /// Attempt ID that makes a retried establishment recognizable.
         attempt_id: [u8; ATTEMPT_ID_BYTES],
+        /// HMAC proof over the preface and the `HELLO` without this field.
         proof: [u8; 32],
     },
 }
@@ -430,6 +535,7 @@ impl Drop for HelloAuthentication {
 }
 
 impl HelloAuthentication {
+    /// Returns the wire authentication kind, such as [`AUTHENTICATION_ROOT`].
     pub const fn kind(&self) -> u64 {
         match self {
             Self::Root { .. } => AUTHENTICATION_ROOT,
@@ -542,15 +648,52 @@ impl HelloAuthentication {
     }
 }
 
+/// The producer's `HELLO`, the first control record of a session (core §6.1).
+///
+/// # Examples
+///
+/// ```
+/// use vivid_protocol::auth::Secret32;
+/// use vivid_protocol::messages::{Hello, HelloAuthentication};
+/// use vivid_protocol::registry::{CORE_CONTROL, DESKTOP_SURFACE};
+/// use vivid_protocol::wire::{ConnectionKind, encode_preface};
+///
+/// let mut hello = Hello {
+///     producer_name: "example".into(),
+///     producer_version: "1.0".into(),
+///     required_profiles: vec![DESKTOP_SURFACE.into(), CORE_CONTROL.into()],
+///     optional_profiles: vec![],
+///     maximum_control_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+///     client_nonce: [1; 32],
+///     authentication: HelloAuthentication::Root { proof: [0; 32] },
+///     target_profile: DESKTOP_SURFACE.into(),
+///     extensions: vec![],
+/// };
+/// let preface = encode_preface(ConnectionKind::Control, vivid_protocol::CONTROL_MAX_RECORD_BODY);
+/// hello.authenticate_root(&Secret32::new([7; 32]), &preface)?;
+///
+/// let body = hello.encode(1)?;
+/// let (request_id, decoded) = Hello::decode(&body)?;
+/// assert_eq!((request_id, decoded.target_profile.as_str()), (1, DESKTOP_SURFACE));
+/// # Ok::<(), vivid_protocol::messages::MessageError>(())
+/// ```
 #[derive(Debug)]
 pub struct Hello {
+    /// Producer name, at most 256 UTF-8 bytes (key 0).
     pub producer_name: String,
+    /// Producer version, at most 128 UTF-8 bytes (key 1).
     pub producer_version: String,
+    /// Required profiles, sorted and unique (key 2).
     pub required_profiles: Vec<String>,
+    /// Optional profiles, sorted and unique (key 3).
     pub optional_profiles: Vec<String>,
+    /// Largest control-record body the producer accepts (key 4).
     pub maximum_control_body: u32,
+    /// Fresh client nonce (key 5).
     pub client_nonce: [u8; NONCE_BYTES],
+    /// Authentication request (key 6).
     pub authentication: HelloAuthentication,
+    /// Requested presentation-target profile (key 7).
     pub target_profile: String,
     /// Canonical extension values. Keys 0 through 7 are reserved to the base schema.
     pub extensions: PayloadMap,
@@ -589,35 +732,18 @@ impl Hello {
     /// and any error from [`Hello::validate`].
     pub fn authenticate_resume(
         &mut self,
-        prior_resume_key: &[u8; 32],
+        prior_resume_key: &ResumeKey,
         preface: &[u8; 16],
     ) -> Result<(), MessageError> {
-        let (lease_id, session_id, resume_generation, attempt_id) = match &self.authentication {
-            HelloAuthentication::Resume {
-                lease_id,
-                session_id,
-                resume_generation,
-                attempt_id,
-                ..
-            } => (*lease_id, *session_id, *resume_generation, *attempt_id),
-            _ => {
-                return Err(invalid(
-                    "HELLO authentication",
-                    0,
-                    "is not resume authentication",
-                ));
-            }
+        let Some(binding) = self.resume_binding() else {
+            return Err(invalid(
+                "HELLO authentication",
+                0,
+                "is not resume authentication",
+            ));
         };
         let authless = self.authless_payload()?;
-        let proof = auth::resume_hello_proof(
-            prior_resume_key,
-            preface,
-            lease_id,
-            session_id,
-            resume_generation,
-            &attempt_id,
-            &authless,
-        );
+        let proof = auth::resume_hello_proof(prior_resume_key, preface, &binding, &authless);
         if let HelloAuthentication::Resume {
             proof: stored_proof,
             ..
@@ -626,6 +752,46 @@ impl Hello {
             *stored_proof = proof;
         }
         Ok(())
+    }
+
+    /// Checks this resume `HELLO`'s proof against the prior session's resume key in constant time.
+    ///
+    /// Returns `false` for any other authentication kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Hello::authless_payload`].
+    pub fn verify_resume(
+        &self,
+        prior_resume_key: &ResumeKey,
+        preface: &[u8; 16],
+    ) -> Result<bool, MessageError> {
+        let (Some(binding), HelloAuthentication::Resume { proof, .. }) =
+            (self.resume_binding(), &self.authentication)
+        else {
+            return Ok(false);
+        };
+        let authless = self.authless_payload()?;
+        let expected = auth::resume_hello_proof(prior_resume_key, preface, &binding, &authless);
+        Ok(auth::verify_proof(&expected, proof))
+    }
+
+    fn resume_binding(&self) -> Option<ResumeBinding> {
+        match &self.authentication {
+            HelloAuthentication::Resume {
+                lease_id,
+                session_id,
+                resume_generation,
+                attempt_id,
+                ..
+            } => Some(ResumeBinding {
+                lease_id: *lease_id,
+                session_id: *session_id,
+                resume_generation: *resume_generation,
+                attempt_id: *attempt_id,
+            }),
+            _ => None,
+        }
     }
 
     /// Checks every `HELLO` field against the core specification's limits.
@@ -741,7 +907,7 @@ impl Hello {
     /// Returns [`MessageError`] when the payload fails [`Hello::validate`] or `request_id` is zero.
     pub fn encode(&self, request_id: u64) -> Result<Vec<u8>, MessageError> {
         let Value::Map(payload) = self.payload_value()? else {
-            unreachable!()
+            unreachable!("a HELLO payload is always a map")
         };
         let envelope = Zeroizing::new(Envelope::new(request_id, payload));
         envelope.validate_request()?;
@@ -777,11 +943,16 @@ impl Hello {
     }
 }
 
+/// The authentication confirmation in `WELCOME` key 9.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WelcomeAuthentication {
+    /// Authentication kind, matching the `HELLO` request (subkey 0).
     pub kind: u64,
+    /// Server confirmation the producer verifies before sending anything else (subkey 1).
     pub confirmation: [u8; 32],
+    /// Lease state, or zero for root (subkey 2).
     pub lease_state: u64,
+    /// Fresh (`0`) or exact replay (`1`) of an activation attempt (subkey 3).
     pub activation_attempt_status: u64,
 }
 
@@ -861,23 +1032,40 @@ impl WelcomeAuthentication {
     }
 }
 
+/// The presenter's `WELCOME` reply that establishes a session (core §6.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Welcome {
+    /// Nonzero session ID (key 0).
     pub session_id: u64,
+    /// Non-secret session tag; an identifier, never authority (key 1).
     pub session_tag: [u8; SESSION_TAG_BYTES],
+    /// Root context visible to this principal (key 2).
     pub root_context_id: u64,
+    /// Presentation-target generation (key 3).
     pub target_generation: u64,
+    /// Selected presentation-target profile (key 4).
     pub target_profile: String,
+    /// Target-profile descriptor (key 5).
     pub target_descriptor: PayloadMap,
+    /// Accepted profiles, sorted and unique (key 6).
     pub accepted_profiles: Vec<String>,
+    /// Largest control-record body the presenter accepts (key 7).
     pub maximum_control_body: u32,
+    /// Fresh server nonce (key 8).
     pub server_nonce: [u8; NONCE_BYTES],
+    /// Authentication confirmation and lease state (key 9).
     pub authentication: WelcomeAuthentication,
+    /// Initial or resumed session revision (key 10).
     pub session_revision: u64,
+    /// Current scene revision (key 11).
     pub scene_revision: u64,
+    /// Effective resource contract (key 12).
     pub resource_contract: ResourceContract,
+    /// New (`0`) or resumed (`1`) session (key 13).
     pub establishment_state: u64,
+    /// Lease resume generation; zero for a non-resumable root session (key 14).
     pub resume_generation: u64,
+    /// Canonical extension entries after key 14, such as the vector limits map at key 15.
     pub extensions: PayloadMap,
 }
 
@@ -1004,7 +1192,7 @@ impl Welcome {
     /// zero.
     pub fn encode(&self, request_id: u64) -> Result<Vec<u8>, MessageError> {
         let Value::Map(payload) = self.payload_value_inner(false)? else {
-            unreachable!()
+            unreachable!("a WELCOME payload is always a map")
         };
         let envelope = Zeroizing::new(Envelope::new(request_id, payload));
         envelope.validate_request()?;
@@ -1049,8 +1237,10 @@ impl Welcome {
     }
 }
 
+/// The structured detail map in `ERROR` key 2 (core §11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorDetail {
+    /// Detail entries, such as limit identifier (0) or current session revision (3).
     pub fields: PayloadMap,
 }
 
@@ -1105,6 +1295,7 @@ impl ErrorDetail {
         Ok(())
     }
 
+    /// Returns the `UNSUPPORTED_VERSION` detail naming Vivid 1.5 (keys 14 and 15).
     pub fn supported_version() -> Self {
         Self {
             fields: vec![
@@ -1114,6 +1305,7 @@ impl ErrorDetail {
         }
     }
 
+    /// Returns the supported major and minor version (keys 14 and 15), if both are present.
     pub fn supported_version_tuple(&self) -> Option<(u64, u64)> {
         Some((
             self.fields.iter().find(|(key, _)| *key == 14)?.1.as_u64()?,
@@ -1122,12 +1314,18 @@ impl ErrorDetail {
     }
 }
 
+/// A decoded `ERROR` reply (core §11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorReply {
+    /// Registered error code, such as [`ERROR_BAD_MESSAGE`] (key 0).
     pub code: u64,
+    /// The failed request's ID (key 1).
     pub request_id: u64,
+    /// Structured detail (key 2).
     pub detail: ErrorDetail,
+    /// Whether the error ends the connection (key 3).
     pub fatal: bool,
+    /// Untrusted human diagnostic, at most 4,096 UTF-8 bytes (key 4).
     pub diagnostic: String,
 }
 
@@ -1209,13 +1407,18 @@ pub fn unsupported_version_error() -> Vec<u8> {
     .expect("static version error is valid")
 }
 
+/// The quality-of-service lane a connection or track uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 #[non_exhaustive]
 pub enum LaneClass {
+    /// The control connection.
     Control = 0,
+    /// The interactive lane that carries input.
     Interactive = 1,
+    /// Latency-sensitive media.
     Realtime = 2,
+    /// Throughput-oriented media and file transfer.
     Bulk = 3,
 }
 
@@ -1233,11 +1436,16 @@ impl TryFrom<u64> for LaneClass {
     }
 }
 
+/// The `LANE_OPEN` record that authenticates an interactive lane (core §7).
 #[derive(Clone, PartialEq, Eq)]
 pub struct LaneOpen {
+    /// The session that owns the channel key (key 0).
     pub session_id: u64,
+    /// Lane generation, starting at one (key 2).
     pub lane_generation: u64,
+    /// Fresh client nonce (key 3).
     pub client_nonce: [u8; 16],
+    /// Truncated HMAC over the other fields (key 4).
     pub authentication_tag: [u8; 16],
 }
 
@@ -1260,6 +1468,22 @@ impl Drop for LaneOpen {
 }
 
 impl LaneOpen {
+    /// Sets `authentication_tag` from `session_channel_key` and every other field.
+    ///
+    /// Sign after the binding fields are final; any later field change invalidates the tag.
+    pub fn sign(&mut self, session_channel_key: &ChannelKey) {
+        self.authentication_tag = auth::lane_tag(session_channel_key, self);
+    }
+
+    /// Checks `authentication_tag` against `session_channel_key` in constant time.
+    pub fn verify(&self, session_channel_key: &ChannelKey) -> bool {
+        auth::verify_tag(
+            &auth::lane_tag(session_channel_key, self),
+            &self.authentication_tag,
+        )
+    }
+
+    /// Encodes the `LANE_OPEN` payload; key 1 is always the interactive class.
     pub fn payload(&self) -> PayloadMap {
         vec![
             (0, Value::Unsigned(self.session_id)),
@@ -1295,14 +1519,20 @@ impl LaneOpen {
     }
 }
 
+/// The media a track carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 #[non_exhaustive]
 pub enum TrackKind {
+    /// Coded video access units.
     Video = 1,
+    /// Coded audio packets.
     Audio = 2,
+    /// Uncompressed or zstd-compressed RGBA frames.
     Raster = 3,
+    /// Whole encoded images, such as PNG.
     EncodedImage = 4,
+    /// Vector display lists for overlays.
     VectorScene = 5,
 }
 
@@ -1321,16 +1551,26 @@ impl TryFrom<u64> for TrackKind {
     }
 }
 
+/// The `CHANNEL_OPEN` record that authenticates a track connection (media §5.1).
 #[derive(Clone, PartialEq, Eq)]
 pub struct ChannelOpen {
+    /// The session that owns the channel key (key 0).
     pub session_id: u64,
+    /// Owning context (key 1).
     pub context_id: u64,
+    /// Owning surface (key 2).
     pub surface_id: u64,
+    /// The track; also the record object ID (key 3).
     pub track_id: u64,
+    /// The channel generation this connection carries (key 4).
     pub channel_generation: u64,
+    /// The track's kind (key 5).
     pub track_kind: TrackKind,
+    /// The lane the connection uses (key 6).
     pub lane: LaneClass,
+    /// Fresh client channel nonce (key 7).
     pub client_nonce: [u8; 16],
+    /// Truncated HMAC over the other fields (key 8).
     pub authentication_tag: [u8; 16],
 }
 
@@ -1361,18 +1601,19 @@ impl ChannelOpen {
     /// Sets `authentication_tag` from `session_channel_key` and every other field.
     ///
     /// Sign after the binding fields are final; any later field change invalidates the tag.
-    pub fn sign(&mut self, session_channel_key: &[u8; 32]) {
+    pub fn sign(&mut self, session_channel_key: &ChannelKey) {
         self.authentication_tag = auth::channel_tag(session_channel_key, self);
     }
 
     /// Checks `authentication_tag` against `session_channel_key` in constant time.
-    pub fn verify(&self, session_channel_key: &[u8; 32]) -> bool {
+    pub fn verify(&self, session_channel_key: &ChannelKey) -> bool {
         auth::verify_tag(
             &auth::channel_tag(session_channel_key, self),
             &self.authentication_tag,
         )
     }
 
+    /// Encodes the `CHANNEL_OPEN` payload.
     pub fn payload(&self) -> PayloadMap {
         vec![
             (0, Value::Unsigned(self.session_id)),
@@ -1439,6 +1680,8 @@ pub fn validate_header_object(header_object_id: u64, payload_id: u64) -> Result<
     }
 }
 
+/// A decoded CBOR map checked against one schema's known keys.
+///
 /// Debug output reports the schema and entry count, never decoded values that may carry proofs.
 pub struct StrictMap<'a> {
     schema: &'static str,
@@ -1516,6 +1759,7 @@ impl<'a> StrictMap<'a> {
             })
     }
 
+    /// Returns the value at `key`, if present.
     pub fn optional(&self, key: u64) -> Option<&'a Value> {
         self.entries
             .iter()
@@ -1661,7 +1905,7 @@ impl<'a> StrictMap<'a> {
             })
     }
 
-    /// Returns the byte string stored under `key` as an array of exactly `N` bytes, if present.
+    /// Returns the byte string at `key` as exactly `N` bytes, if present.
     ///
     /// # Errors
     ///
@@ -1739,6 +1983,7 @@ impl<'a> StrictMap<'a> {
             .collect()
     }
 
+    /// Returns the entries whose keys follow `last_known_key`, for preserving schemas.
     pub fn extensions_after(&self, last_known_key: u64) -> PayloadMap {
         self.entries
             .iter()
@@ -1819,6 +2064,7 @@ fn invalid(schema: &'static str, key: u64, reason: &'static str) -> MessageError
     }
 }
 
+/// Builds a [`MessageError::InvalidValue`] for `schema` at `key`.
 pub fn invalid_value(schema: &'static str, key: u64, reason: &'static str) -> MessageError {
     invalid(schema, key, reason)
 }
@@ -1845,210 +2091,31 @@ impl ValueMapExt for Value {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        CONTROL_MAX_RECORD_BODY,
-        registry::{DESKTOP_SURFACE, LIVE_MEDIA},
-        wire::{ConnectionKind, encode_preface},
-    };
-    use std::fmt::Write as _;
+/// The `CANCEL_WAIT` payload: abandon a pending wait (core §10).
+///
+/// Cancelling a wait that already completed is not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelWait {
+    /// The request ID of the wait to cancel.
+    pub request_id: u64,
+}
 
-    fn root_hello() -> Hello {
-        Hello {
-            producer_name: "test producer".into(),
-            producer_version: "1.5.0".into(),
-            required_profiles: vec![
-                DESKTOP_SURFACE.into(),
-                LIVE_MEDIA.into(),
-                CORE_CONTROL.into(),
-            ],
-            optional_profiles: vec![],
-            maximum_control_body: CONTROL_MAX_RECORD_BODY,
-            client_nonce: [1; 32],
-            authentication: HelloAuthentication::Root { proof: [2; 32] },
-            target_profile: DESKTOP_SURFACE.into(),
-            extensions: vec![(100, Value::Text("preserved".into()))],
-        }
+impl CancelWait {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![(0, Value::Unsigned(self.request_id))]
     }
 
-    #[test]
-    fn envelope_round_trip_includes_execution_metadata() {
-        let mut envelope = Envelope::correlated(9, vec![(0, Value::Unsigned(3))]).unwrap();
-        envelope.transaction_id = Some(4);
-        envelope.expected_target_generation = Some(7);
-        envelope.preconditions = vec![(0, Value::Unsigned(8))];
-        envelope.idempotency_key = Some([5; 16]);
-        envelope.causation_id = Some([6; 16]);
-        assert_eq!(
-            decode_control(&envelope.encode().unwrap()).unwrap(),
-            envelope
-        );
-    }
-
-    #[test]
-    fn hello_has_no_version_range_and_preserves_extensions() {
-        let hello = root_hello();
-        let body = hello.encode(1).unwrap();
-        let (request_id, parsed) = Hello::decode(&body).unwrap();
-        assert_eq!(request_id, 1);
-        assert_eq!(parsed.extensions, hello.extensions);
-        assert_eq!(parsed.target_profile, DESKTOP_SURFACE);
-    }
-
-    #[test]
-    fn hello_accepts_zero_as_the_initial_resume_generation() {
-        let mut hello = root_hello();
-        hello.authentication = HelloAuthentication::Resume {
-            context_id: 1,
-            lease_id: 2,
-            session_id: 3,
-            resume_generation: 0,
-            attempt_id: [4; 16],
-            proof: [5; 32],
-        };
-
-        let (_, parsed) = Hello::decode(&hello.encode(1).unwrap()).unwrap();
-        assert!(matches!(
-            parsed.authentication,
-            HelloAuthentication::Resume {
-                resume_generation: 0,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn hello_rejects_unclosed_profiles() {
-        let mut hello = root_hello();
-        hello.required_profiles = vec!["desktop-input-v1".into(), CORE_CONTROL.into()];
-        assert!(hello.validate().is_err());
-    }
-
-    #[test]
-    fn hello_ignores_unknown_optional_profile_syntax() {
-        let mut hello = root_hello();
-        hello.optional_profiles = vec!["future-profile-v9".into()];
-        hello.validate().unwrap();
-    }
-
-    #[test]
-    fn hello_root_builder_matches_transcript_verifier_and_redacts_debug() {
-        let secret = Secret32::new([7; 32]);
-        let preface = encode_preface(ConnectionKind::Control, CONTROL_MAX_RECORD_BODY);
-        let mut hello = root_hello();
-        hello.authenticate_root(&secret, &preface).unwrap();
-        let authless = hello.authless_payload().unwrap();
-        let HelloAuthentication::Root { proof } = &hello.authentication else {
-            panic!("not root authentication");
-        };
-        assert!(auth::verify_root_hello_proof(
-            &secret, &preface, &authless, proof
-        ));
-        assert!(format!("{:?}", hello.authentication).contains("[REDACTED]"));
-        assert!(!format!("{:?}", hello.authentication).contains(&hex(proof)));
-    }
-
-    #[test]
-    fn welcome_round_trip_carries_all_resource_fields() {
-        let welcome = Welcome {
-            session_id: 1,
-            session_tag: [2; 16],
-            root_context_id: 3,
-            target_generation: 1,
-            target_profile: DESKTOP_SURFACE.into(),
-            target_descriptor: vec![],
-            accepted_profiles: vec![DESKTOP_SURFACE.into(), CORE_CONTROL.into()],
-            maximum_control_body: CONTROL_MAX_RECORD_BODY,
-            server_nonce: [4; 32],
-            authentication: WelcomeAuthentication {
-                kind: AUTHENTICATION_ROOT,
-                confirmation: [5; 32],
-                lease_state: 0,
-                activation_attempt_status: 0,
-            },
-            session_revision: 1,
-            scene_revision: 0,
-            resource_contract: ResourceContract::denied(),
-            establishment_state: 0,
-            resume_generation: 0,
-            extensions: vec![],
-        };
-        let body = welcome.encode(9).unwrap();
-        let (request_id, parsed) = Welcome::decode(&body).unwrap();
-        assert_eq!(request_id, 9);
-        assert_eq!(parsed, welcome);
-    }
-
-    #[test]
-    fn lane_and_track_open_schemas_bind_complete_owner_fields() {
-        let lane = LaneOpen {
-            session_id: 1,
-            lane_generation: 1,
-            client_nonce: [2; 16],
-            authentication_tag: [3; 16],
-        };
-        let lane_body = encode_payload(1, lane.payload()).unwrap();
-        assert_eq!(LaneOpen::decode(&lane_body).unwrap().session_id, 1);
-
-        let channel = ChannelOpen {
-            session_id: 1,
-            context_id: 2,
-            surface_id: 3,
-            track_id: 4,
-            channel_generation: 1,
-            track_kind: TrackKind::Video,
-            lane: LaneClass::Realtime,
-            client_nonce: [5; 16],
-            authentication_tag: [6; 16],
-        };
-        let channel_body = encode_payload(1, channel.payload()).unwrap();
-        let parsed = ChannelOpen::decode(4, &channel_body).unwrap();
-        assert_eq!(
-            (parsed.context_id, parsed.surface_id, parsed.track_id),
-            (2, 3, 4)
-        );
-        ChannelOpen::decode(5, &channel_body).unwrap_err();
-    }
-
-    #[test]
-    fn typed_version_error_round_trip() {
-        let parsed = parse_error_reply(&unsupported_version_error()).unwrap();
-        assert_eq!(parsed.code, ERROR_UNSUPPORTED_VERSION);
-        assert!(parsed.fatal);
-        assert_eq!(
-            parsed.detail.supported_version_tuple(),
-            Some((u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR)))
-        );
-    }
-
-    #[test]
-    fn complete_identity_does_not_alias_reused_local_ids() {
-        let session =
-            crate::identity::SessionIdentity::new(crate::identity::PresenterInstanceId([1; 16]), 1)
-                .unwrap();
-        let first = session
-            .context(10)
-            .unwrap()
-            .surface(20)
-            .unwrap()
-            .track(7)
-            .unwrap();
-        let second = session
-            .context(11)
-            .unwrap()
-            .surface(20)
-            .unwrap()
-            .track(7)
-            .unwrap();
-        assert_ne!(first, second);
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().fold(String::new(), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
+    /// Decodes a `CANCEL_WAIT` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `CANCEL_WAIT` map or the request ID is
+    /// missing or not an unsigned integer.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("CANCEL_WAIT", value, &[0])?;
+        Ok(Self {
+            request_id: map.required_u64(0)?,
         })
     }
 }

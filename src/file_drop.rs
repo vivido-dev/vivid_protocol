@@ -1,11 +1,19 @@
-//! Consent-gated presenter-to-producer regular-file transfer schemas.
+//! Consent-gated copy of regular files from presenter to producer (`file-drop-v1`).
+//!
+//! A producer makes a surface a drop target with [`FileDropBinding`], and the presenter's
+//! [`FileDropGate`] answers with a [`FileDropGrant`]. When the user drops a file, the presenter
+//! offers it ([`FileDropOffer`]), the producer accepts ([`AcceptFileDrop`]), and the bytes travel
+//! on an authenticated file-transfer connection that [`FileTransferOpen`] opens.
+//! [`FileTransferFlow`] accounts for credit, [`FileFinish`] carries the hash, and [`FileResult`]
+//! reports the commit.
 
 use std::fmt;
 
 use zeroize::Zeroize;
 
 use crate::{
-    CodecError, HARD_MAX_RECORD_BODY, auth,
+    CodecError, HARD_MAX_RECORD_BODY,
+    auth::{self, ChannelKey},
     cbor::{self, Value},
     messages::{
         MessageError, PayloadMap, StrictMap, invalid_value, require_nonzero, validate_header_object,
@@ -13,27 +21,56 @@ use crate::{
     revision::{FileDropEpoch, FileDropGrantGeneration, FileTransferGeneration, SurfaceGeneration},
 };
 
+/// Bytes before the data in a `FILE_DATA` body: offset, length, and four reserved bytes (§5).
 pub const FILE_DATA_PREFIX_SIZE: usize = 16;
+/// Length of the client nonce in `FILE_TRANSFER_OPEN` (§4, key 10).
 pub const FILE_TRANSFER_NONCE_BYTES: usize = 16;
+/// Length of the `FILE_TRANSFER_OPEN` authentication tag: a truncated HMAC-SHA-256 (§4, key 11).
 pub const FILE_TRANSFER_TAG_BYTES: usize = 16;
+/// Length of the SHA-256 digest a `FILE_RESULT` reports (§5).
 pub const FILE_HASH_BYTES: usize = 32;
+/// Longest suggested basename an offer may carry, in UTF-8 bytes (§3, key 6).
+///
+/// It matches the common 255-byte filename limit, so a receiver can always create the file
+/// under the suggested name.
 pub const MAX_FILE_DROP_NAME_BYTES: usize = 255;
+/// Longest committed destination path `file-drop-path-v1` reports, in bytes (§8, key 5).
 pub const MAX_COMMITTED_PATH_BYTES: usize = 4096;
+/// Most pending offers one binding may allow (§1, §2 key 6).
 pub const MAX_PENDING_FILE_DROPS: u64 = 16;
+/// Most concurrent transfers one binding may allow (§1, §2 key 7).
 pub const MAX_ACTIVE_FILE_TRANSFERS: u64 = 4;
+/// Pending-offer limit the specification recommends for a binding (§1).
 pub const DEFAULT_PENDING_FILE_DROPS: u64 = 4;
+/// Active-transfer limit the specification recommends for a binding (§1).
 pub const DEFAULT_ACTIVE_FILE_TRANSFERS: u64 = 1;
+/// Shortest acceptance or idle timeout a binding may request: one second (§2).
 pub const MIN_FILE_DROP_DEADLINE_US: u64 = 1_000_000;
+/// Longest acceptance or idle timeout a binding may request: 300 seconds (§2).
 pub const MAX_FILE_DROP_DEADLINE_US: u64 = 300_000_000;
+/// Acceptance timeout this crate suggests for a new binding: 30 seconds.
+///
+/// The specification only bounds it (1 through 300 seconds). Thirty seconds lets a person answer
+/// a consent prompt without leaving an abandoned offer holding a pending slot for minutes.
 pub const DEFAULT_FILE_DROP_ACCEPTANCE_US: u64 = 30_000_000;
+/// Transfer idle timeout this crate suggests for a new binding: 60 seconds.
+///
+/// The specification only bounds it (1 through 300 seconds). A minute rides out a stalled
+/// connection or a busy producer, while a dead transfer still frees its active slot promptly.
 pub const DEFAULT_FILE_TRANSFER_IDLE_US: u64 = 60_000_000;
+/// How long a terminal transfer outcome stays available for an exact retry.
+///
+/// This is the specification's 60-second ceiling (§6).
 pub const FILE_DROP_RESULT_RETENTION_US: u64 = 60_000_000;
 
+/// Where an enabled binding commits dropped files (`SET_FILE_DROP_BINDING` key 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 #[non_exhaustive]
 pub enum FileDropDestination {
+    /// The producer shell's current working directory.
     ShellCwd = 1,
+    /// The user's desktop folder.
     DesktopFolder = 2,
 }
 
@@ -53,13 +90,18 @@ impl TryFrom<u64> for FileDropDestination {
     }
 }
 
+/// A binding's state as `FILE_DROP_BOUND` key 5 reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 #[non_exhaustive]
 pub enum FileDropBindingState {
+    /// The binding is removed.
     Disabled = 0,
+    /// The binding receives drops.
     Enabled = 1,
+    /// The presenter refused the binding.
     Denied = 2,
+    /// A target-wide binding superseded by a newer one; it can become enabled again.
     Standby = 3,
 }
 
@@ -81,22 +123,35 @@ impl TryFrom<u64> for FileDropBindingState {
     }
 }
 
+/// The `SET_FILE_DROP_BINDING` request (file drop §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDropBinding {
+    /// Nonzero epoch that increases for this binding identity (key 0).
     pub producer_epoch: FileDropEpoch,
+    /// Owning context (key 1).
     pub context_id: u64,
+    /// Owned surface, or zero for a target-wide binding (key 2).
     pub surface_id: u64,
+    /// Surface generation, or zero for a target-wide binding (key 3).
     pub surface_generation: SurfaceGeneration,
+    /// Destination, or `None` to disable the binding (key 4).
     pub destination: Option<FileDropDestination>,
+    /// Largest file accepted; nonzero while enabled (key 5).
     pub maximum_file_bytes: u64,
+    /// Offers that may wait for acceptance at once, `1..=16` (key 6).
     pub maximum_pending_offers: u64,
+    /// Transfers that may run at once, `1..=4` and at most key 6 (key 7).
     pub maximum_active_transfers: u64,
+    /// Largest record body the producer receives (key 8).
     pub maximum_record_body: u32,
+    /// How long an offer waits for acceptance, in microseconds (key 9).
     pub acceptance_timeout_us: u64,
+    /// How long a transfer may sit idle, in microseconds (key 10).
     pub idle_timeout_us: u64,
 }
 
 impl FileDropBinding {
+    /// Returns whether this request disables the binding.
     pub fn disabled(&self) -> bool {
         self.destination.is_none()
     }
@@ -231,25 +286,41 @@ impl FileDropBinding {
     }
 }
 
+/// The presenter's `FILE_DROP_BOUND` reply: the binding's effective state and limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileDropGrant {
+    /// The request's producer epoch (key 0).
     pub producer_epoch: FileDropEpoch,
+    /// Presenter grant generation; zero only when disabled (key 1).
     pub grant_generation: FileDropGrantGeneration,
+    /// Owning context (key 2).
     pub context_id: u64,
+    /// Owned surface, or zero for a target-wide binding (key 3).
     pub surface_id: u64,
+    /// Surface generation, or zero for a target-wide binding (key 4).
     pub surface_generation: SurfaceGeneration,
+    /// Effective binding state (key 5).
     pub state: FileDropBindingState,
+    /// Effective destination, or `None` when disabled (key 6).
     pub destination: Option<FileDropDestination>,
+    /// Effective largest file, at most the requested value (key 7).
     pub maximum_file_bytes: u64,
+    /// Effective pending-offer limit (key 8).
     pub maximum_pending_offers: u64,
+    /// Effective active-transfer limit (key 9).
     pub maximum_active_transfers: u64,
+    /// Effective receive record-body limit (key 10).
     pub maximum_record_body: u32,
+    /// Effective acceptance timeout in microseconds (key 11).
     pub acceptance_timeout_us: u64,
+    /// Effective idle timeout in microseconds (key 12).
     pub idle_timeout_us: u64,
+    /// Bounded reason for the state (key 13).
     pub reason: u64,
 }
 
 impl FileDropGrant {
+    /// Encodes the `FILE_DROP_BOUND` payload.
     pub fn payload(self) -> PayloadMap {
         vec![
             (0, Value::Unsigned(self.producer_epoch.get())),
@@ -363,13 +434,20 @@ impl FileDropGrant {
     }
 }
 
+/// The identity that offer keys 0 through 5 carry for one drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileDropTuple {
+    /// The binding's producer epoch.
     pub producer_epoch: FileDropEpoch,
+    /// The grant generation the offer was made under.
     pub grant_generation: FileDropGrantGeneration,
+    /// Owning context.
     pub context_id: u64,
+    /// Target surface, or zero for a target-wide binding.
     pub surface_id: u64,
+    /// Surface generation, or zero for a target-wide binding.
     pub surface_generation: SurfaceGeneration,
+    /// Nonzero drop ID; also the offer's record object ID.
     pub drop_id: u64,
 }
 
@@ -420,10 +498,14 @@ impl FileDropTuple {
     }
 }
 
+/// The presenter's `FILE_DROP_OFFER` event for one dropped file (file drop §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDropOffer {
+    /// The drop's identity (keys 0 through 5).
     pub binding: FileDropTuple,
+    /// Inert UTF-8 basename of at most 255 bytes (key 6).
     pub suggested_name: String,
+    /// Exact file length, possibly zero (key 7).
     pub declared_length: u64,
 }
 
@@ -462,13 +544,20 @@ impl FileDropOffer {
     }
 }
 
+/// The producer's `ACCEPT_FILE_DROP` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcceptFileDrop {
+    /// The offer's identity (keys 0 through 5).
     pub binding: FileDropTuple,
+    /// Nonzero transfer ID (key 6).
     pub transfer_id: u64,
+    /// Initial transfer generation, exactly one (key 7).
     pub transfer_generation: FileTransferGeneration,
+    /// Largest record body the producer receives (key 8).
     pub maximum_record_body: u32,
+    /// Initial cumulative `FILE_DATA` body-byte allowance (key 9).
     pub initial_maximum_body_bytes: u64,
+    /// Initial cumulative `FILE_DATA` record allowance (key 10).
     pub initial_maximum_records: u64,
 }
 
@@ -537,17 +626,25 @@ impl AcceptFileDrop {
     }
 }
 
+/// The presenter's `FILE_DROP_ACCEPTED` reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileDropAccepted {
+    /// The accepted drop.
     pub drop_id: u64,
+    /// The transfer the producer opens.
     pub transfer_id: u64,
+    /// The generation the producer opens.
     pub transfer_generation: FileTransferGeneration,
+    /// How long the presenter waits for `FILE_TRANSFER_OPEN`, in microseconds.
     pub open_timeout_us: u64,
 }
 
+/// A `CANCEL_FILE_DROP` request, or the matching `FILE_DROP_CANCELLED` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelFileDrop {
+    /// The drop's identity (keys 0 through 5).
     pub binding: FileDropTuple,
+    /// Registered cancellation reason (key 6).
     pub reason: u64,
 }
 
@@ -599,16 +696,26 @@ impl CancelFileDrop {
     }
 }
 
+/// The producer's `ADVANCE_FILE_TRANSFER` request to resume on a new generation (file drop §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdvanceFileTransfer {
+    /// Owning context.
     pub context_id: u64,
+    /// Target surface, or zero for a target-wide binding.
     pub surface_id: u64,
+    /// The drop being transferred.
     pub drop_id: u64,
+    /// The transfer; also the record object ID.
     pub transfer_id: u64,
+    /// The generation the producer believes is current.
     pub expected_generation: FileTransferGeneration,
+    /// The exactly-next generation.
     pub new_generation: FileTransferGeneration,
+    /// Bytes the producer has durably received.
     pub committed_offset: u64,
+    /// Initial body-byte allowance for the new generation.
     pub maximum_body_bytes: u64,
+    /// Initial record allowance for the new generation.
     pub maximum_records: u64,
 }
 
@@ -697,11 +804,16 @@ impl AdvanceFileTransfer {
     }
 }
 
+/// The presenter's `FILE_TRANSFER_ADVANCED` reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileTransferAdvanced {
+    /// The advanced transfer.
     pub transfer_id: u64,
+    /// The new current generation.
     pub generation: FileTransferGeneration,
+    /// The offset the new generation resumes from.
     pub committed_offset: u64,
+    /// How long the presenter waits for `FILE_TRANSFER_OPEN`, in microseconds.
     pub open_timeout_us: u64,
 }
 
@@ -747,8 +859,10 @@ impl FileTransferAdvanced {
     }
 }
 
+/// The producer's `QUERY_FILE_DROP` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryFileDrop {
+    /// The drop to report.
     pub drop_id: u64,
 }
 
@@ -780,14 +894,21 @@ impl QueryFileDrop {
     }
 }
 
+/// A drop's state as `FILE_DROP_STATUS` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum FileDropState {
+    /// Offered and waiting for acceptance.
     Offered = 1,
+    /// Accepted; no file transfer is open yet.
     Accepted = 2,
+    /// File bytes are being transferred.
     Transferring = 3,
+    /// The producer committed the file.
     Committed = 4,
+    /// Either side cancelled the drop.
     Cancelled = 5,
+    /// The transfer ended without a commit.
     Failed = 6,
 }
 
@@ -807,14 +928,22 @@ impl TryFrom<u64> for FileDropState {
     }
 }
 
+/// The presenter's `FILE_DROP_STATUS` reply; it never carries a directory or path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDropStatus {
+    /// The reported drop.
     pub drop_id: u64,
+    /// The drop's state.
     pub state: FileDropState,
+    /// The drop's transfer, or zero before acceptance.
     pub transfer_id: u64,
+    /// The transfer's current generation.
     pub generation: FileTransferGeneration,
+    /// Bytes committed so far.
     pub committed_offset: u64,
+    /// The terminal result, once there is one.
     pub result: Option<FileResultCode>,
+    /// The committed basename, or empty.
     pub final_name: String,
 }
 
@@ -929,6 +1058,7 @@ impl FileDropStatus {
 }
 
 impl FileDropAccepted {
+    /// Encodes the `FILE_DROP_ACCEPTED` payload.
     pub fn payload(self) -> PayloadMap {
         vec![
             (0, Value::Unsigned(self.drop_id)),
@@ -968,20 +1098,35 @@ impl FileDropAccepted {
 /// `Debug` redacts the authentication tag, and dropping the value zeroizes it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct FileTransferOpen {
+    /// Session that owns the channel key (key 0).
     pub session_id: u64,
+    /// Owning context (key 1).
     pub context_id: u64,
+    /// Target surface, possibly zero (key 2).
     pub surface_id: u64,
+    /// The binding's producer epoch (key 12).
     pub producer_epoch: FileDropEpoch,
+    /// The presenter grant generation (key 13).
     pub grant_generation: FileDropGrantGeneration,
+    /// Surface generation, or zero for a target-wide binding (key 14).
     pub surface_generation: SurfaceGeneration,
+    /// The drop being transferred (key 3).
     pub drop_id: u64,
+    /// The accepted transfer (key 4).
     pub transfer_id: u64,
+    /// The generation this connection carries (key 5).
     pub transfer_generation: FileTransferGeneration,
+    /// The receiver's committed resume offset (key 6).
     pub resume_offset: u64,
+    /// Largest record body the receiver accepts (key 7).
     pub maximum_record_body: u32,
+    /// Initial cumulative body-byte allowance (key 8).
     pub maximum_body_bytes: u64,
+    /// Initial cumulative record allowance (key 9).
     pub maximum_records: u64,
+    /// Fresh client nonce (key 10).
     pub client_nonce: [u8; FILE_TRANSFER_NONCE_BYTES],
+    /// Truncated HMAC over the other fields (key 11).
     pub authentication_tag: [u8; FILE_TRANSFER_TAG_BYTES],
 }
 
@@ -1018,12 +1163,12 @@ impl FileTransferOpen {
     /// Sets `authentication_tag` from `session_channel_key` and every other field.
     ///
     /// Sign after the binding fields are final; any later field change invalidates the tag.
-    pub fn sign(&mut self, session_channel_key: &[u8; 32]) {
+    pub fn sign(&mut self, session_channel_key: &ChannelKey) {
         self.authentication_tag = auth::file_transfer_tag(session_channel_key, self);
     }
 
     /// Checks `authentication_tag` against `session_channel_key` in constant time.
-    pub fn verify(&self, session_channel_key: &[u8; 32]) -> bool {
+    pub fn verify(&self, session_channel_key: &ChannelKey) -> bool {
         auth::verify_tag(
             &auth::file_transfer_tag(session_channel_key, self),
             &self.authentication_tag,
@@ -1128,10 +1273,14 @@ impl FileTransferOpen {
     }
 }
 
+/// The presenter's `FILE_TRANSFER_ACCEPTED` reply, sent before any file data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileTransferAccepted {
+    /// The accepted transfer.
     pub transfer_id: u64,
+    /// The accepted generation.
     pub transfer_generation: FileTransferGeneration,
+    /// The offset the first `FILE_DATA` starts at.
     pub resume_offset: u64,
 }
 
@@ -1176,11 +1325,16 @@ impl FileTransferAccepted {
     }
 }
 
+/// The producer's `MAX_FILE_DATA` credit update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaximumFileData {
+    /// The credited transfer.
     pub transfer_id: u64,
+    /// The credited generation.
     pub transfer_generation: FileTransferGeneration,
+    /// New cumulative body-byte allowance.
     pub maximum_body_bytes: u64,
+    /// New cumulative record allowance.
     pub maximum_records: u64,
 }
 
@@ -1228,11 +1382,16 @@ impl MaximumFileData {
     }
 }
 
+/// The presenter's `FILE_FINISH`, sent after exactly the offered length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileFinish {
+    /// The finished transfer.
     pub transfer_id: u64,
+    /// The generation that finished.
     pub transfer_generation: FileTransferGeneration,
+    /// Total bytes sent.
     pub final_length: u64,
+    /// SHA-256 of the bytes read from the retained source handle.
     pub sha256: [u8; FILE_HASH_BYTES],
 }
 
@@ -1279,15 +1438,22 @@ impl FileFinish {
     }
 }
 
+/// The outcome a `FILE_RESULT` reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 #[non_exhaustive]
 pub enum FileResultCode {
+    /// The file was committed.
     Committed = 0,
+    /// The producer refused the file.
     Rejected = 1,
+    /// The transfer was cancelled.
     Cancelled = 2,
+    /// The received bytes did not match `FILE_FINISH`.
     HashMismatch = 3,
+    /// Writing or committing the file failed.
     IoError = 4,
+    /// A resumed transfer whose file was already committed.
     AlreadyCommitted = 5,
 }
 
@@ -1307,12 +1473,18 @@ impl TryFrom<u64> for FileResultCode {
     }
 }
 
+/// The producer's `FILE_RESULT` for one transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileResult {
+    /// The transfer the result is for.
     pub transfer_id: u64,
+    /// The generation the result is for.
     pub transfer_generation: FileTransferGeneration,
+    /// The outcome.
     pub result: FileResultCode,
+    /// Bytes committed.
     pub committed_length: u64,
+    /// The committed basename; empty unless the result is a success.
     pub final_name: String,
     /// The committed absolute path, carried only under `file-drop-path-v1` on a successful result.
     pub committed_path: Option<String>,
@@ -1392,11 +1564,16 @@ impl FileResult {
     }
 }
 
+/// A `FILE_TRANSFER_ABORT`, which either side may send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileTransferAbort {
+    /// The aborted transfer.
     pub transfer_id: u64,
+    /// The aborted generation.
     pub transfer_generation: FileTransferGeneration,
+    /// Bounded abort reason.
     pub reason: u64,
+    /// The offset reached before the abort.
     pub final_offset: u64,
 }
 
@@ -1448,9 +1625,12 @@ impl FileTransferAbort {
     }
 }
 
+/// One `FILE_DATA` body split into its offset and bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedFileData<'a> {
+    /// Exact file offset of the first byte.
     pub offset: u64,
+    /// The file bytes; never empty.
     pub data: &'a [u8],
 }
 
@@ -1508,6 +1688,18 @@ pub fn parse_file_data(body: &[u8]) -> Result<ParsedFileData<'_>, CodecError> {
     })
 }
 
+/// Cumulative credit a receiver grants one transfer generation: bytes and `FILE_DATA` records.
+///
+/// Both limits are zero to stop the sender, or both nonzero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileCredit {
+    /// Total `FILE_DATA` payload bytes the generation may send.
+    pub maximum_body_bytes: u64,
+    /// Total `FILE_DATA` records the generation may send.
+    pub maximum_records: u64,
+}
+
+/// Credit and offset accounting for one transfer generation on the receiving side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileTransferFlow {
     generation: FileTransferGeneration,
@@ -1528,9 +1720,12 @@ impl FileTransferFlow {
     pub fn new(
         generation: FileTransferGeneration,
         resume_offset: u64,
-        maximum_body_bytes: u64,
-        maximum_records: u64,
+        credit: FileCredit,
     ) -> Result<Self, MessageError> {
+        let FileCredit {
+            maximum_body_bytes,
+            maximum_records,
+        } = credit;
         generation
             .require_nonzero()
             .map_err(|_| invalid_value("file-transfer flow", 0, "has a zero generation"))?;
@@ -1551,6 +1746,7 @@ impl FileTransferFlow {
         })
     }
 
+    /// Returns the file offset the next `FILE_DATA` must start at.
     pub const fn next_offset(&self) -> u64 {
         self.next_offset
     }
@@ -1592,9 +1788,10 @@ impl FileTransferFlow {
         Ok(())
     }
 
-    pub fn raise_maxima(&mut self, body_bytes: u64, records: u64) {
-        self.maximum_body_bytes = self.maximum_body_bytes.max(body_bytes);
-        self.maximum_records = self.maximum_records.max(records);
+    /// Raises the credit to `credit` where it is higher; credit never shrinks within a generation.
+    pub fn raise_maxima(&mut self, credit: FileCredit) {
+        self.maximum_body_bytes = self.maximum_body_bytes.max(credit.maximum_body_bytes);
+        self.maximum_records = self.maximum_records.max(credit.maximum_records);
     }
 
     /// Moves the flow to the next generation with fresh credit, as `ADVANCE_FILE_TRANSFER` does.
@@ -1607,8 +1804,7 @@ impl FileTransferFlow {
         &mut self,
         generation: FileTransferGeneration,
         committed_offset: u64,
-        maximum_body_bytes: u64,
-        maximum_records: u64,
+        credit: FileCredit,
     ) -> Result<(), MessageError> {
         if generation
             != self
@@ -1623,24 +1819,25 @@ impl FileTransferFlow {
                 "has a nonconsecutive generation or impossible offset",
             ));
         }
-        *self = Self::new(
-            generation,
-            committed_offset,
-            maximum_body_bytes,
-            maximum_records,
-        )?;
+        *self = Self::new(generation, committed_offset, credit)?;
         Ok(())
     }
 }
 
+/// What [`FileDropGate::apply`] did with a binding request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileDropBindingOutcome {
+    /// The request disabled the binding.
     Disabled,
+    /// The binding is enabled with this grant.
     Enabled(FileDropGrant),
+    /// The presenter denied the binding; the grant reports why.
     Denied(FileDropGrant),
+    /// The request repeats the latest binding; this is its prior result.
     ExactRetry(FileDropGrant),
 }
 
+/// The presenter's file-drop binding state for one binding identity.
 #[derive(Debug, Default, Clone)]
 pub struct FileDropGate {
     latest: Option<FileDropBinding>,
@@ -1650,6 +1847,7 @@ pub struct FileDropGate {
 }
 
 impl FileDropGate {
+    /// Returns the grant in effect, if the binding is enabled.
     pub fn current(&self) -> Option<FileDropGrant> {
         self.current
     }
@@ -1904,6 +2102,13 @@ fn encode_raw(payload: PayloadMap) -> Result<Vec<u8>, MessageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn credit(maximum_body_bytes: u64, maximum_records: u64) -> FileCredit {
+        FileCredit {
+            maximum_body_bytes,
+            maximum_records,
+        }
+    }
 
     fn binding(epoch: u64) -> FileDropBinding {
         FileDropBinding {
@@ -2209,15 +2414,17 @@ mod tests {
         assert_eq!(parsed.offset, 10);
         assert_eq!(parsed.data, b"abc");
 
-        let mut flow = FileTransferFlow::new(FileTransferGeneration::ONE, 10, 19, 1).unwrap();
+        let mut flow =
+            FileTransferFlow::new(FileTransferGeneration::ONE, 10, credit(19, 1)).unwrap();
         flow.admit(10, 3).unwrap();
         assert_eq!(flow.next_offset(), 13);
         assert!(flow.admit(12, 1).is_err());
         assert!(flow.admit(13, 1).is_err());
 
-        let mut stopped = FileTransferFlow::new(FileTransferGeneration::ONE, 0, 0, 0).unwrap();
+        let mut stopped =
+            FileTransferFlow::new(FileTransferGeneration::ONE, 0, credit(0, 0)).unwrap();
         assert!(stopped.admit(0, 1).is_err());
-        stopped.raise_maxima(17, 1);
+        stopped.raise_maxima(credit(17, 1));
         stopped.admit(0, 1).unwrap();
     }
 

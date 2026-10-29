@@ -1,4 +1,9 @@
-//! Context authority and finite delegated resource schemas.
+//! Contexts: delegated authority with a finite resource contract (security §4).
+//!
+//! Every session has a root context. A context with [`OP_DELEGATE`] creates children with
+//! `CREATE_CONTEXT` ([`ContextDefinition`]); each child holds a subset of its parent's operation
+//! classes and a contract reserved from the parent's. [`ContextState`] is a presenter's record of
+//! one context, and [`RevokeContext`] ends a child and everything it owns.
 
 use crate::{
     cbor::Value,
@@ -10,22 +15,37 @@ use crate::{
     revision::ContextRevision,
 };
 
+/// Operation class 0: observe owned objects and sanitized status.
 pub const OP_OBSERVE: u64 = 1 << 0;
+/// Operation class 1: create surfaces and tracks and submit media.
 pub const OP_SURFACE_TRACK_MEDIA: u64 = 1 << 1;
+/// Operation class 2: create and mutate owned scene nodes.
 pub const OP_SCENE: u64 = 1 << 2;
+/// Operation class 3: create terminal anchors.
 pub const OP_TERMINAL_ANCHOR: u64 = 1 << 3;
+/// Operation class 4: establish and receive desktop input for owned surfaces.
 pub const OP_DESKTOP_INPUT: u64 = 1 << 4;
+/// Operation class 5: create child contexts and session leases.
 pub const OP_DELEGATE: u64 = 1 << 5;
+/// Operation class 6: receive user-initiated file drops on owned contexts or surfaces.
 pub const OP_RECEIVE_FILE_DROP: u64 = 1 << 6;
+/// Every assigned operation-class bit.
 pub const OP_KNOWN_MASK: u64 = (1 << 7) - 1;
 
+/// The `CREATE_CONTEXT` request (security §4.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextDefinition {
+    /// Nonzero child context ID (key 0).
     pub context_id: u64,
+    /// Parent context (key 1).
     pub parent_context_id: u64,
+    /// Requested operation-class bits (key 2).
     pub operation_classes: u64,
+    /// Diagnostic label, at most 64 UTF-8 bytes (key 3).
     pub label: String,
+    /// Lifetime from acceptance in microseconds; zero means the parent's (key 4).
     pub lifetime_us: u64,
+    /// Requested resource contract (key 5).
     pub requested_contract: ResourceContract,
 }
 
@@ -97,23 +117,35 @@ impl ContextDefinition {
     }
 }
 
+/// A presenter's state for one context.
 #[derive(Debug)]
 pub struct ContextState {
+    /// The context's complete identity.
     pub identity: ContextIdentity,
+    /// The parent context, or `None` for the root.
     pub parent_context_id: Option<u64>,
+    /// Granted operation-class bits, such as [`OP_SCENE`].
     pub operation_classes: u64,
+    /// Context revision; advances on each change.
     pub revision: ContextRevision,
+    /// Effective resource contract.
     pub contract: ResourceContract,
     reservations: ReservationLedger,
+    /// Whether the context is live.
     pub lifecycle: ContextLifecycle,
 }
 
+/// Whether a context is live, and if not, why it ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum ContextLifecycle {
+    /// Live.
     Active = 1,
+    /// Its lifetime ran out.
     Expired = 2,
+    /// Its owner or a parent revoked it.
     Revoked = 3,
+    /// Its session closed.
     Closed = 4,
 }
 
@@ -184,6 +216,7 @@ impl ContextState {
         Ok((classes, contract))
     }
 
+    /// Returns the local context ID.
     pub const fn context_id(&self) -> u64 {
         self.identity.context_id
     }
@@ -222,31 +255,36 @@ impl ContextState {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::identity::PresenterInstanceId;
-    use crate::resource::Resource;
+/// The `REVOKE_CONTEXT` payload: tear down a delegated context and its descendants (security §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevokeContext {
+    /// The context to revoke.
+    pub context_id: u64,
+    /// The parent context that authorizes the revocation, when the request names it.
+    pub parent_context_id: Option<u64>,
+}
 
-    #[test]
-    fn sibling_contracts_reserve_parent_capacity() {
-        let mut contract = ResourceContract::denied();
-        contract.set(Resource::Surfaces, 4);
-        let session = SessionIdentity::new(PresenterInstanceId([1; 16]), 1).unwrap();
-        let mut root = ContextState::root(session, 1, OP_DELEGATE, contract.clone()).unwrap();
-        let mut requested = ResourceContract::denied();
-        requested.set(Resource::Surfaces, 3);
-        let definition = ContextDefinition {
-            context_id: 2,
-            parent_context_id: 1,
-            operation_classes: 0,
-            label: String::new(),
-            lifetime_us: 0,
-            requested_contract: requested,
-        };
-        let (_, first) = root.reserve_child(&definition, &contract).unwrap();
-        let (_, second) = root.reserve_child(&definition, &contract).unwrap();
-        assert_eq!(first.get(Resource::Surfaces), 3);
-        assert_eq!(second.get(Resource::Surfaces), 1);
+impl RevokeContext {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        let mut payload = vec![(0, Value::Unsigned(self.context_id))];
+        if let Some(parent) = self.parent_context_id {
+            payload.push((1, Value::Unsigned(parent)));
+        }
+        payload
+    }
+
+    /// Decodes a `REVOKE_CONTEXT` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `REVOKE_CONTEXT` map, the context is
+    /// missing, or a field is not an unsigned integer.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("REVOKE_CONTEXT", value, &[0, 1])?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            parent_context_id: map.optional_u64(1)?,
+        })
     }
 }

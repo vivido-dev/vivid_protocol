@@ -1,4 +1,9 @@
-//! Authenticated terminal anchor marker version 3.
+//! Authenticated terminal anchor markers, version 3 (terminal §4 and §5).
+//!
+//! A producer writes an anchor marker into its terminal output so the presenter learns which cell a
+//! scene node is attached to. [`encode_marker`] builds the APC form, and [`encode_conpty_marker`]
+//! the printable form that survives `ConPTY`. [`parse_marker`] and [`parse_conpty_marker`] read
+//! them back, and [`verify_marker`] checks the [`authenticator`] with the session's [`AnchorKey`].
 
 use std::fmt;
 
@@ -7,22 +12,30 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
-use crate::CodecError;
+use crate::{
+    CodecError,
+    cbor::Value,
+    messages::{MessageError, PayloadMap, StrictMap},
+};
 
 pub mod conpty;
 
 const AUTH_LABEL: &[u8] = b"VIVID-ANCHOR-3";
+/// Most bytes one anchor marker may span in the terminal stream.
 pub const MAX_MARKER_BYTES: usize = 192;
 
+/// The session's anchor key; it zeroizes on drop and never prints.
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct AnchorKey([u8; 32]);
 
 impl AnchorKey {
+    /// Wraps key bytes.
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
+    /// Returns the key bytes; keep them out of logs.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -34,14 +47,20 @@ impl fmt::Debug for AnchorKey {
     }
 }
 
+/// A parsed terminal anchor marker (terminal §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnchorMarker {
+    /// The session's non-secret tag.
     pub session_tag: [u8; 16],
+    /// The context that created the anchor.
     pub context_id: u64,
+    /// The anchor.
     pub anchor_id: u64,
+    /// Truncated HMAC that proves the marker came from the session.
     pub authenticator: [u8; 16],
 }
 
+/// Computes a marker's authenticator (terminal §4.3).
 pub fn authenticator(
     key: &AnchorKey,
     session_tag: &[u8; 16],
@@ -181,6 +200,7 @@ pub fn parse_conpty_marker(marker: &str) -> Result<AnchorMarker, CodecError> {
     parse_marker(&marker[..marker.len() - ";VIVID-END".len()])
 }
 
+/// Checks a marker's authenticator in constant time.
 pub fn verify_marker(key: &AnchorKey, marker: &AnchorMarker) -> bool {
     authenticator(
         key,
@@ -196,23 +216,35 @@ fn malformed(message: &'static str) -> CodecError {
     CodecError::malformed(message)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The `QUERY_ANCHOR` payload: ask where an anchor currently is (terminal surface §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryAnchor {
+    /// The context that owns the anchor.
+    pub context_id: u64,
+    /// The anchor, local to its context.
+    pub anchor_id: u64,
+}
 
-    #[test]
-    fn marker_v3_round_trip_and_owner_binding() {
-        let key = AnchorKey::new([0x42; 32]);
-        let tag = [0x24; 16];
-        let encoded = encode_marker(&key, &tag, 3, 7).unwrap();
-        assert!(encoded.len() <= MAX_MARKER_BYTES);
-        let marker = parse_marker(&encoded[2..encoded.len() - 2]).unwrap();
-        assert!(verify_marker(&key, &marker));
-        let conpty = encode_conpty_marker(&key, &tag, 3, 7).unwrap();
-        assert_eq!(parse_conpty_marker(&conpty).unwrap(), marker);
+impl QueryAnchor {
+    /// Encodes the payload map.
+    pub fn payload(&self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.anchor_id)),
+        ]
+    }
 
-        let mut wrong_owner = marker;
-        wrong_owner.context_id = 4;
-        assert!(!verify_marker(&key, &wrong_owner));
+    /// Decodes a `QUERY_ANCHOR` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `QUERY_ANCHOR` map or a field is
+    /// missing or not an unsigned integer.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new("QUERY_ANCHOR", value, &[0, 1])?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            anchor_id: map.required_u64(1)?,
+        })
     }
 }

@@ -1,4 +1,10 @@
-//! Stable surface schemas and generation-safe mutation helpers.
+//! Surfaces: what a producer presents and how it may change (core §8).
+//!
+//! A [`SurfaceDefinition`] is the `CREATE_SURFACE` schema: semantic profile, coordinate model,
+//! logical size, [`SurfaceDescriptor`], capture policy, and profile parameters such as
+//! [`DesktopSurfaceParameters`]. [`UpdateSurface`] decodes a change, and
+//! [`SurfaceState::replace_mutable`] applies it, advancing the surface revision, and the surface
+//! generation too when coordinates or input identity change.
 
 use crate::{
     cbor::Value,
@@ -11,23 +17,37 @@ use crate::{
     target::OutputDescriptor,
 };
 
+/// Policy bit 0: deny screenshots, canvas capture, and readback.
 pub const POLICY_DENY_CAPTURE: u64 = 1 << 0;
+/// Policy bit 1: deny descriptor, title, and semantic export beyond the role.
 pub const POLICY_DENY_DESCRIPTOR_EXPORT: u64 = 1 << 1;
+/// Policy bit 2: deny keeping a poster after disconnect.
 pub const POLICY_DENY_POSTER_RETENTION: u64 = 1 << 2;
+/// Policy bit 3: deny content-addressed image caching.
 pub const POLICY_DENY_IMAGE_CACHE: u64 = 1 << 3;
+/// Policy bit 4: reduce diagnostics to kind and lifecycle.
 pub const POLICY_REDUCED_DIAGNOSTICS: u64 = 1 << 4;
+/// Every assigned policy bit.
 pub const POLICY_KNOWN_MASK: u64 = (1 << 5) - 1;
 
+/// What a surface shows (descriptor key 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 #[non_exhaustive]
 pub enum SurfaceRole {
+    /// No stated role.
     Unspecified = 0,
+    /// A document.
     Document = 1,
+    /// A desktop.
     Desktop = 2,
+    /// Timed media, such as a video.
     TimedMedia = 3,
+    /// A figure or still image.
     Figure = 4,
+    /// A terminal or text surface.
     TerminalText = 5,
+    /// An application canvas.
     ApplicationCanvas = 6,
 }
 
@@ -52,13 +72,18 @@ impl TryFrom<u64> for SurfaceRole {
     }
 }
 
+/// The units a surface's logical size and node geometry use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 #[non_exhaustive]
 pub enum CoordinateModel {
+    /// Desktop logical pixels.
     DesktopLogicalPixels = 1,
+    /// Normalized coordinates.
     Normalized = 2,
+    /// Canvas logical units.
     CanvasLogicalUnits = 3,
+    /// Terminal content cells.
     TerminalContentCells = 4,
 }
 
@@ -80,12 +105,18 @@ impl TryFrom<u64> for CoordinateModel {
     }
 }
 
+/// A surface's descriptor (core §8.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceDescriptor {
+    /// What the surface shows (key 0).
     pub role: SurfaceRole,
+    /// Title, at most 256 UTF-8 bytes (key 1).
     pub title: String,
+    /// Semantic content revision; it never decreases (key 2).
     pub semantic_content_revision: u64,
+    /// Availability bits: extracted text, structure, links, outline, actions (key 3).
     pub semantic_availability: u64,
+    /// Inert locator hint, at most 512 UTF-8 bytes; never opened or fetched (key 4).
     pub locator_hint: String,
 }
 
@@ -158,19 +189,32 @@ impl SurfaceDescriptor {
     }
 }
 
+/// The `CREATE_SURFACE` schema (core §8.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceDefinition {
+    /// Owning context (key 0).
     pub context_id: u64,
+    /// Nonzero surface ID, unique within the context (key 1).
     pub surface_id: u64,
+    /// Semantic profile, such as [`crate::registry::GENERIC_CONTENT`] (key 2).
     pub semantic_profile: String,
+    /// Coordinate model; the semantic profile limits the choice (key 3).
     pub coordinate_model: CoordinateModel,
+    /// Nonzero logical width (key 4).
     pub logical_width: u64,
+    /// Nonzero logical height (key 5).
     pub logical_height: u64,
+    /// Nonzero scale numerator (key 6).
     pub scale_numerator: u64,
+    /// Nonzero scale denominator (key 7).
     pub scale_denominator: u64,
+    /// Clockwise rotation: 0, 90, 180, or 270 (key 8).
     pub rotation: u16,
+    /// Complete descriptor (key 9).
     pub descriptor: SurfaceDescriptor,
+    /// Capture and export policy bits, such as [`POLICY_DENY_CAPTURE`] (key 10).
     pub policy: u64,
+    /// Profile-specific parameters (key 11).
     pub profile_parameters: PayloadMap,
 }
 
@@ -285,17 +329,25 @@ impl SurfaceDefinition {
     }
 }
 
+/// A presenter's state for one surface.
 #[derive(Debug, Clone)]
 pub struct SurfaceState {
+    /// The current definition.
     pub definition: SurfaceDefinition,
+    /// Surface revision; advances on each change.
     pub revision: SurfaceRevision,
+    /// Surface generation; advances when coordinates or input identity change.
     pub generation: SurfaceGeneration,
 }
 
+/// The result of applying an `UPDATE_SURFACE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceMutation {
+    /// The new surface revision.
     pub revision: SurfaceRevision,
+    /// The surface generation after the update.
     pub generation: SurfaceGeneration,
+    /// Whether the generation changed, so input bound to the surface must be revoked.
     pub input_must_be_revoked: bool,
 }
 
@@ -382,10 +434,15 @@ impl SurfaceState {
 /// A bit says the producer *can* inject that class. It does not grant the presenter permission —
 /// that is the input binding's job.
 pub mod input_capability {
+    /// The desktop surface accepts keyboard input.
     pub const KEYBOARD: u64 = 1 << 0;
+    /// The desktop surface accepts pointer motion.
     pub const POINTER_MOTION: u64 = 1 << 1;
+    /// The desktop surface accepts pointer buttons.
     pub const POINTER_BUTTON: u64 = 1 << 2;
+    /// The desktop surface accepts scrolling.
     pub const POINTER_AXIS: u64 = 1 << 3;
+    /// Every assigned input capability bit.
     pub const KNOWN_MASK: u64 = (1 << 4) - 1;
 }
 
@@ -398,6 +455,7 @@ pub mod input_capability {
 pub struct DesktopSurfaceParameters {
     /// Captured virtual-desktop origin in producer logical pixels.
     pub captured_origin_x: i32,
+    /// Captured virtual-desktop origin Y in producer logical pixels.
     pub captured_origin_y: i32,
     /// Sanitized captured-output topology, using the target output schema.
     pub topology: Vec<OutputDescriptor>,
@@ -405,10 +463,12 @@ pub struct DesktopSurfaceParameters {
     /// desktop, security boundary, injected seat, display mapping, or coordinate truth changes —
     /// never as a user name or OS identifier.
     pub semantic_generation: u64,
+    /// Input capability bits, such as [`input_capability::KEYBOARD`].
     pub input_capabilities: u64,
 }
 
 impl DesktopSurfaceParameters {
+    /// Encodes the parameters as the surface's profile-parameter map.
     pub fn encode(&self) -> PayloadMap {
         vec![
             (0, Value::from(i64::from(self.captured_origin_x))),
@@ -525,195 +585,138 @@ fn required_i32(map: &StrictMap<'_>, key: u64) -> Result<i32, MessageError> {
         })
 }
 
-#[cfg(test)]
-mod desktop_parameter_tests {
-    use super::*;
-
-    fn output(id: u64) -> OutputDescriptor {
-        OutputDescriptor {
-            output_id: id,
-            origin_x: 0,
-            origin_y: 0,
-            width: 1920,
-            height: 1080,
-            scale_numerator: 1,
-            scale_denominator: 1,
-            rotation: Rotation::None,
-            primary: id == 1,
-        }
-    }
-
-    fn parameters() -> DesktopSurfaceParameters {
-        DesktopSurfaceParameters {
-            captured_origin_x: -1920,
-            captured_origin_y: 0,
-            topology: vec![output(1), output(2)],
-            semantic_generation: 3,
-            input_capabilities: input_capability::KEYBOARD | input_capability::POINTER_MOTION,
-        }
-    }
-
-    #[test]
-    fn parameters_round_trip() {
-        assert_eq!(
-            DesktopSurfaceParameters::decode(&parameters().encode()).unwrap(),
-            parameters()
-        );
-    }
-
-    #[test]
-    fn a_zero_semantic_generation_is_rejected() {
-        let mut broken = parameters();
-        broken.semantic_generation = 0;
-        assert!(broken.validate().is_err());
-    }
-
-    #[test]
-    fn unassigned_capability_bits_are_rejected() {
-        let mut broken = parameters();
-        broken.input_capabilities = 1 << 8;
-        assert!(broken.validate().is_err());
-    }
-
-    #[test]
-    fn duplicate_output_ids_are_rejected() {
-        let mut broken = parameters();
-        broken.topology[1].output_id = 1;
-        assert!(broken.validate().is_err());
-    }
-
-    #[test]
-    fn an_empty_topology_is_allowed_for_a_headless_producer() {
-        let headless = DesktopSurfaceParameters {
-            topology: Vec::new(),
-            ..parameters()
-        };
-        headless.validate().unwrap();
-    }
-
-    #[test]
-    fn the_mapping_carries_the_captured_origin() {
-        let mapping = parameters().mapping(1920, 1080, Rotation::None);
-        assert_eq!(mapping.to_os_logical(0, 0).unwrap(), (-1920, 0));
-        assert_eq!(mapping.logical_width, 1920);
-    }
-
-    #[test]
-    fn unknown_keys_are_rejected() {
-        let mut map = parameters().encode();
-        map.push((5, Value::Unsigned(0)));
-        DesktopSurfaceParameters::decode(&map).unwrap_err();
-    }
+/// The `UPDATE_SURFACE` payload: a complete replacement of a surface's mutable state (core §8.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateSurface {
+    /// The owning context.
+    pub context_id: u64,
+    /// The surface to update.
+    pub surface_id: u64,
+    /// The surface revision the update expects.
+    pub expected_revision: SurfaceRevision,
+    /// The surface generation the update expects.
+    pub expected_generation: SurfaceGeneration,
+    /// The new logical width.
+    pub logical_width: u64,
+    /// The new logical height.
+    pub logical_height: u64,
+    /// The new scale numerator.
+    pub scale_numerator: u64,
+    /// The new scale denominator.
+    pub scale_denominator: u64,
+    /// The new rotation in degrees.
+    pub rotation: u16,
+    /// The complete new descriptor.
+    pub descriptor: SurfaceDescriptor,
+    /// The requested policy bits.
+    pub policy: u64,
+    /// The complete new profile-specific parameters.
+    pub profile_parameters: PayloadMap,
 }
 
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn a_surface_ready_body_carries_identity_revisions_policy_and_parameters() {
-        let parameters = vec![(0, Value::Unsigned(9))];
-
-        assert_eq!(
-            surface_ready_payload(
-                1,
-                2,
-                SurfaceRevision::new(3),
-                SurfaceGeneration::new(4),
-                5,
-                parameters.clone(),
-            ),
-            vec![
-                (0, Value::Unsigned(1)),
-                (1, Value::Unsigned(2)),
-                (2, Value::Unsigned(3)),
-                (3, Value::Unsigned(4)),
-                (4, Value::Unsigned(5)),
-                (5, Value::Map(parameters)),
-            ]
-        );
+impl UpdateSurface {
+    /// Encodes the payload map.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`SurfaceDescriptor::to_value`].
+    pub fn payload(&self) -> Result<PayloadMap, MessageError> {
+        Ok(vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (2, Value::Unsigned(self.expected_revision.get())),
+            (3, Value::Unsigned(self.expected_generation.get())),
+            (4, Value::Unsigned(self.logical_width)),
+            (5, Value::Unsigned(self.logical_height)),
+            (6, Value::Unsigned(self.scale_numerator)),
+            (7, Value::Unsigned(self.scale_denominator)),
+            (8, Value::Unsigned(u64::from(self.rotation))),
+            (9, self.descriptor.to_value()?),
+            (10, Value::Unsigned(self.policy)),
+            (11, Value::Map(self.profile_parameters.clone())),
+        ])
     }
 
-    #[test]
-    fn a_surface_with_no_profile_parameters_still_carries_the_key() {
-        // An absent key and an empty map are different on the wire, and a producer that treats a
-        // missing key 5 as "no parameters" would be reading a different message than one that
-        // rejects it.
-        let payload = surface_ready_payload(
-            1,
-            1,
-            SurfaceRevision::new(1),
-            SurfaceGeneration::new(1),
-            0,
-            Vec::new(),
-        );
-
-        assert_eq!(payload.last(), Some(&(5, Value::Map(Vec::new()))));
+    /// Decodes an `UPDATE_SURFACE` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when `value` is not a strict `UPDATE_SURFACE` map, a field is
+    /// missing or has the wrong type, the rotation does not fit in `u16`, or the descriptor is
+    /// invalid.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
+        let map = StrictMap::new(
+            "UPDATE_SURFACE",
+            value,
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        )?;
+        Ok(Self {
+            context_id: map.required_u64(0)?,
+            surface_id: map.required_u64(1)?,
+            expected_revision: SurfaceRevision::new(map.required_u64(2)?),
+            expected_generation: SurfaceGeneration::new(map.required_u64(3)?),
+            logical_width: map.required_u64(4)?,
+            logical_height: map.required_u64(5)?,
+            scale_numerator: map.required_u64(6)?,
+            scale_denominator: map.required_u64(7)?,
+            rotation: u16::try_from(map.required_u64(8)?)
+                .map_err(|_| invalid_value("UPDATE_SURFACE", 8, "does not fit in u16"))?,
+            descriptor: SurfaceDescriptor::from_value(map.required(9)?)?,
+            policy: map.required_u64(10)?,
+            profile_parameters: map.required_map(11)?.to_vec(),
+        })
     }
-    use super::*;
 
-    fn surface(context_id: u64) -> SurfaceDefinition {
+    /// The definition this update would leave, keeping `current`'s immutable identity, profile,
+    /// and coordinate model.
+    pub fn replacement(&self, current: &SurfaceDefinition) -> SurfaceDefinition {
         SurfaceDefinition {
-            context_id,
-            surface_id: 7,
-            semantic_profile: DESKTOP_CONTENT.into(),
-            coordinate_model: CoordinateModel::DesktopLogicalPixels,
-            logical_width: 1920,
-            logical_height: 1080,
-            scale_numerator: 1,
-            scale_denominator: 1,
-            rotation: 0,
-            descriptor: SurfaceDescriptor {
-                role: SurfaceRole::Desktop,
-                title: "desktop".into(),
-                semantic_content_revision: 1,
-                semantic_availability: 0,
-                locator_hint: String::new(),
-            },
-            policy: 0,
-            profile_parameters: vec![],
+            context_id: self.context_id,
+            surface_id: self.surface_id,
+            semantic_profile: current.semantic_profile.clone(),
+            coordinate_model: current.coordinate_model,
+            logical_width: self.logical_width,
+            logical_height: self.logical_height,
+            scale_numerator: self.scale_numerator,
+            scale_denominator: self.scale_denominator,
+            rotation: self.rotation,
+            descriptor: self.descriptor.clone(),
+            policy: self.policy,
+            profile_parameters: self.profile_parameters.clone(),
         }
-    }
-
-    #[test]
-    fn mapping_change_advances_generation_and_requires_input_revoke() {
-        let mut state = SurfaceState::new(surface(1)).unwrap();
-        let mut replacement = surface(1);
-        replacement.logical_width = 1280;
-        let mutation = state
-            .replace_mutable(SurfaceRevision::ONE, SurfaceGeneration::ONE, replacement)
-            .unwrap();
-        assert_eq!(mutation.revision.get(), 2);
-        assert_eq!(mutation.generation.get(), 2);
-        assert!(mutation.input_must_be_revoked);
-    }
-
-    #[test]
-    fn same_local_id_in_different_contexts_is_not_same_surface() {
-        let first = surface(1);
-        let second = surface(2);
-        assert_ne!(first.context_id, second.context_id);
-        assert_eq!(first.surface_id, second.surface_id);
     }
 }
 
-/// The body of `SURFACE_READY`: a surface exists and carries this policy and profile parameters.
+/// The `SURFACE_READY` body: a surface exists with this policy and these profile parameters.
 ///
-/// Every presenter in this tree built this by hand, and identically. It is small enough that three
-/// copies looked harmless, and small enough that one drifting key would be hard to see.
-pub fn surface_ready_payload(
-    context_id: u64,
-    surface_id: u64,
-    revision: SurfaceRevision,
-    generation: SurfaceGeneration,
-    policy: u64,
-    profile_parameters: PayloadMap,
-) -> PayloadMap {
-    vec![
-        (0, Value::Unsigned(context_id)),
-        (1, Value::Unsigned(surface_id)),
-        (2, Value::Unsigned(revision.get())),
-        (3, Value::Unsigned(generation.get())),
-        (4, Value::Unsigned(policy)),
-        (5, Value::Map(profile_parameters)),
-    ]
+/// [`payload`](Self::payload) always carries key 5, even when the parameter map is empty: a
+/// missing key and an empty map are different messages on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceReady {
+    /// The owning context.
+    pub context_id: u64,
+    /// The surface, local to its context.
+    pub surface_id: u64,
+    /// The surface revision after creation.
+    pub revision: SurfaceRevision,
+    /// The surface generation, which input bindings name.
+    pub generation: SurfaceGeneration,
+    /// The effective `POLICY_*` bits.
+    pub policy: u64,
+    /// The profile-specific parameters, such as a desktop surface's canonical size.
+    pub profile_parameters: PayloadMap,
+}
+
+impl SurfaceReady {
+    /// Encodes the body as a payload map.
+    pub fn payload(self) -> PayloadMap {
+        vec![
+            (0, Value::Unsigned(self.context_id)),
+            (1, Value::Unsigned(self.surface_id)),
+            (2, Value::Unsigned(self.revision.get())),
+            (3, Value::Unsigned(self.generation.get())),
+            (4, Value::Unsigned(self.policy)),
+            (5, Value::Map(self.profile_parameters)),
+        ]
+    }
 }

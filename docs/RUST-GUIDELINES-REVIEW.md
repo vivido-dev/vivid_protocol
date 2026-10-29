@@ -14,8 +14,8 @@ redesign:
 A follow-up raised `rust-version` to 1.95 to match `vivid_sdk` and `vivido`. Nearly every
 consumer already needed 1.95 through the SDK.
 
-The open findings follow, most important first. Guideline IDs such as `M-INIT-CASCADED` name the
-rule each one comes from, and each `#[expect]` reason in the source points back here.
+The sections below record how the remaining findings were resolved and which deviations are
+deliberate. Guideline IDs such as `M-INIT-CASCADED` name the rule each one comes from.
 
 ## Errors (M-ERRORS-CANONICAL-STRUCTS)
 
@@ -36,46 +36,41 @@ a message naming the field; the dropped error says only "out of range", so `Carg
 
 ## Documentation (M-CANONICAL-DOCS)
 
-Every fallible public function now documents its errors, and every function that can panic says
-when, so `clippy::missing_errors_doc` and `clippy::missing_panics_doc` are enforced. Each module
-has `//!` documentation, and the size and CBOR constants explain how they were chosen.
+Every public item is documented, and `Cargo.toml` enables `missing_docs`. Wire fields name the
+CBOR key or byte offset their specification table assigns, and constants name their bit or code.
+Every fallible public function documents its errors, and every function that can panic says when,
+so `clippy::missing_errors_doc` and `clippy::missing_panics_doc` are enforced.
 
-`missing_docs` still reports 1,825 undocumented public items. Most are self-describing wire
-fields (722), registry and flag constants (408), and enum variants (343). The rest are 122
-methods, 165 types, 56 functions, eight associated constants, and one type alias. Documenting them would let the
-crate enable `missing_docs`; the wire fields can usually point to the specification table that
-defines them.
-
-To reproduce the count:
-
-```sh
-cargo clippy --lib -- -A clippy::all -W missing_docs
-```
+The crate root has a module map and a producer and presenter quick start that runs as a doctest.
+`Connection`, `Hello`, `cbor`, `media::raster_frame_body`, and `NativeDiscovery` have examples,
+and each module's `//!` documentation names its main types and specification sections.
 
 ## Long positional parameter lists (M-INIT-CASCADED)
 
-Sixteen public functions take five or more parameters, often several integers in a row that the
-compiler cannot tell apart:
+Public functions that took five or more positional parameters now take a message or a small
+named-field struct, so integers cannot be swapped silently:
 
-- `media::raster_delta_frame_body` (10)
-- `trace::TraceEmitter::emit` (9) and `emit_control` (7)
-- `lease::LeaseMachine::begin_resume` (8) and `begin_activation` (7)
-- `auth::resume_hello_proof` (7)
-- `geometry::fit_quad`, `media::raster_frame_body_with_compression`, and
-  `surface::surface_ready_payload` (6 each)
+- media builders and validators take `RasterFrame`, `RasterDeltaFrame`, `RasterSize`, and `AudioInitialization`;
+- `trace::TraceEmitter::emit` takes a `TraceEvent`;
+- `lease::LeaseMachine::begin_activation` and `begin_resume` take an `EstablishmentAttempt`;
+- `geometry::fit_quad` takes a `SourceSize`, and `surface::SurfaceReady` encodes its own payload;
+- `track::TrackState::admit_media` takes `ReceivedMedia`, and `ChannelOpenState::open` a
+  `ChannelOpenAttempt`;
+- the resume proof is `Hello::authenticate_resume` and `Hello::verify_resume`, and the lane tag is
+  `LaneOpen::sign` and `LaneOpen::verify`.
 
-Five of them carry `#[expect(clippy::too_many_arguments)]`, whose reasons point here. The auth tag
-functions were the worst case and now take the `ChannelOpen` or `FileTransferOpen` message
-instead. The same approach fits here: pass the decoded message or a small named-field struct.
+Keys are typed too: `ChannelKey` and `ResumeKey` cannot be passed for each other, and
+`HandshakeNonces` names the client and server nonce. No `#[expect(clippy::too_many_arguments)]`
+remains. `PathBuilder::cubic_to` and `quad_to`, `vector::Rect::new`, and `geometry::FixedRect::new`
+keep the coordinate lists every graphics API uses.
 
 ## Smaller items
 
-- **The trace clock is not mockable (M-MOCKABLE-SYSCALLS).** `TraceGuard::callback` is an
-  I/O-free sink, but timestamps come from `Instant::now()` and `Connection::trace` takes only a
-  path. It is diagnostics only, so this matters less than discovery did.
-- **The record re-export list is manual.** `messages` re-exports the `registry::record` constants
-  by name, so a new record type must be added in both places. A missing one fails to compile only
-  where someone first uses `messages::NEW_RECORD`.
+- **The trace clock is mockable (M-MOCKABLE-SYSCALLS).** Trace guards take a `TraceClock`, and
+  `TraceClock::new` accepts any time source, so tests need neither the filesystem nor real time.
+- **Record and error codes have one public path (M-SINGLE-ITEM-PATH).** The registry's `record`
+  and `error` modules are crate-private, and `messages` re-exports them by name.
+  `tests/registry.rs` fails when a live record or error code is missing from `messages`.
 
 ## Deliberate deviations
 

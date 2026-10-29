@@ -13,6 +13,24 @@
 //!
 //! The decoder enforces the profile's resource bounds before allocating: nesting depth, string
 //! length, and container length.
+//!
+//! # Examples
+//!
+//! ```
+//! use vivid_protocol::cbor::{self, Value};
+//!
+//! let value = Value::Map(vec![
+//!     (0, Value::Unsigned(42)),
+//!     (1, Value::Text("vivid".into())),
+//! ]);
+//! let bytes = cbor::encode(&value)?;
+//! assert_eq!(cbor::decode(&bytes)?, value);
+//!
+//! // Keys must be strictly increasing, so a non-canonical map does not encode.
+//! let unsorted = Value::Map(vec![(1, Value::Null), (0, Value::Null)]);
+//! assert!(cbor::encode(&unsorted).is_err());
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 use std::fmt::{self, Display, Formatter};
 use zeroize::{Zeroize, Zeroizing};
@@ -32,15 +50,24 @@ const ARGUMENT_U16: u8 = 25;
 const ARGUMENT_U32: u8 = 26;
 const ARGUMENT_U64: u8 = 27;
 
+/// One value of the constrained CBOR profile (core §5).
 #[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub enum Value {
+    /// An unsigned integer.
     Unsigned(u64),
+    /// A negative integer.
     Negative(i64),
+    /// A byte string.
     Bytes(Vec<u8>),
+    /// A UTF-8 text string.
     Text(String),
+    /// An array.
     Array(Vec<Value>),
+    /// A map with integer keys, in strictly increasing order.
     Map(Vec<(u64, Value)>),
+    /// A boolean.
     Bool(bool),
+    /// Null.
     Null,
 }
 
@@ -57,18 +84,23 @@ impl From<i64> for Value {
 /// it into a dynamic value tree or changing its canonical representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreservedEntry<'a> {
+    /// The entry's key.
     pub key: u64,
+    /// The entry's value exactly as encoded.
     pub encoded_value: &'a [u8],
 }
 
 /// An owned preserved entry for message objects that outlive their decode buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreservedField {
+    /// The entry's key.
     pub key: u64,
+    /// The entry's value exactly as encoded.
     pub encoded_value: Vec<u8>,
 }
 
 impl PreservedEntry<'_> {
+    /// Copies the entry into an owned [`PreservedField`].
     pub fn to_owned(self) -> PreservedField {
         PreservedField {
             key: self.key,
@@ -85,22 +117,26 @@ pub struct PreservingMap<'a> {
 }
 
 impl<'a> PreservingMap<'a> {
+    /// Returns the parsed value of known key `key`, if present.
     pub fn known_value(&self, key: u64) -> Option<&Value> {
         self.known
             .iter()
             .find_map(|(entry_key, value, _)| (*entry_key == key).then_some(value))
     }
 
+    /// Returns the exact encoded bytes of known key `key`, if present.
     pub fn encoded_known_value(&self, key: u64) -> Option<&'a [u8]> {
         self.known
             .iter()
             .find_map(|(entry_key, _, bytes)| (*entry_key == key).then_some(*bytes))
     }
 
+    /// Returns the unknown entries, borrowed byte-for-byte from the input.
     pub fn preserved(&self) -> &[PreservedEntry<'a>] {
         &self.preserved
     }
 
+    /// Returns owned copies of the unknown entries.
     pub fn preserved_owned(&self) -> Vec<PreservedField> {
         self.preserved
             .iter()
@@ -111,6 +147,7 @@ impl<'a> PreservingMap<'a> {
 }
 
 impl Value {
+    /// Returns the value at `key` when this is a map that has it.
     pub fn map_value(&self, key: u64) -> Option<&Value> {
         let Self::Map(entries) = self else {
             return None;
@@ -120,6 +157,7 @@ impl Value {
             .find_map(|(entry_key, value)| (*entry_key == key).then_some(value))
     }
 
+    /// Returns the value when it is an unsigned integer.
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Unsigned(value) => Some(*value),
@@ -127,6 +165,7 @@ impl Value {
         }
     }
 
+    /// Returns the value when it is an integer that fits in `i64`.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Self::Unsigned(value) => i64::try_from(*value).ok(),
@@ -135,6 +174,7 @@ impl Value {
         }
     }
 
+    /// Returns the bytes when this is a byte string.
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytes(value) => Some(value),
@@ -142,6 +182,7 @@ impl Value {
         }
     }
 
+    /// Returns the text when this is a text string.
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(value) => Some(value),
@@ -149,6 +190,7 @@ impl Value {
         }
     }
 
+    /// Returns the value when it is a boolean.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
@@ -156,6 +198,7 @@ impl Value {
         }
     }
 
+    /// Returns the elements when this is an array.
     pub fn as_array(&self) -> Option<&[Value]> {
         match self {
             Self::Array(value) => Some(value),
@@ -164,16 +207,19 @@ impl Value {
     }
 }
 
+/// Writes deterministic CBOR item by item; callers write map keys in increasing order.
 #[derive(Debug, Default)]
 pub struct Encoder {
     bytes: Vec<u8>,
 }
 
 impl Encoder {
+    /// Creates an empty encoder.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns the encoded bytes.
     pub fn into_vec(mut self) -> Vec<u8> {
         std::mem::take(&mut self.bytes)
     }
@@ -186,18 +232,22 @@ impl Encoder {
         self.bytes.zeroize();
     }
 
+    /// Starts a map of `length` entries.
     pub fn map(&mut self, length: usize) {
         self.major_length(5, length as u64);
     }
 
+    /// Starts an array of `length` elements.
     pub fn array(&mut self, length: usize) {
         self.major_length(4, length as u64);
     }
 
+    /// Writes an unsigned integer in shortest form.
     pub fn u64(&mut self, value: u64) {
         self.major_length(0, value);
     }
 
+    /// Writes a signed integer in shortest form.
     pub fn i64(&mut self, value: i64) {
         match u64::try_from(value) {
             Ok(value) => self.u64(value),
@@ -206,20 +256,24 @@ impl Encoder {
         }
     }
 
+    /// Writes a byte string.
     pub fn bytes(&mut self, value: &[u8]) {
         self.major_length(2, value.len() as u64);
         self.bytes.extend_from_slice(value);
     }
 
+    /// Writes a text string.
     pub fn text(&mut self, value: &str) {
         self.major_length(3, value.len() as u64);
         self.bytes.extend_from_slice(value.as_bytes());
     }
 
+    /// Writes a boolean.
     pub fn bool(&mut self, value: bool) {
         self.bytes.push(if value { 0xf5 } else { 0xf4 });
     }
 
+    /// Writes null.
     pub fn null(&mut self) {
         self.bytes.push(0xf6);
     }
@@ -256,6 +310,7 @@ impl Drop for Encoder {
     }
 }
 
+/// A value the constrained CBOR profile cannot encode, such as an unsorted map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodeError(String);
 
@@ -414,6 +469,7 @@ fn validate_container_length(length: usize) -> Result<(), EncodeError> {
     }
 }
 
+/// Input that is not canonical constrained CBOR, such as a float or trailing bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeError(String);
 
@@ -618,21 +674,21 @@ impl Decoder<'_> {
                 Ok(value)
             }
             25 => {
-                let value = u64::from(u16::from_be_bytes(self.take(2)?.try_into().unwrap()));
+                let value = u64::from(u16::from_be_bytes(self.take_array()?));
                 if u8::try_from(value).is_ok() {
                     return Err(DecodeError("non-shortest CBOR integer encoding".into()));
                 }
                 Ok(value)
             }
             26 => {
-                let value = u64::from(u32::from_be_bytes(self.take(4)?.try_into().unwrap()));
+                let value = u64::from(u32::from_be_bytes(self.take_array()?));
                 if u16::try_from(value).is_ok() {
                     return Err(DecodeError("non-shortest CBOR integer encoding".into()));
                 }
                 Ok(value)
             }
             27 => {
-                let value = u64::from_be_bytes(self.take(8)?.try_into().unwrap());
+                let value = u64::from_be_bytes(self.take_array()?);
                 if u32::try_from(value).is_ok() {
                     return Err(DecodeError("non-shortest CBOR integer encoding".into()));
                 }
@@ -663,6 +719,10 @@ impl Decoder<'_> {
         let value = &self.bytes[self.offset..end];
         self.offset = end;
         Ok(value)
+    }
+
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        Ok(crate::array_at(self.take(N)?, 0))
     }
 }
 

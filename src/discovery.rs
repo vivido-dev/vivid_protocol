@@ -1,4 +1,9 @@
-//! Native Vivid 1.5 endpoint and root-secret discovery.
+//! Native endpoint and root-secret discovery from the environment (core §3).
+//!
+//! A native producer learns where to connect, and how to authenticate, from environment variables
+//! such as [`ENDPOINT_CONTROL`] and [`ROOT_SECRET`]. [`NativeDiscovery::from_environment`] reads
+//! and validates them, and [`NativeDiscovery::from_lookup`] takes them from any source, which keeps
+//! tests off the process environment. The secret never appears in `Debug` output.
 
 use std::{env, fmt, io};
 use zeroize::Zeroizing;
@@ -9,12 +14,33 @@ use crate::{
     wire::Endpoint,
 };
 
+/// Environment variable naming the control endpoint.
 pub const ENDPOINT_CONTROL: &str = "VIVID_ENDPOINT_CONTROL";
+/// Environment variable naming the interactive-lane endpoint.
 pub const ENDPOINT_INTERACTIVE: &str = "VIVID_ENDPOINT_INTERACTIVE";
+/// Environment variable naming the realtime-media endpoint.
 pub const ENDPOINT_REALTIME: &str = "VIVID_ENDPOINT_REALTIME";
+/// Environment variable naming the bulk endpoint.
 pub const ENDPOINT_BULK: &str = "VIVID_ENDPOINT_BULK";
+/// Environment variable holding the root secret as 64 hexadecimal digits.
 pub const ROOT_SECRET: &str = "VIVID_ROOT_SECRET";
 
+/// The endpoints and root secret a native producer reads from its environment (core §3).
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// use vivid_protocol::discovery::{ENDPOINT_CONTROL, NativeDiscovery, ROOT_SECRET};
+///
+/// let environment = HashMap::from([
+///     (ENDPOINT_CONTROL, "tcp:127.0.0.1:7000".to_owned()),
+///     (ROOT_SECRET, "ab".repeat(32)),
+/// ]);
+/// let discovery = NativeDiscovery::from_lookup(|name| environment.get(name).cloned())?;
+/// assert_eq!(discovery.control().as_tcp().map(|address| address.port()), Some(7000));
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct NativeDiscovery {
     control: Endpoint,
     interactive: Option<Endpoint>,
@@ -80,16 +106,19 @@ impl NativeDiscovery {
         })
     }
 
+    /// Returns the control endpoint.
     pub fn control(&self) -> &Endpoint {
         &self.control
     }
 
+    /// Returns the interactive-lane endpoint.
     pub fn interactive(&self) -> &Endpoint {
         self.interactive.as_ref().unwrap_or(&self.control)
     }
 
-    /// Returns the endpoint for a track on `lane`, falling back to the bulk and then control
-    /// endpoint.
+    /// Returns the endpoint a track on `lane` connects to.
+    ///
+    /// It falls back to the bulk endpoint and then to the control endpoint.
     ///
     /// # Errors
     ///
@@ -109,6 +138,7 @@ impl NativeDiscovery {
         }
     }
 
+    /// Returns the root secret; keep it out of logs and arguments.
     pub fn root_secret(&self) -> &Secret32 {
         &self.root_secret
     }

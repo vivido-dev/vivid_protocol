@@ -22,7 +22,9 @@ include = [
 
 [features]
 default = ["native"]
-# Native zstd raster compression and decompression, plus everything in `native-transport`.
+# Everything in `native-transport`, plus zstd raster compression and decompression through the C
+# zstd library. On wasm32 the C library is not built: those targets always decode zstd rasters with
+# pure-Rust `ruzstd` and cannot compress them, with or without this feature.
 native = ["native-transport", "dep:zstd", "dep:zstd-safe"]
 # Blocking TCP and Unix-socket `wire::Connection`, endpoint discovery, and protocol tracing.
 native-transport = []
@@ -35,6 +37,8 @@ hmac = "0.13"
 sha2 = "0.11"
 subtle = "2.6"
 zeroize = { version = "1.9", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Default features are off: they enable legacy (pre-1.0) frame decoding and dictionary building,
 # which peer-supplied rasters must never reach. The floors exclude RUSTSEC-2026-0391 and
 # RUSTSEC-2026-0395 through -0406.
@@ -50,6 +54,15 @@ name = "stage0"
 harness = false
 required-features = ["native"]
 
+[[bench]]
+name = "receive"
+harness = false
+required-features = ["native"]
+
+# Line tables let a profiler attribute benchmark time to source lines.
+[profile.bench]
+debug = 1
+
 # The §7 model checker explores ~10^6 composed states and must stay a practical part of
 # `cargo test`. opt-level 1 keeps debug assertions and cheap incremental builds while bringing
 # the exploration back to seconds.
@@ -60,6 +73,7 @@ opt-level = 1
 [lints.rust]
 ambiguous_negative_literals = "warn"
 missing_debug_implementations = "warn"
+missing_docs = "warn"
 redundant_imports = "warn"
 redundant_lifetimes = "warn"
 trivial_numeric_casts = "warn"

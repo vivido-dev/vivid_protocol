@@ -19,7 +19,10 @@ use std::fmt;
 use crate::CodecError;
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
-use crate::trace::{self, TraceComponent, TraceDirection, TraceGuard, TraceHop, TraceOutcome};
+use crate::trace::{
+    self, TraceClock, TraceComponent, TraceDirection, TraceEvent, TraceGuard, TraceHop,
+    TraceOutcome, TraceSource,
+};
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use std::io::{self, IoSlice, Read, Write};
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -45,31 +48,61 @@ use crate::messages::{
     MAX_FILE_DATA, PONG,
 };
 
+/// Bytes in a preface.
 pub const PREFACE_SIZE: usize = 16;
+/// Bytes in a record header.
 pub const HEADER_SIZE: usize = 24;
 const MAGIC: &[u8; 4] = b"VIVD";
 
+/// Record flag: a receiver that does not know the record ignores it.
 pub const RECORD_OPTIONAL: u16 = 1 << 0;
+/// Every assigned record flag.
 pub const RECORD_KNOWN_FLAGS: u16 = RECORD_OPTIONAL;
+/// Most records a batched writer buffers before flushing on its own.
+///
+/// Batching amortizes the system call across small records; the cap keeps a batch from delaying
+/// the first record by more than a few dozen records' worth of send time when a caller never
+/// flushes.
 #[cfg(any(feature = "native", feature = "native-transport"))]
 const BATCH_RECORD_LIMIT: usize = 32;
+/// Most slices one vectored write hands the operating system: the header plus 15 body parts.
+///
+/// Every platform's `IOV_MAX` is far larger; the cap keeps the slice array on the stack. A record
+/// with more parts is written in several calls.
 #[cfg(any(feature = "native", feature = "native-transport"))]
 const MAX_VECTORED_SLICES: usize = 16;
 
+/// How long a native connection may wait on a read or write before the handshake completes.
+///
+/// It bounds connecting to a stalled or wedged endpoint. Thirty seconds tolerates a presenter that
+/// is starting up or busy rendering; [`Connection::split`] clears it once the handshake succeeds,
+/// because ordinary protocol idleness is not an error.
+#[cfg(any(feature = "native", feature = "native-transport"))]
+const ESTABLISHMENT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// When a connection writer flushes records to the transport.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum FlushMode {
+    /// Flush after every record, the default.
     #[default]
     Immediate,
+    /// Hold records until an explicit flush, except flow and file-transfer records, which always
+    /// flush.
     Batched,
 }
 
+/// The kind of connection a preface opens (core §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
 pub enum ConnectionKind {
+    /// The control connection; it starts with `HELLO`.
     Control = 0,
+    /// An interactive lane; it starts with `LANE_OPEN`.
     Lane = 1,
+    /// A track connection; it starts with `CHANNEL_OPEN`.
     Track = 2,
+    /// A file-transfer connection; it starts with `FILE_TRANSFER_OPEN`.
     FileTransfer = 3,
 }
 
@@ -90,6 +123,7 @@ impl TryFrom<u8> for ConnectionKind {
 }
 
 impl ConnectionKind {
+    /// Returns the record type that must be the connection's first record.
     pub const fn required_first_record(self) -> u16 {
         match self {
             Self::Control => crate::messages::HELLO,
@@ -120,12 +154,18 @@ impl ConnectionKind {
     }
 }
 
+/// The 16-byte preface that opens every connection (core §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preface {
+    /// Major version; 1.
     pub major: u8,
+    /// Minor version; 5.
     pub minor: u8,
+    /// The connection kind.
     pub kind: ConnectionKind,
+    /// Preface flags; zero.
     pub flags: u8,
+    /// Nonzero initiator transmit-body limit, at most 64 MiB.
     pub initiator_tx_body_limit: u32,
 }
 
@@ -179,9 +219,12 @@ impl Preface {
     }
 }
 
+/// A structurally valid preface, sorted by whether its version is supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefaceClassification {
+    /// A Vivid 1.5 preface.
     Accepted(Preface),
+    /// A well-formed preface for another version; answer with [`unsupported_version_record`].
     UnsupportedVersion(Preface),
 }
 
@@ -388,8 +431,8 @@ impl Endpoint {
             Address::Unix(path) => connect_unix(path),
             Address::Tcp(address) => {
                 let stream = TcpStream::connect(address)?;
-                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+                stream.set_read_timeout(Some(ESTABLISHMENT_DEADLINE))?;
+                stream.set_write_timeout(Some(ESTABLISHMENT_DEADLINE))?;
                 stream.set_nodelay(true)?;
                 let writer = stream.try_clone()?;
                 Ok(ConnectedIo {
@@ -404,8 +447,8 @@ impl Endpoint {
 #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
 fn connect_unix(path: &Path) -> io::Result<ConnectedIo> {
     let stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(ESTABLISHMENT_DEADLINE))?;
+    stream.set_write_timeout(Some(ESTABLISHMENT_DEADLINE))?;
     let writer = stream.try_clone()?;
     Ok(ConnectedIo {
         reader: ReaderIo::Unix(stream),
@@ -819,13 +862,20 @@ impl fmt::Debug for ConnectionReader {
     }
 }
 
+/// One record whose body borrows the reader's buffer.
+///
 /// Debug output reports the body length, never body bytes that may carry tags or media.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BorrowedRecord<'a> {
+    /// Record type, such as [`crate::messages::HELLO`].
     pub record_type: u16,
+    /// Record flags, such as [`RECORD_OPTIONAL`].
     pub flags: u16,
+    /// Innermost local object ID.
     pub object_id: u64,
+    /// Directional connection sequence, starting at one.
     pub sequence: u64,
+    /// The body.
     pub body: &'a [u8],
 }
 
@@ -954,6 +1004,32 @@ impl ConnectionReader {
     }
 }
 
+/// A blocking Vivid connection over a TCP or Unix-socket endpoint, or any stream pair.
+///
+/// Opening a connection writes its preface. Records then go out with consecutive sequence
+/// numbers, and incoming bodies are checked against the receive limit before allocation. Call
+/// [`Connection::split`] once the first reply is validated to get independent reader and writer
+/// halves.
+///
+/// # Examples
+///
+/// ```no_run
+/// use vivid_protocol::discovery::NativeDiscovery;
+/// use vivid_protocol::messages;
+/// use vivid_protocol::wire::{Connection, ConnectionKind};
+///
+/// # fn hello_body() -> Vec<u8> { Vec::new() }
+/// # fn main() -> std::io::Result<()> {
+/// let discovery = NativeDiscovery::from_environment()?;
+/// let mut connection = Connection::open(discovery.control(), ConnectionKind::Control)?;
+/// connection.write_record(messages::HELLO, 0, 0, &hello_body())?;
+/// let welcome = connection.read_record()?;
+/// assert_eq!(welcome.record_type, messages::WELCOME);
+/// let (mut reader, writer) = connection.split()?;
+/// # let _ = (&mut reader, writer);
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(any(feature = "native", feature = "native-transport"))]
 #[derive(Debug)]
 pub struct Connection {
@@ -984,11 +1060,15 @@ impl Connection {
     ///
     /// Returns any error from writing the preface to `writer`.
     pub fn from_streams(
-        reader: Box<dyn Read + Send>,
-        writer: Box<dyn Write + Send>,
+        reader: impl Read + Send + 'static,
+        writer: impl Write + Send + 'static,
         kind: ConnectionKind,
     ) -> io::Result<Self> {
-        Self::new(Some(ReaderIo::Other(reader)), WriterIo::Live(writer), kind)
+        Self::new(
+            Some(ReaderIo::Other(Box::new(reader))),
+            WriterIo::Live(Box::new(writer)),
+            kind,
+        )
     }
 
     /// Create a new, private metadata-only NDJSON trace. Existing paths are rejected.
@@ -999,7 +1079,12 @@ impl Connection {
     /// Returns [`io::ErrorKind::AlreadyExists`] when `path` exists, and any error creating its
     /// parent directory or the file.
     pub fn trace(path: &Path, kind: ConnectionKind) -> io::Result<Self> {
-        let guard = TraceGuard::file(path, TraceComponent::Protocol, TraceHop::Local, [0; 16])?;
+        let source = TraceSource {
+            component: TraceComponent::PROTOCOL,
+            hop: TraceHop::Local,
+            local_session_hint: [0; 16],
+        };
+        let guard = TraceGuard::file(path, source, TraceClock::process())?;
         Self::new(None, WriterIo::Trace(guard), kind)
     }
 
@@ -1069,6 +1154,7 @@ impl Connection {
         Ok((reader, self.writer))
     }
 
+    /// Returns a clone of the connection's writer half.
     pub fn writer(&self) -> ConnectionWriter {
         self.writer.clone()
     }
@@ -1255,14 +1341,19 @@ fn writer_closed_error() -> io::Error {
     )
 }
 
+/// The three ceilings on one direction's record bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectionalLimits {
+    /// What the peer declared it accepts.
     pub peer_limit: u32,
+    /// What the negotiated profiles allow.
     pub profile_limit: u32,
+    /// The protocol's hard ceiling.
     pub hard_limit: u32,
 }
 
 impl DirectionalLimits {
+    /// Returns the smallest of the three limits.
     pub fn effective(self) -> u32 {
         self.peer_limit.min(self.profile_limit).min(self.hard_limit)
     }
@@ -1286,17 +1377,17 @@ fn write_writer_parts(io: &mut WriterIo, header: &[u8], parts: &[&[u8]]) -> io::
         let header = RecordHeader::decode(header.try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid trace record header")
         })?);
-        guard.emitter().emit(
-            TraceDirection::Send,
-            header.record_type,
-            u64::from(header.body_length),
-            header.sequence,
-            trace::object_kind(header.record_type, header.object_id),
-            Some(header.object_id),
-            None,
-            None,
-            TraceOutcome::Ok,
-        );
+        guard.emitter().emit(TraceEvent {
+            direction: TraceDirection::Send,
+            record_type: header.record_type,
+            body_length: u64::from(header.body_length),
+            connection_sequence: header.sequence,
+            object_kind: trace::object_kind(header.record_type, header.object_id),
+            object_id: Some(header.object_id),
+            request_id: None,
+            causation_id: None,
+            outcome: TraceOutcome::Ok,
+        });
         return Ok(());
     }
     let mut part_index = 0_usize;
@@ -1437,12 +1528,19 @@ fn flush_writer(io: &mut WriterIo) -> io::Result<()> {
     }
 }
 
+/// One record with an owned body.
+///
 /// Debug output reports the body length, never body bytes that may carry tags or media.
 pub struct Record {
+    /// Record type, such as [`crate::messages::HELLO`].
     pub record_type: u16,
+    /// Record flags, such as [`RECORD_OPTIONAL`].
     pub flags: u16,
+    /// Innermost local object ID.
     pub object_id: u64,
+    /// Directional connection sequence, starting at one.
     pub sequence: u64,
+    /// The body.
     pub body: Vec<u8>,
 }
 
@@ -1479,16 +1577,23 @@ fn debug_record(
         .finish()
 }
 
+/// The 24-byte header before every record body (core §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordHeader {
+    /// Body length in bytes.
     pub body_length: u32,
+    /// Record type.
     pub record_type: u16,
+    /// Record flags.
     pub flags: u16,
+    /// Innermost local object ID.
     pub object_id: u64,
+    /// Directional connection sequence.
     pub sequence: u64,
 }
 
 impl RecordHeader {
+    /// Encodes the header in its big-endian wire layout.
     pub fn encode(self) -> [u8; HEADER_SIZE] {
         let mut bytes = [0_u8; HEADER_SIZE];
         bytes[0..4].copy_from_slice(&self.body_length.to_be_bytes());
@@ -1499,6 +1604,7 @@ impl RecordHeader {
         bytes
     }
 
+    /// Decodes a header from its big-endian wire layout.
     pub fn decode(bytes: [u8; HEADER_SIZE]) -> Self {
         Self {
             body_length: u32::from_be_bytes(crate::array_at(&bytes, 0)),
@@ -1510,6 +1616,7 @@ impl RecordHeader {
     }
 }
 
+/// Encodes a Vivid 1.5 preface for `kind` that accepts bodies up to `maximum` bytes.
 pub fn encode_preface(kind: ConnectionKind, maximum: u32) -> [u8; PREFACE_SIZE] {
     preface_bytes(kind, maximum, VIVID_MAJOR, VIVID_MINOR)
 }

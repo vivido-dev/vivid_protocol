@@ -1,3 +1,10 @@
+//! Send-path benchmark: what a producer spends framing, encoding, and writing records.
+//!
+//! Runs every stage-0 scenario, compares the results with the stage-0 gate, and writes a JSON
+//! report to `target/stage0-benchmark.json`, or to the path given with `--output`. Run it with
+//! `cargo bench --bench stage0`; `--samples` sets the runs per scenario, at least 3. The receive
+//! path is measured by `receive`.
+
 #![expect(
     clippy::cast_precision_loss,
     reason = "benchmark reports convert byte and latency counts to floating-point rates"
@@ -20,7 +27,9 @@ use std::time::{Duration, Instant};
 
 use stage0::allocator::{AllocationSnapshot, CountingAllocator, measure};
 use stage0::scenarios::{Delivery, Flow, MediaKind, Scenario};
-use vivid_protocol::media::{self, AudioPacket, RasterDeltaOperation, VideoPacket};
+use vivid_protocol::media::{
+    self, AudioPacket, RasterDeltaFrame, RasterDeltaOperation, RasterFrame, VideoPacket,
+};
 use vivid_protocol::messages::{AUDIO_PACKET, IMAGE_DATA, RASTER_FRAME, VIDEO_PACKET};
 use vivid_protocol::wire::{Connection, ConnectionKind, HEADER_SIZE};
 
@@ -477,13 +486,13 @@ fn send_flow(prepared: &mut PreparedFlow<'_>, mode: SendMode) -> io::Result<()> 
                     .write_record(IMAGE_DATA, 0, prepared.flow.object_id, &body)?;
             }
             (MediaKind::Raster { width, height }, SendMode::Stage0) => {
-                let prefix = media::raster_full_frame_prefix(
-                    1,
-                    record_id,
+                let prefix = media::raster_full_frame_prefix(&RasterFrame {
+                    epoch: 1,
+                    frame_id: record_id,
                     width,
                     height,
-                    prepared.payload.len(),
-                )?;
+                    rgba: &prepared.payload,
+                })?;
                 prepared.connection.write_record_parts(
                     RASTER_FRAME,
                     0,
@@ -492,8 +501,13 @@ fn send_flow(prepared: &mut PreparedFlow<'_>, mode: SendMode) -> io::Result<()> 
                 )?;
             }
             (MediaKind::Raster { width, height }, SendMode::PreStage0) => {
-                let body =
-                    media::raster_frame_body(1, record_id, width, height, &prepared.payload)?;
+                let body = media::raster_frame_body(&RasterFrame {
+                    epoch: 1,
+                    frame_id: record_id,
+                    width,
+                    height,
+                    rgba: &prepared.payload,
+                })?;
                 prepared.connection.write_record(
                     RASTER_FRAME,
                     0,
@@ -829,9 +843,15 @@ fn stage4_evidence(mode: Stage4Mode) -> io::Result<Stage4Evidence> {
     let full_pixels = u64::from(WIDTH) * u64::from(HEIGHT);
     let full_rgba = vec![0_u8; usize::try_from(full_pixels.saturating_mul(4)).unwrap()];
     let full_bytes = u64::try_from(
-        media::raster_frame_body(1, 1, WIDTH, HEIGHT, &full_rgba)?
-            .len()
-            .saturating_add(HEADER_SIZE),
+        media::raster_frame_body(&RasterFrame {
+            epoch: 1,
+            frame_id: 1,
+            width: WIDTH,
+            height: HEIGHT,
+            rgba: &full_rgba,
+        })?
+        .len()
+        .saturating_add(HEADER_SIZE),
     )
     .unwrap();
     if mode == Stage4Mode::Disabled {
@@ -877,15 +897,17 @@ fn stage4_evidence(mode: Stage4Mode) -> io::Result<Stage4Evidence> {
     ];
     let scroll_optimized_bytes = u64::try_from(
         media::raster_delta_frame_body(
-            1,
-            2,
-            1,
-            0,
-            0,
-            WIDTH,
-            HEIGHT,
+            &RasterDeltaFrame {
+                epoch: 1,
+                frame_id: 2,
+                base_frame_id: 1,
+                pts_us: 0,
+                duration_us: 0,
+                width: WIDTH,
+                height: HEIGHT,
+                operations: &scroll_operations,
+            },
             16,
-            &scroll_operations,
             false,
         )?
         .len()
@@ -904,15 +926,17 @@ fn stage4_evidence(mode: Stage4Mode) -> io::Result<Stage4Evidence> {
     }];
     let search_optimized_bytes = u64::try_from(
         media::raster_delta_frame_body(
-            1,
-            2,
-            1,
-            0,
-            0,
-            WIDTH,
-            HEIGHT,
+            &RasterDeltaFrame {
+                epoch: 1,
+                frame_id: 2,
+                base_frame_id: 1,
+                pts_us: 0,
+                duration_us: 0,
+                width: WIDTH,
+                height: HEIGHT,
+                operations: &search_operations,
+            },
             16,
-            &search_operations,
             false,
         )?
         .len()

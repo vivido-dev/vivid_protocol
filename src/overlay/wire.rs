@@ -16,13 +16,16 @@ use super::{
 
 const SCHEMA: &str = "overlay";
 
-#[path = "text.rs"]
 pub mod text;
 
+/// The context, surface, and surface generation that name an overlay window (keys 0 through 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowAddress {
+    /// Owning context.
     pub context_id: u64,
+    /// The window's surface; also the record object ID.
     pub surface_id: u64,
+    /// The surface generation.
     pub generation: u64,
 }
 
@@ -75,8 +78,11 @@ impl WindowAddress {
 /// Revision zero creates a window; a nonzero revision conditionally replaces its options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetWindow {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// Zero to create the window, or the revision an update expects (key 3).
     pub expected_revision: u64,
+    /// Geometry and behavior (keys 4 through 8).
     pub options: WindowOptions,
 }
 
@@ -185,20 +191,30 @@ impl SetWindow {
     }
 }
 
+/// What an `OVERLAY_ACTION` asks the host to do (key 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WindowAction {
+    /// Closes the window and releases its input state (`0`).
     Close,
+    /// Focuses the window (`1`).
     Focus,
+    /// Raises the window (`2`).
     Raise,
+    /// Lowers the window (`3`).
     Lower,
+    /// Centers the window in the pane (`4`).
     Center,
 }
 
+/// An `OVERLAY_ACTION` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Action {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// The window revision the action expects (key 3).
     pub expected_revision: u64,
+    /// The action (key 4).
     pub action: WindowAction,
 }
 impl Action {
@@ -254,9 +270,13 @@ impl Action {
 /// Authoritative viewport extent is independent of terminal cells and scrollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
+    /// Logical width of the pane viewport.
     pub width: Scalar,
+    /// Logical height of the pane viewport.
     pub height: Scalar,
+    /// Positive logical-to-physical scale numerator.
     pub scale_numerator: u32,
+    /// Positive logical-to-physical scale denominator.
     pub scale_denominator: u32,
 }
 impl Viewport {
@@ -278,15 +298,22 @@ impl Viewport {
     }
 }
 
+/// The `OVERLAY_STATUS` reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     /// Key 3 is the current window revision, never zero in a successful reply.
     pub window: SetWindow,
+    /// Viewport extent and scale (keys 9 and 10).
     pub viewport: Viewport,
+    /// Whether the window has focus (key 11).
     pub focused: bool,
+    /// Last presented scene revision (key 12).
     pub scene_revision: u64,
+    /// The active vector-track binding, if any (key 13).
     pub active: Option<Submission>,
+    /// Nonzero viewport revision (key 14).
     pub viewport_revision: u64,
+    /// Highest accepted scene revision (key 15).
     pub accepted_revision: u64,
 }
 impl Status {
@@ -414,10 +441,15 @@ impl Status {
 /// Full authenticated-channel submission identity; owner is supplied by the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Submission {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// The vector track (key 3).
     pub track_id: u64,
+    /// The track's channel generation (key 4).
     pub channel_generation: u64,
+    /// The media epoch (key 5).
     pub epoch: u32,
+    /// The scene revision (key 6).
     pub revision: u64,
 }
 impl Submission {
@@ -436,14 +468,20 @@ impl Submission {
         Ok(())
     }
 }
+/// The terminal outcome of one scene submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationOutcome {
+    /// The scene was in a successfully composed host frame (`0`).
     Presented,
+    /// A newer scene or a close replaced it before composition (`1`).
     Superseded,
 }
+/// An `OVERLAY_SUBMISSION_OUTCOME` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubmissionOutcome {
+    /// The submitted scene (keys 0 through 6).
     pub submission: Submission,
+    /// The outcome (key 7).
     pub outcome: PresentationOutcome,
 }
 impl SubmissionOutcome {
@@ -498,9 +536,12 @@ impl SubmissionOutcome {
         })
     }
 }
+/// An `OVERLAY_VIEWPORT_CHANGED` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewportChanged {
+    /// Nonzero viewport revision; advances only on change (key 0).
     pub revision: u64,
+    /// Extent and scale (keys 1 and 2).
     pub viewport: Viewport,
 }
 impl ViewportChanged {
@@ -557,9 +598,12 @@ impl ViewportChanged {
     }
 }
 
+/// A `QUERY_OVERLAY` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Query {
+    /// Owning context (key 0).
     pub context_id: u64,
+    /// The window's surface (key 1).
     pub surface_id: u64,
 }
 impl Query {
@@ -593,8 +637,11 @@ impl Query {
 /// Scene revision is the revision whose hit/dispatch tree received this input, not window geometry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputEvent {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// Published scene revision the event was targeted against (key 3).
     pub scene_revision: u64,
+    /// The event (keys 4 and 5).
     pub event: Event,
 }
 impl From<super::WindowEvent> for InputEvent {
@@ -877,7 +924,9 @@ impl InputEvent {
 /// A window's complete semantic tree for one published scene (`overlay-a11y-v1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetSemantics {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// The complete semantic tree and its scene revision (keys 3 and 4).
     pub semantics: Semantics,
 }
 impl SetSemantics {
@@ -1084,7 +1133,9 @@ fn parse_node(value: &Value) -> Result<SemanticNode, MessageError> {
 /// text through the host's own paste policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clipboard {
+    /// The focused window that writes (keys 0 through 2).
     pub address: WindowAddress,
+    /// Non-empty UTF-8 text, at most 65,536 bytes (key 3).
     pub text: String,
 }
 impl Clipboard {
@@ -1124,7 +1175,9 @@ impl Clipboard {
     }
 }
 
-/// Who the host is: the defaults a toolkit needs so an overlay looks like the pane it sits in.
+/// The host's defaults for fonts, appearance, and motion.
+///
+/// A toolkit uses them so an overlay looks like the pane it sits in.
 ///
 /// Delivered separately from the viewport because appearance and motion preference change
 /// independently of geometry, and a producer that caches layout per viewport revision must not
@@ -1135,6 +1188,7 @@ pub struct Environment {
     pub font_family: String,
     /// The default size for that family, in logical pixels.
     pub font_size: Scalar,
+    /// Light or dark appearance (key 3).
     pub appearance: Appearance,
     /// Whether the user asked for reduced motion, or `None` when the host cannot tell. A host
     /// that has no such signal MUST report absence rather than assert a preference.
@@ -1144,11 +1198,14 @@ pub struct Environment {
     pub refresh_interval_us: Option<u64>,
 }
 
+/// The host's color appearance.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Appearance {
+    /// Light appearance (`0`).
     #[default]
     Light,
+    /// Dark appearance (`1`).
     Dark,
 }
 
@@ -1191,7 +1248,9 @@ impl Environment {
 /// `OVERLAY_ENV_CHANGED` (0x7036): an unsolicited interactive-lane envelope with request ID zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentChanged {
+    /// Nonzero revision; advances only when the environment changes (key 0).
     pub revision: u64,
+    /// The host environment (keys 1 through 5).
     pub environment: Environment,
 }
 impl EnvironmentChanged {
@@ -1263,10 +1322,14 @@ impl EnvironmentChanged {
     }
 }
 
+/// An `OVERLAY_INPUT_CAPTURE` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capture {
+    /// The window (keys 0 through 2).
     pub address: WindowAddress,
+    /// The window's current nonzero scene revision (key 3).
     pub scene_revision: u64,
+    /// Requests capture (`true`) or releases it (key 4).
     pub capture: bool,
 }
 impl Capture {
@@ -1303,7 +1366,9 @@ impl Capture {
 /// Renew only the authenticated lane generation, never another producer's lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Renew {
+    /// The authenticated lane's generation (key 0).
     pub lane_generation: u64,
+    /// Watchdog duration, 250,000 through 5,000,000 microseconds (key 1).
     pub watchdog_us: u64,
 }
 impl Renew {

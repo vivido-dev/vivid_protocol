@@ -14,19 +14,26 @@ const BODY_BYTES: usize = 10 + 22 + 1 + 16 + 1 + 16 + 1 + 22;
 const SUFFIX: &[u8] = b";VIVID-END";
 const ENVELOPE_BYTES: usize = BODY_BYTES + SUFFIX.len();
 
+/// The result of scanning bytes for an anchor envelope split by `ConPTY`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Scan {
     /// Exactly `consumed` raw bytes belong to this zero-width envelope.
     Complete {
+        /// Raw bytes that belong to the envelope.
         consumed: usize,
+        /// The reassembled marker body.
         body: String,
     },
+    /// The bytes could start an envelope; wait for more.
     Incomplete,
+    /// Not an envelope; pass the bytes through unchanged.
     Invalid,
 }
 
-/// Inspect a candidate starting at `V`, including a prefix or suffix split by a `ConPTY` wrap.
-/// Invalid input must be preserved byte-for-byte by the caller; never normalize arbitrary VT.
+/// Scans a candidate anchor envelope that starts at `V`.
+///
+/// A `ConPTY` wrap may split its prefix or suffix. Invalid input must be preserved byte-for-byte by
+/// the caller; never normalize arbitrary VT.
 pub fn scan(bytes: &[u8]) -> Scan {
     let input = &bytes[..bytes.len().min(MAX_TRANSPORT_BYTES)];
     let mut canonical = [0; ENVELOPE_BYTES];

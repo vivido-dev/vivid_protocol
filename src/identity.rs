@@ -1,9 +1,15 @@
-//! Complete owner-scoped identities for Vivid 1.5 state and cleanup.
+//! Complete owner-scoped identities for state lookup and cleanup (core §2.1).
+//!
+//! Local numeric IDs are unique only within their owner, so every identity carries its whole
+//! chain: a [`SurfaceIdentity`] names its context, which names its session, which names the
+//! [`PresenterInstanceId`]. Constructors reject zero IDs, and fields are private, so code outside
+//! this crate cannot build an identity that skips those checks.
 
 use std::fmt;
 
 use crate::revision::ChannelGeneration;
 
+/// An identity component that is zero or otherwise invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentityError(&'static str);
 
@@ -15,6 +21,7 @@ impl fmt::Display for IdentityError {
 
 impl std::error::Error for IdentityError {}
 
+/// Identifies one presenter instance; a session identity is this plus the session ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PresenterInstanceId(pub [u8; 16]);
 
@@ -97,10 +104,12 @@ impl SessionIdentity {
         })
     }
 
+    /// Returns the presenter instance the session lives on.
     pub const fn presenter(&self) -> PresenterInstanceId {
         self.presenter
     }
 
+    /// Returns the local session ID.
     pub const fn session_id(&self) -> u64 {
         self.session_id
     }
@@ -119,10 +128,12 @@ impl SessionIdentity {
 }
 
 impl ContextIdentity {
+    /// Returns the owning session.
     pub const fn session(&self) -> SessionIdentity {
         self.session
     }
 
+    /// Returns the local context ID.
     pub const fn context_id(&self) -> u64 {
         self.context_id
     }
@@ -189,10 +200,12 @@ impl ContextIdentity {
 }
 
 impl SurfaceIdentity {
+    /// Returns the owning context.
     pub const fn context(&self) -> ContextIdentity {
         self.context
     }
 
+    /// Returns the local surface ID.
     pub const fn surface_id(&self) -> u64 {
         self.surface_id
     }
@@ -211,10 +224,12 @@ impl SurfaceIdentity {
 }
 
 impl TrackIdentity {
+    /// Returns the owning surface.
     pub const fn surface(&self) -> SurfaceIdentity {
         self.surface
     }
 
+    /// Returns the local track ID.
     pub const fn track_id(&self) -> u64 {
         self.track_id
     }
@@ -236,10 +251,12 @@ impl TrackIdentity {
 }
 
 impl ChannelIdentity {
+    /// Returns the track.
     pub const fn track(&self) -> TrackIdentity {
         self.track
     }
 
+    /// Returns the channel generation.
     pub const fn generation(&self) -> ChannelGeneration {
         self.generation
     }
@@ -249,10 +266,12 @@ macro_rules! context_child_accessors {
     ($($name:ident => $id:ident),* $(,)?) => {
         $(
             impl $name {
+                /// Returns the owning context.
                 pub const fn context(&self) -> ContextIdentity {
                     self.context
                 }
 
+                #[doc = concat!("Returns the local `", stringify!($id), "`.")]
                 pub const fn $id(&self) -> u64 {
                     self.$id
                 }
@@ -273,42 +292,5 @@ fn nonzero(label: &'static str, value: u64) -> Result<u64, IdentityError> {
         Err(IdentityError(label))
     } else {
         Ok(value)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reused_local_numbers_do_not_alias_across_owners_or_presenters() {
-        let presenter_a = PresenterInstanceId([1; 16]);
-        let presenter_b = PresenterInstanceId([2; 16]);
-        let first = SessionIdentity::new(presenter_a, 1)
-            .unwrap()
-            .context(2)
-            .unwrap()
-            .surface(3)
-            .unwrap()
-            .track(4)
-            .unwrap();
-        let sibling = SessionIdentity::new(presenter_a, 1)
-            .unwrap()
-            .context(5)
-            .unwrap()
-            .surface(3)
-            .unwrap()
-            .track(4)
-            .unwrap();
-        let other_presenter = SessionIdentity::new(presenter_b, 1)
-            .unwrap()
-            .context(2)
-            .unwrap()
-            .surface(3)
-            .unwrap()
-            .track(4)
-            .unwrap();
-        assert_ne!(first, sibling);
-        assert_ne!(first, other_presenter);
     }
 }

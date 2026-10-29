@@ -24,7 +24,9 @@ use vivid_protocol::grant::{
 use vivid_protocol::input::{
     BindingOutcome, INPUT_CLASS_KEYBOARD, InputBinding, InputEvent, InputGate, InputTuple,
 };
-use vivid_protocol::lease::{AttemptDecision, CleanupPolicy, LeaseMachine, LeaseState};
+use vivid_protocol::lease::{
+    AttemptDecision, CleanupPolicy, EstablishmentAttempt, LeaseMachine, LeaseState,
+};
 use vivid_protocol::resource::ChannelFlow;
 use vivid_protocol::revision::{GrantGeneration, InputEpoch, SurfaceGeneration};
 use vivid_protocol::time::Monotonic;
@@ -579,15 +581,15 @@ impl Model {
     }
 
     fn attempt(&mut self) -> Result<AttemptDecision, vivid_protocol::lease::LeaseTransitionError> {
-        Rc::make_mut(&mut self.lease).begin_activation(
-            ATTEMPT,
-            CLIENT_NONCE,
-            HELLO_BODY,
-            FINGERPRINT,
-            SESSION,
-            SERVER_NONCE,
-            WELCOME_BODY.to_vec(),
-        )
+        Rc::make_mut(&mut self.lease).begin_activation(EstablishmentAttempt {
+            attempt_id: ATTEMPT,
+            client_nonce: CLIENT_NONCE,
+            hello_bytes: HELLO_BODY,
+            profile_fingerprint: FINGERPRINT,
+            session_id: SESSION,
+            server_nonce: SERVER_NONCE,
+            welcome: WELCOME_BODY.to_vec(),
+        })
     }
 
     /// Cheaply reject disabled transitions before `fire` clones the concrete protocol machines.
@@ -748,15 +750,15 @@ impl Model {
                     if self.lease.state() != LeaseState::Issued {
                         return None;
                     }
-                    match Rc::make_mut(&mut next.lease).begin_activation(
-                        ATTEMPT,
-                        CLIENT_NONCE,
-                        HELLO_BODY,
-                        FINGERPRINT,
-                        SESSION,
-                        SERVER_NONCE,
-                        WELCOME_BODY.to_vec(),
-                    ) {
+                    match Rc::make_mut(&mut next.lease).begin_activation(EstablishmentAttempt {
+                        attempt_id: ATTEMPT,
+                        client_nonce: CLIENT_NONCE,
+                        hello_bytes: HELLO_BODY,
+                        profile_fingerprint: FINGERPRINT,
+                        session_id: SESSION,
+                        server_nonce: SERVER_NONCE,
+                        welcome: WELCOME_BODY.to_vec(),
+                    }) {
                         Ok(AttemptDecision::Fresh { .. }) => Some(()),
                         other => {
                             violations.push(format!("activation was not fresh: {other:?}"));
@@ -795,15 +797,15 @@ impl Model {
                     report.cases.insert(Case::SimultaneousActivation);
                     let mut racing = next.lease.as_ref().clone();
                     if racing
-                        .begin_activation(
-                            ATTEMPT_OTHER,
-                            CLIENT_NONCE,
-                            HELLO_BODY,
-                            FINGERPRINT,
-                            SESSION,
-                            SERVER_NONCE,
-                            WELCOME_BODY.to_vec(),
-                        )
+                        .begin_activation(EstablishmentAttempt {
+                            attempt_id: ATTEMPT_OTHER,
+                            client_nonce: CLIENT_NONCE,
+                            hello_bytes: HELLO_BODY,
+                            profile_fingerprint: FINGERPRINT,
+                            session_id: SESSION,
+                            server_nonce: SERVER_NONCE,
+                            welcome: WELCOME_BODY.to_vec(),
+                        })
                         .is_ok()
                     {
                         violations.push("a different attempt displaced the pending one".to_owned());
@@ -902,13 +904,15 @@ impl Model {
                     let generation = self.lease.resume_generation();
                     match Rc::make_mut(&mut next.lease).begin_resume(
                         generation,
-                        ATTEMPT,
-                        CLIENT_NONCE,
-                        HELLO_BODY,
-                        FINGERPRINT,
-                        SESSION,
-                        SERVER_NONCE,
-                        WELCOME_BODY.to_vec(),
+                        EstablishmentAttempt {
+                            attempt_id: ATTEMPT,
+                            client_nonce: CLIENT_NONCE,
+                            hello_bytes: HELLO_BODY,
+                            profile_fingerprint: FINGERPRINT,
+                            session_id: SESSION,
+                            server_nonce: SERVER_NONCE,
+                            welcome: WELCOME_BODY.to_vec(),
+                        },
                     ) {
                         Ok(AttemptDecision::Fresh { .. }) => {
                             // The resumed attempt is fresh: admission must recur on it.
@@ -934,17 +938,19 @@ impl Model {
                         && (self.lease.state() == LeaseState::Reserved || self.control_lost);
                     let result = Rc::make_mut(&mut next.lease).begin_resume(
                         vivid_protocol::revision::ResumeGeneration::new(generation.get() - 1),
-                        if kind == T::ResumeRetryExact {
-                            ATTEMPT
-                        } else {
-                            ATTEMPT_OTHER
+                        EstablishmentAttempt {
+                            attempt_id: if kind == T::ResumeRetryExact {
+                                ATTEMPT
+                            } else {
+                                ATTEMPT_OTHER
+                            },
+                            client_nonce: CLIENT_NONCE,
+                            hello_bytes: HELLO_BODY,
+                            profile_fingerprint: FINGERPRINT,
+                            session_id: SESSION,
+                            server_nonce: SERVER_NONCE,
+                            welcome: WELCOME_BODY.to_vec(),
                         },
-                        CLIENT_NONCE,
-                        HELLO_BODY,
-                        FINGERPRINT,
-                        SESSION,
-                        SERVER_NONCE,
-                        WELCOME_BODY.to_vec(),
                     );
                     if should_replay {
                         if !matches!(result, Ok(AttemptDecision::ExactReplay { session_id: SESSION, server_nonce: SERVER_NONCE, ref welcome }) if welcome == WELCOME_BODY)
@@ -975,13 +981,15 @@ impl Model {
                     if Rc::make_mut(&mut next.lease)
                         .begin_resume(
                             vivid_protocol::revision::ResumeGeneration::new(stale),
-                            ATTEMPT,
-                            CLIENT_NONCE,
-                            HELLO_BODY,
-                            FINGERPRINT,
-                            SESSION,
-                            SERVER_NONCE,
-                            WELCOME_BODY.to_vec(),
+                            EstablishmentAttempt {
+                                attempt_id: ATTEMPT,
+                                client_nonce: CLIENT_NONCE,
+                                hello_bytes: HELLO_BODY,
+                                profile_fingerprint: FINGERPRINT,
+                                session_id: SESSION,
+                                server_nonce: SERVER_NONCE,
+                                welcome: WELCOME_BODY.to_vec(),
+                            },
                         )
                         .is_ok()
                     {
@@ -1576,15 +1584,15 @@ impl Model {
                         return None;
                     }
                     if Rc::make_mut(&mut next.other.lease)
-                        .begin_activation(
-                            ATTEMPT,
-                            CLIENT_NONCE,
-                            HELLO_BODY,
-                            FINGERPRINT,
-                            SESSION,
-                            SERVER_NONCE,
-                            WELCOME_BODY.to_vec(),
-                        )
+                        .begin_activation(EstablishmentAttempt {
+                            attempt_id: ATTEMPT,
+                            client_nonce: CLIENT_NONCE,
+                            hello_bytes: HELLO_BODY,
+                            profile_fingerprint: FINGERPRINT,
+                            session_id: SESSION,
+                            server_nonce: SERVER_NONCE,
+                            welcome: WELCOME_BODY.to_vec(),
+                        })
                         .is_err()
                     {
                         violations.push("the other owner's activation failed".to_owned());
