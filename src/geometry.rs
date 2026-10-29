@@ -23,6 +23,7 @@ pub const FIXED_ONE: i64 = 1 << 32;
 /// the complete current target extent (`NormalizedTarget`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum CoordinateSpace {
     TargetLogical = 1,
     NormalizedTarget = 2,

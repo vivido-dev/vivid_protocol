@@ -14,6 +14,7 @@ pub const MAX_ACTIVATION_TIMEOUT_US: u64 = 60_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum CleanupPolicy {
     Immediate = 0,
     SuspendOnUncleanLoss = 1,
@@ -154,8 +155,7 @@ impl SessionLeaseDefinition {
             requested_disconnect_grace_us: map.required_u64(4)?,
             cleanup_policy: CleanupPolicy::try_from(map.required_u64(5)?)?,
             permitted_profiles: profiles,
-            requested_contract: ResourceContract::from_value(map.required(7)?)
-                .map_err(|error| MessageError::Cbor(error.to_string()))?,
+            requested_contract: ResourceContract::from_value(map.required(7)?)?,
             client_public_key: map.optional_bytes(8)?.map(ToOwned::to_owned),
         };
         definition.validate()?;
@@ -211,6 +211,7 @@ pub enum AttemptDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LeaseTransitionError {
     AuthenticationFailed,
     BadState,

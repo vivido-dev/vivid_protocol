@@ -13,7 +13,7 @@ use crate::{
     auth::{self, ATTEMPT_ID_BYTES, HandshakePrk, NONCE_BYTES, Secret32},
     cbor::{self, Value},
     registry::{self, CORE_CONTROL},
-    resource::ResourceContract,
+    resource::{ResourceContract, ResourceError},
 };
 
 // Record types are re-exported by name so that each assignment reaches this module
@@ -84,9 +84,18 @@ pub const ERROR_LEASE_SUSPENDED: u64 = registry::error::LEASE_SUSPENDED;
 pub const ERROR_RATE_LIMITED: u64 = registry::error::RATE_LIMITED;
 pub const ERROR_INTEGRITY_FAILED: u64 = registry::error::INTEGRITY_FAILED;
 
+/// A control message that does not satisfy its Vivid 1.5 schema.
+///
+/// New variants may be added within 1.5 as the protocol registers new checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MessageError {
-    Cbor(String),
+    /// The body is not canonical Vivid CBOR.
+    Decode(cbor::DecodeError),
+    /// A value could not be encoded as canonical Vivid CBOR.
+    Encode(cbor::EncodeError),
+    /// A resource contract inside the message is invalid.
+    Resource(ResourceError),
     ExpectedMap(&'static str),
     MissingKey {
         schema: &'static str,
@@ -114,7 +123,9 @@ pub enum MessageError {
 impl fmt::Display for MessageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cbor(message) => write!(formatter, "CBOR error: {message}"),
+            Self::Decode(error) => write!(formatter, "invalid CBOR: {error}"),
+            Self::Encode(error) => write!(formatter, "CBOR encoding failed: {error}"),
+            Self::Resource(error) => write!(formatter, "invalid resource contract: {error}"),
             Self::ExpectedMap(schema) => write!(formatter, "{schema} is not a map"),
             Self::MissingKey { schema, key } => write!(formatter, "{schema} omits key {key}"),
             Self::UnknownKey { schema, key } => {
@@ -136,7 +147,16 @@ impl fmt::Display for MessageError {
     }
 }
 
-impl std::error::Error for MessageError {}
+impl std::error::Error for MessageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode(error) => Some(error),
+            Self::Encode(error) => Some(error),
+            Self::Resource(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<MessageError> for io::Error {
     fn from(value: MessageError) -> Self {
@@ -146,13 +166,19 @@ impl From<MessageError> for io::Error {
 
 impl From<cbor::EncodeError> for MessageError {
     fn from(value: cbor::EncodeError) -> Self {
-        Self::Cbor(value.to_string())
+        Self::Encode(value)
     }
 }
 
 impl From<cbor::DecodeError> for MessageError {
     fn from(value: cbor::DecodeError) -> Self {
-        Self::Cbor(value.to_string())
+        Self::Decode(value)
+    }
+}
+
+impl From<ResourceError> for MessageError {
+    fn from(value: ResourceError) -> Self {
+        Self::Resource(value)
     }
 }
 
@@ -321,6 +347,7 @@ pub fn ok(request_id: u64) -> Vec<u8> {
     empty(request_id)
 }
 
+#[non_exhaustive]
 pub enum HelloAuthentication {
     Root {
         proof: [u8; 32],
@@ -997,8 +1024,7 @@ impl Welcome {
         let value = Zeroizing::new(Value::Map(std::mem::take(&mut envelope.payload)));
         let welcome = {
             let map = StrictMap::preserving("WELCOME", &value, 14)?;
-            let contract = ResourceContract::from_value(map.required(12)?)
-                .map_err(|error| MessageError::Cbor(error.to_string()))?;
+            let contract = ResourceContract::from_value(map.required(12)?)?;
             Self {
                 session_id: map.required_u64(0)?,
                 session_tag: map.required_fixed_bytes(1)?,
@@ -1185,6 +1211,7 @@ pub fn unsupported_version_error() -> Vec<u8> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+#[non_exhaustive]
 pub enum LaneClass {
     Control = 0,
     Interactive = 1,
@@ -1270,6 +1297,7 @@ impl LaneOpen {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+#[non_exhaustive]
 pub enum TrackKind {
     Video = 1,
     Audio = 2,

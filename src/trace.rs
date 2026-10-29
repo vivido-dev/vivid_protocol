@@ -20,6 +20,7 @@ const TRACE_QUEUE_CAPACITY: usize = 256;
 const TRACE_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TraceComponent {
     Protocol,
     Sdk,
@@ -49,6 +50,7 @@ impl TraceComponent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TraceHop {
     Producer,
     Presenter,
@@ -74,6 +76,7 @@ impl TraceHop {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TraceDirection {
     Send,
     Receive,
@@ -93,6 +96,7 @@ impl TraceDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TraceObjectKind {
     Session,
     Surface,
@@ -124,6 +128,7 @@ impl TraceObjectKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TraceOutcome {
     Ok,
     Error,

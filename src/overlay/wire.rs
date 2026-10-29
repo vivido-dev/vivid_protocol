@@ -105,14 +105,7 @@ impl SetWindow {
         values.extend([
             (3, u(self.expected_revision)),
             (4, rectangle(self.options.bounds)),
-            (
-                5,
-                u(match self.options.mode {
-                    WindowMode::Floating => 0,
-                    WindowMode::Popup => 1,
-                    WindowMode::Modal => 2,
-                }),
-            ),
+            (5, u(self.options.mode.wire_value())),
             (6, Value::Bool(self.options.visible)),
         ]);
         if let Some(parent) = self.options.parent {
@@ -193,6 +186,7 @@ impl SetWindow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WindowAction {
     Close,
     Focus,
@@ -1151,6 +1145,7 @@ pub struct Environment {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Appearance {
     #[default]
     Light,

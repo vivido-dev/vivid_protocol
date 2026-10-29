@@ -60,15 +60,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_ceilings_match_the_published_table() {
-        // Web §5.2 states these as decimal byte counts; assert the literals so a refactor of the
-        // KiB arithmetic cannot silently move a wire-visible bound.
-        assert_eq!(MAX_SOCKET_CHUNK, 65_536);
-        assert_eq!(MAX_CONTROL_RECORD_BODY, 262_144);
-        assert_eq!(MAX_INTERACTIVE_RECORD_BODY, 65_536);
-        assert_eq!(MAX_MEDIA_RECORD_BODY, 8_388_608);
-        assert_eq!(MAX_AGGREGATE_REASSEMBLY, 33_554_432);
-        assert_eq!(MAX_PENDING_CHUNKS, 128);
+    fn the_ceilings_match_the_specification_table() {
+        // Web §5.2 is normative: read its table instead of restating the numbers here.
+        let spec = include_str!("../vivid-protocol-1.5-web-bindings.md");
+        let table = &spec[spec.find("### 5.2 Mandatory web ceilings").unwrap()..];
+        let cell = |bound: &str| -> &str {
+            let prefix = format!("| {bound} |");
+            let row = table
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("web §5.2 has no {bound:?} row"));
+            row.split('|').nth(2).unwrap().trim()
+        };
+        let bytes = |bound: &str| -> u64 {
+            let value = cell(bound).trim_end_matches(" bytes").replace(',', "");
+            value.parse().unwrap()
+        };
+        assert_eq!(
+            u64::from(MAX_SOCKET_CHUNK),
+            bytes("WebSocket binary message chunk")
+        );
+        assert_eq!(
+            u64::from(MAX_CONTROL_RECORD_BODY),
+            bytes("Control Vivid record body")
+        );
+        assert_eq!(
+            u64::from(MAX_INTERACTIVE_RECORD_BODY),
+            bytes("Interactive record body")
+        );
+        assert_eq!(
+            u64::from(MAX_MEDIA_RECORD_BODY),
+            bytes("Media Vivid record body")
+        );
+        assert_eq!(
+            MAX_AGGREGATE_REASSEMBLY,
+            bytes("Aggregate browser reassembly and queued decoded input")
+        );
+        assert_eq!(
+            u64::from(MAX_PENDING_CHUNKS),
+            bytes("Pending browser event chunks per connection")
+        );
+        assert_eq!(
+            cell("Per-connection incomplete-record reassembly"),
+            format!("One accepted record plus {REASSEMBLY_HEADROOM} bytes")
+        );
     }
 
     #[test]

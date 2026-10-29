@@ -449,17 +449,21 @@ fn decode_at_depth(bytes: &[u8], depth: usize) -> Result<Value, DecodeError> {
 ///
 /// # Errors
 ///
-/// Returns [`DecodeError`] when `known_keys` is not strictly increasing, or `bytes` is not one
-/// canonical map with unsigned, strictly increasing keys and valid values and no trailing bytes.
+/// Returns [`DecodeError`] when `bytes` is not one canonical map with unsigned, strictly
+/// increasing keys and valid values and no trailing bytes.
+///
+/// # Panics
+///
+/// Panics when `known_keys` is not strictly increasing; that list is the caller's schema, not
+/// received data.
 pub fn decode_preserving_map<'a>(
     bytes: &'a [u8],
     known_keys: &[u64],
 ) -> Result<PreservingMap<'a>, DecodeError> {
-    if known_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(DecodeError(
-            "known CBOR map keys are not strictly sorted".into(),
-        ));
-    }
+    assert!(
+        known_keys.windows(2).all(|pair| pair[0] < pair[1]),
+        "known CBOR map keys must be strictly increasing: {known_keys:?}"
+    );
     let mut decoder = Decoder { bytes, offset: 0 };
     let initial = decoder.byte()?;
     if initial >> 5 != 5 {

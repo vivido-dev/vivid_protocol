@@ -21,7 +21,9 @@
 //! zstd compression needs the `native` feature; wasm32 builds decode with a pure-Rust zstd
 //! implementation instead.
 
-use std::{borrow::Cow, fmt, io};
+use std::{borrow::Cow, fmt};
+
+use crate::{CodecError, codec::Kind};
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 use std::io::Cursor;
@@ -82,6 +84,7 @@ pub struct ParsedRasterFrame<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RasterDeltaOperation<'a> {
     Overwrite {
         x: u32,
@@ -101,6 +104,7 @@ pub enum RasterDeltaOperation<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParsedRasterDeltaOperation<'a> {
     Overwrite {
         x: u32,
@@ -130,16 +134,25 @@ pub struct ParsedRasterDeltaFrame<'a> {
     pub operations: Vec<ParsedRasterDeltaOperation<'a>>,
 }
 
+/// Why a media dimension or length cannot become a record body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SizeError {
+    /// Computing the size overflows.
     Overflow,
+    /// The size exceeds its limit: `u32` for pixel data, [`HARD_MAX_RECORD_BODY`] for bodies.
     TooLarge,
+    /// A dimension or length is zero.
     Empty,
 }
 
 impl std::fmt::Display for SizeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{self:?}")
+        formatter.write_str(match self {
+            Self::Overflow => "media size computation overflows",
+            Self::TooLarge => "media size exceeds the record limit",
+            Self::Empty => "media size is zero",
+        })
     }
 }
 
@@ -233,9 +246,9 @@ impl MediaSequence {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when `id` is zero or not greater than the last ID, or
-    /// `epoch` is lower than the last epoch.
-    pub fn accept(&mut self, id: u64, epoch: u32) -> io::Result<()> {
+    /// Returns a malformed-input [`CodecError`] when `id` is zero or not greater than the last ID,
+    /// or `epoch` is lower than the last epoch.
+    pub fn accept(&mut self, id: u64, epoch: u32) -> Result<(), CodecError> {
         if id == 0 || id <= self.last_id {
             return Err(invalid("media ID is zero or not strictly increasing"));
         }
@@ -312,15 +325,17 @@ impl fmt::Debug for AudioPacket<'_> {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
-pub fn audio_packet_prefix(packet: &AudioPacket<'_>) -> io::Result<[u8; AUDIO_PACKET_PREFIX_SIZE]> {
+/// Returns an invalid-argument [`CodecError`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
+pub fn audio_packet_prefix(
+    packet: &AudioPacket<'_>,
+) -> Result<[u8; AUDIO_PACKET_PREFIX_SIZE], CodecError> {
     packet
         .data
         .len()
         .checked_add(AUDIO_PACKET_PREFIX_SIZE)
         .and_then(|length| u32::try_from(length).ok())
         .filter(|length| *length <= HARD_MAX_RECORD_BODY)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "audio packet too large"))?;
+        .ok_or_else(|| CodecError::invalid_argument("audio packet too large"))?;
     let mut prefix = [0_u8; AUDIO_PACKET_PREFIX_SIZE];
     put_u32(&mut prefix, 0, packet.epoch);
     put_u32(&mut prefix, 4, 0);
@@ -337,8 +352,8 @@ pub fn audio_packet_prefix(packet: &AudioPacket<'_>) -> io::Result<[u8; AUDIO_PA
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
-pub fn audio_packet_body(packet: AudioPacket<'_>) -> io::Result<Vec<u8>> {
+/// Returns an invalid-argument [`CodecError`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
+pub fn audio_packet_body(packet: AudioPacket<'_>) -> Result<Vec<u8>, CodecError> {
     let prefix = audio_packet_prefix(&packet)?;
     let capacity = prefix.len() + packet.data.len();
     let mut body = Vec::with_capacity(capacity);
@@ -351,15 +366,17 @@ pub fn audio_packet_body(packet: AudioPacket<'_>) -> io::Result<Vec<u8>> {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
-pub fn video_packet_prefix(packet: &VideoPacket<'_>) -> io::Result<[u8; VIDEO_PACKET_PREFIX_SIZE]> {
+/// Returns an invalid-argument [`CodecError`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
+pub fn video_packet_prefix(
+    packet: &VideoPacket<'_>,
+) -> Result<[u8; VIDEO_PACKET_PREFIX_SIZE], CodecError> {
     packet
         .data
         .len()
         .checked_add(VIDEO_PACKET_PREFIX_SIZE)
         .and_then(|length| u32::try_from(length).ok())
         .filter(|length| *length <= HARD_MAX_RECORD_BODY)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "video packet too large"))?;
+        .ok_or_else(|| CodecError::invalid_argument("video packet too large"))?;
     let mut prefix = [0_u8; VIDEO_PACKET_PREFIX_SIZE];
     put_u32(&mut prefix, 0, packet.epoch);
     put_u32(
@@ -384,8 +401,8 @@ pub fn video_packet_prefix(packet: &VideoPacket<'_>) -> io::Result<[u8; VIDEO_PA
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
-pub fn video_packet_body(packet: VideoPacket<'_>) -> io::Result<Vec<u8>> {
+/// Returns an invalid-argument [`CodecError`] when the body would exceed [`HARD_MAX_RECORD_BODY`].
+pub fn video_packet_body(packet: VideoPacket<'_>) -> Result<Vec<u8>, CodecError> {
     let prefix = video_packet_prefix(&packet)?;
     let capacity = prefix.len() + packet.data.len();
     let mut body = Vec::with_capacity(capacity);
@@ -398,26 +415,26 @@ pub fn video_packet_body(packet: VideoPacket<'_>) -> io::Result<Vec<u8>> {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] when a dimension is zero, `data_len` is not four bytes
-/// per pixel, or the body would exceed [`HARD_MAX_RECORD_BODY`].
+/// Returns an invalid-argument [`CodecError`] when a dimension is zero, `data_len` is not four
+/// bytes per pixel, or the body would exceed [`HARD_MAX_RECORD_BODY`].
 pub fn raster_full_frame_prefix(
     epoch: u32,
     frame_id: u64,
     width: u32,
     height: u32,
     data_len: usize,
-) -> io::Result<[u8; RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE]> {
-    let expected_length = rgba8_pixel_len(width, height)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
-        as usize;
+) -> Result<[u8; RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE], CodecError> {
+    let expected_length = rgba8_pixel_len(width, height).map_err(|error| {
+        CodecError::invalid_argument("invalid raster dimensions").with_source(error)
+    })? as usize;
     if data_len != expected_length {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("RGBA data has {data_len} bytes, expected {expected_length}"),
-        ));
+        return Err(CodecError::invalid_argument(format!(
+            "RGBA data has {data_len} bytes, expected {expected_length}"
+        )));
     }
-    rgba8_raw_frame_body_len(width, height)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    rgba8_raw_frame_body_len(width, height).map_err(|error| {
+        CodecError::invalid_argument("invalid raster dimensions").with_source(error)
+    })?;
     raster_full_frame_prefix_inner(epoch, frame_id, width, height, data_len, false)
 }
 
@@ -428,23 +445,16 @@ fn raster_full_frame_prefix_inner(
     height: u32,
     data_len: usize,
     compressed: bool,
-) -> io::Result<[u8; RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE]> {
+) -> Result<[u8; RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE], CodecError> {
     if width == 0 || height == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "raster dimensions are empty",
-        ));
+        return Err(CodecError::invalid_argument("raster dimensions are empty"));
     }
-    let data_len = u32::try_from(data_len).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "raster frame exceeds u32 length",
-        )
-    })?;
+    let data_len = u32::try_from(data_len)
+        .map_err(|_| CodecError::invalid_argument("raster frame exceeds u32 length"))?;
     data_len
         .checked_add(const { crate::const_u32(RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE) })
         .filter(|length| *length <= HARD_MAX_RECORD_BODY)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raster frame too large"))?;
+        .ok_or_else(|| CodecError::invalid_argument("raster frame too large"))?;
 
     let mut prefix = [0_u8; RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE];
     put_u32(&mut prefix, 0, epoch);
@@ -472,7 +482,7 @@ fn raster_full_frame_prefix_inner(
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] when a dimension is zero, `rgba` is not exactly four
+/// Returns an invalid-argument [`CodecError`] when a dimension is zero, `rgba` is not exactly four
 /// bytes per pixel, or the body would exceed [`HARD_MAX_RECORD_BODY`].
 pub fn raster_frame_body(
     epoch: u32,
@@ -480,7 +490,7 @@ pub fn raster_frame_body(
     width: u32,
     height: u32,
     rgba: &[u8],
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, CodecError> {
     raster_frame_body_with_compression(epoch, frame_id, width, height, rgba, false)
 }
 
@@ -488,10 +498,10 @@ pub fn raster_frame_body(
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] when a dimension is zero, `rgba` is not exactly four
+/// Returns an invalid-argument [`CodecError`] when a dimension is zero, `rgba` is not exactly four
 /// bytes per pixel, or the body would exceed [`HARD_MAX_RECORD_BODY`];
-/// [`io::ErrorKind::Unsupported`] when compression is requested without the `native` feature or on
-/// wasm32; and [`io::ErrorKind::InvalidData`] when compression fails.
+/// an unsupported [`CodecError`] when compression is requested without the `native` feature or on
+/// wasm32; and a malformed-input [`CodecError`] when compression fails.
 pub fn raster_frame_body_with_compression(
     epoch: u32,
     frame_id: u64,
@@ -499,32 +509,29 @@ pub fn raster_frame_body_with_compression(
     height: u32,
     rgba: &[u8],
     compress: bool,
-) -> io::Result<Vec<u8>> {
-    let expected_length = rgba8_pixel_len(width, height)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
-        as usize;
+) -> Result<Vec<u8>, CodecError> {
+    let expected_length = rgba8_pixel_len(width, height).map_err(|error| {
+        CodecError::invalid_argument("invalid raster dimensions").with_source(error)
+    })? as usize;
     if rgba.len() != expected_length {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "RGBA data has {} bytes, expected {expected_length}",
-                rgba.len()
-            ),
-        ));
+        return Err(CodecError::invalid_argument(format!(
+            "RGBA data has {} bytes, expected {expected_length}",
+            rgba.len()
+        )));
     }
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     let compressed;
     let pixels = if compress {
         #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
         {
-            compressed = zstd::bulk::compress(rgba, 1)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            compressed = zstd::bulk::compress(rgba, 1).map_err(|error| {
+                CodecError::malformed("zstd compression failed").with_source(error)
+            })?;
             compressed.as_slice()
         }
         #[cfg(any(not(feature = "native"), target_arch = "wasm32"))]
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
+            return Err(CodecError::unsupported(
                 "zstd raster compression requires the native feature",
             ));
         }
@@ -547,10 +554,10 @@ pub fn raster_frame_body_with_compression(
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] when the operation limit is outside 1 through 16, a
+/// Returns an invalid-argument [`CodecError`] when the operation limit is outside 1 through 16, a
 /// frame or base ID is zero, a source dimension is zero, the operation count exceeds the limit, an
 /// overwrite's pixels do not match its rectangle, or the body would exceed
-/// [`HARD_MAX_RECORD_BODY`]; [`io::ErrorKind::Unsupported`] when compression is requested without
+/// [`HARD_MAX_RECORD_BODY`]; an unsupported [`CodecError`] when compression is requested without
 /// the `native` feature or on wasm32.
 pub fn raster_delta_frame_body(
     epoch: u32,
@@ -563,29 +570,22 @@ pub fn raster_delta_frame_body(
     effective_operation_limit: u32,
     operations: &[RasterDeltaOperation<'_>],
     compress: bool,
-) -> io::Result<Vec<u8>> {
-    validate_delta_operation_limit(effective_operation_limit, io::ErrorKind::InvalidInput)?;
+) -> Result<Vec<u8>, CodecError> {
+    validate_delta_operation_limit(effective_operation_limit, Kind::InvalidArgument)?;
     if frame_id == 0 || base_frame_id == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        return Err(CodecError::invalid_argument(
             "delta frame and base IDs must be nonzero",
         ));
     }
     if source_width == 0 || source_height == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        return Err(CodecError::invalid_argument(
             "delta source dimensions are empty",
         ));
     }
-    let count = u32::try_from(operations.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "too many raster delta operations",
-        )
-    })?;
+    let count = u32::try_from(operations.len())
+        .map_err(|_| CodecError::invalid_argument("too many raster delta operations"))?;
     if count == 0 || count > effective_operation_limit {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        return Err(CodecError::invalid_argument(
             "raster delta operation count is outside the effective limit",
         ));
     }
@@ -593,10 +593,10 @@ pub fn raster_delta_frame_body(
     let descriptor_bytes = operations
         .len()
         .checked_mul(RASTER_DELTA_OPERATION_SIZE)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "delta body overflow"))?;
+        .ok_or_else(|| CodecError::invalid_argument("delta body overflow"))?;
     let payload_start = RASTER_FRAME_PREFIX_SIZE
         .checked_add(descriptor_bytes)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "delta body overflow"))?;
+        .ok_or_else(|| CodecError::invalid_argument("delta body overflow"))?;
     let mut descriptors = vec![0_u8; descriptor_bytes];
     let mut payloads: Vec<Cow<'_, [u8]>> = Vec::new();
     let mut payload_length = 0_usize;
@@ -619,41 +619,37 @@ pub fn raster_delta_frame_body(
                     *height,
                     source_width,
                     source_height,
-                    io::ErrorKind::InvalidInput,
+                    Kind::InvalidArgument,
                 )?;
-                let expected = rgba8_pixel_len(*width, *height)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
-                    as usize;
+                let expected = rgba8_pixel_len(*width, *height).map_err(|error| {
+                    CodecError::invalid_argument("invalid raster dimensions").with_source(error)
+                })? as usize;
                 if rgba.len() != expected {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
+                    return Err(CodecError::invalid_argument(
                         "delta overwrite RGBA length does not match its rectangle",
                     ));
                 }
-                let payload =
-                    if compress {
-                        #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-                        {
-                            Cow::Owned(zstd::bulk::compress(rgba, 1).map_err(|error| {
-                                io::Error::new(io::ErrorKind::InvalidData, error)
-                            })?)
-                        }
-                        #[cfg(any(not(feature = "native"), target_arch = "wasm32"))]
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Unsupported,
-                                "zstd raster compression requires the native feature",
-                            ));
-                        }
-                    } else {
-                        Cow::Borrowed(*rgba)
-                    };
-                let encoded_length = u32::try_from(payload.len()).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "delta overwrite is too large")
-                })?;
-                payload_length = payload_length.checked_add(payload.len()).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "delta body overflow")
-                })?;
+                let payload = if compress {
+                    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+                    {
+                        Cow::Owned(zstd::bulk::compress(rgba, 1).map_err(|error| {
+                            CodecError::malformed("zstd compression failed").with_source(error)
+                        })?)
+                    }
+                    #[cfg(any(not(feature = "native"), target_arch = "wasm32"))]
+                    {
+                        return Err(CodecError::unsupported(
+                            "zstd raster compression requires the native feature",
+                        ));
+                    }
+                } else {
+                    Cow::Borrowed(*rgba)
+                };
+                let encoded_length = u32::try_from(payload.len())
+                    .map_err(|_| CodecError::invalid_argument("delta overwrite is too large"))?;
+                payload_length = payload_length
+                    .checked_add(payload.len())
+                    .ok_or_else(|| CodecError::invalid_argument("delta body overflow"))?;
                 put_u32(descriptor, 0, RASTER_DELTA_OVERWRITE);
                 put_u32(descriptor, 4, *x);
                 put_u32(descriptor, 8, *y);
@@ -679,7 +675,7 @@ pub fn raster_delta_frame_body(
                     *height,
                     source_width,
                     source_height,
-                    io::ErrorKind::InvalidInput,
+                    Kind::InvalidArgument,
                 )?;
                 validate_raster_rectangle(
                     *source_x,
@@ -688,7 +684,7 @@ pub fn raster_delta_frame_body(
                     *height,
                     source_width,
                     source_height,
-                    io::ErrorKind::InvalidInput,
+                    Kind::InvalidArgument,
                 )?;
                 put_u32(descriptor, 0, RASTER_DELTA_COPY);
                 put_u32(descriptor, 4, *destination_x);
@@ -705,7 +701,7 @@ pub fn raster_delta_frame_body(
     let body_length = payload_start
         .checked_add(payload_length)
         .filter(|length| *length <= HARD_MAX_RECORD_BODY as usize)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "delta frame too large"))?;
+        .ok_or_else(|| CodecError::invalid_argument("delta frame too large"))?;
     let mut body = Vec::with_capacity(body_length);
     body.resize(RASTER_FRAME_PREFIX_SIZE, 0);
     put_u32(&mut body, 0, epoch);
@@ -732,9 +728,9 @@ pub fn raster_delta_frame_body(
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `body` is shorter than its 48-byte prefix, the
+/// Returns a malformed-input [`CodecError`] when `body` is shorter than its 48-byte prefix, the
 /// reserved field or flags are invalid, or the side data does not fit in the body.
-pub fn parse_video_packet(body: &[u8]) -> io::Result<ParsedVideoPacket<'_>> {
+pub fn parse_video_packet(body: &[u8]) -> Result<ParsedVideoPacket<'_>, CodecError> {
     if body.len() < VIDEO_PACKET_PREFIX_SIZE {
         return Err(invalid("video packet is shorter than its 48-byte prefix"));
     }
@@ -766,9 +762,9 @@ pub fn parse_video_packet(body: &[u8]) -> io::Result<ParsedVideoPacket<'_>> {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `body` is shorter than its 48-byte prefix, carries
+/// Returns a malformed-input [`CodecError`] when `body` is shorter than its 48-byte prefix, carries
 /// no access unit, or has nonzero reserved flags.
-pub fn parse_audio_packet(body: &[u8]) -> io::Result<ParsedAudioPacket<'_>> {
+pub fn parse_audio_packet(body: &[u8]) -> Result<ParsedAudioPacket<'_>, CodecError> {
     if body.len() < AUDIO_PACKET_PREFIX_SIZE {
         return Err(invalid("audio packet is shorter than its 48-byte prefix"));
     }
@@ -794,10 +790,10 @@ pub fn parse_audio_packet(body: &[u8]) -> io::Result<ParsedAudioPacket<'_>> {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `body` is shorter than one rectangle, uses an
+/// Returns a malformed-input [`CodecError`] when `body` is shorter than one rectangle, uses an
 /// unsupported layout or flags, or its pixel data does not fit the body or match the declared
 /// dimensions.
-pub fn parse_full_raster_frame(body: &[u8]) -> io::Result<ParsedRasterFrame<'_>> {
+pub fn parse_full_raster_frame(body: &[u8]) -> Result<ParsedRasterFrame<'_>, CodecError> {
     let header_length = RASTER_FRAME_PREFIX_SIZE + RASTER_RECT_SIZE;
     if body.len() < header_length {
         return Err(invalid(
@@ -848,7 +844,7 @@ pub fn parse_full_raster_frame(body: &[u8]) -> io::Result<ParsedRasterFrame<'_>>
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when the operation limit is outside 1 through 16, a
+/// Returns a malformed-input [`CodecError`] when the operation limit is outside 1 through 16, a
 /// source dimension is zero, the header is short, has unsupported flags, a zero base frame ID, or
 /// nonzero reserved fields, the operation count exceeds the limit, an operation has an unknown
 /// kind, an empty or out-of-bounds rectangle, or a payload that does not fit, or the body has
@@ -858,7 +854,7 @@ pub fn parse_delta_raster_frame(
     source_width: u32,
     source_height: u32,
     effective_operation_limit: u32,
-) -> io::Result<ParsedRasterDeltaFrame<'_>> {
+) -> Result<ParsedRasterDeltaFrame<'_>, CodecError> {
     struct ValidatedOperation {
         kind: u32,
         destination_x: u32,
@@ -872,7 +868,7 @@ pub fn parse_delta_raster_frame(
         expected_length: usize,
     }
 
-    validate_delta_operation_limit(effective_operation_limit, io::ErrorKind::InvalidData)?;
+    validate_delta_operation_limit(effective_operation_limit, Kind::Malformed)?;
     if source_width == 0 || source_height == 0 {
         return Err(invalid("delta source dimensions are empty"));
     }
@@ -925,7 +921,7 @@ pub fn parse_delta_raster_frame(
             height,
             source_width,
             source_height,
-            io::ErrorKind::InvalidData,
+            Kind::Malformed,
         )?;
         let expected_length = rgba8_pixel_len(width, height)
             .map_err(|_| invalid("raster delta rectangle dimensions overflow"))?
@@ -954,7 +950,7 @@ pub fn parse_delta_raster_frame(
                     height,
                     source_width,
                     source_height,
-                    io::ErrorKind::InvalidData,
+                    Kind::Malformed,
                 )?;
             }
             _ => return Err(invalid("raster delta has an unknown operation kind")),
@@ -986,9 +982,7 @@ pub fn parse_delta_raster_frame(
         if operation.kind == RASTER_DELTA_OVERWRITE {
             let encoded = &body[operation.payload_start..operation.payload_end];
             let rgba = if compressed {
-                if is_zstd_skippable_frame(encoded) {
-                    return Err(invalid("zstd skippable frames are forbidden"));
-                }
+                validate_zstd_frame_magic(encoded)?;
                 Cow::Owned(decode_zstd_pixels(encoded, operation.expected_length)?)
             } else {
                 Cow::Borrowed(encoded)
@@ -1026,30 +1020,47 @@ pub fn parse_delta_raster_frame(
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when the dimensions overflow, the zstd stream is invalid,
-/// uses skippable frames, a dictionary, or trailing frames, or decompresses to the wrong size.
-/// Returns [`io::ErrorKind::Unsupported`] for compressed frames without the `native` feature
+/// Returns a malformed-input [`CodecError`] when the dimensions overflow, the zstd stream is
+/// invalid, uses skippable frames, a dictionary, or trailing frames, or decompresses to the wrong
+/// size. Returns an unsupported [`CodecError`] for compressed frames without the `native` feature
 /// outside wasm32.
-pub fn decode_raster_pixels(frame: ParsedRasterFrame<'_>) -> io::Result<Vec<u8>> {
+pub fn decode_raster_pixels(frame: ParsedRasterFrame<'_>) -> Result<Vec<u8>, CodecError> {
     let expected = rgba8_pixel_len(frame.width, frame.height)
         .map_err(|_| invalid("raster dimensions overflow"))? as usize;
     if !frame.compressed {
         return Ok(frame.pixels.to_vec());
     }
-    if is_zstd_skippable_frame(frame.pixels) {
-        return Err(invalid("zstd skippable frames are forbidden"));
-    }
+    validate_zstd_frame_magic(frame.pixels)?;
     decode_zstd_pixels(frame.pixels, expected)
 }
 
-fn is_zstd_skippable_frame(bytes: &[u8]) -> bool {
-    bytes.len() < 4
-        || u32::from_le_bytes(bytes[..4].try_into().unwrap()) & 0xffff_fff0 == 0x184d_2a50
+/// Magic number, little-endian, that opens every standard zstd frame (RFC 8878 §3.1.1).
+///
+/// Raster payloads must be exactly one standard frame. Legacy frames (zstd 0.1 through 0.7) use
+/// other magic numbers and decoder paths no Vivid sender needs, so they are refused before any
+/// decoder runs, even where the zstd library could still read them.
+const ZSTD_FRAME_MAGIC: u32 = 0xfd2f_b528;
+
+/// Skippable frames (RFC 8878 §3.1.2) use magic numbers `0x184D2A50` through `0x184D2A5F`.
+const ZSTD_SKIPPABLE_MAGIC: u32 = 0x184d_2a50;
+const ZSTD_SKIPPABLE_MAGIC_MASK: u32 = 0xffff_fff0;
+
+fn validate_zstd_frame_magic(bytes: &[u8]) -> Result<(), CodecError> {
+    let magic = (bytes.len() >= 4).then(|| u32::from_le_bytes(crate::array_at(bytes, 0)));
+    match magic {
+        Some(ZSTD_FRAME_MAGIC) => Ok(()),
+        Some(magic) if magic & ZSTD_SKIPPABLE_MAGIC_MASK == ZSTD_SKIPPABLE_MAGIC => {
+            Err(invalid("zstd skippable frames are forbidden"))
+        }
+        _ => Err(invalid(
+            "zstd raster is not a standard zstd frame; legacy frames are forbidden",
+        )),
+    }
 }
 
-fn validate_delta_operation_limit(limit: u32, kind: io::ErrorKind) -> io::Result<()> {
+fn validate_delta_operation_limit(limit: u32, kind: Kind) -> Result<(), CodecError> {
     if !(1..=RASTER_DELTA_OPERATION_LIMIT).contains(&limit) {
-        return Err(io::Error::new(
+        return Err(CodecError::new(
             kind,
             "raster delta operation limit is outside 1 through 16",
         ));
@@ -1064,8 +1075,8 @@ fn validate_raster_rectangle(
     height: u32,
     source_width: u32,
     source_height: u32,
-    kind: io::ErrorKind,
-) -> io::Result<()> {
+    kind: Kind,
+) -> Result<(), CodecError> {
     if width == 0
         || height == 0
         || x.checked_add(width)
@@ -1073,7 +1084,7 @@ fn validate_raster_rectangle(
         || y.checked_add(height)
             .is_none_or(|bottom| bottom > source_height)
     {
-        return Err(io::Error::new(
+        return Err(CodecError::new(
             kind,
             "raster delta rectangle is empty, overflows, or exceeds the source",
         ));
@@ -1082,7 +1093,7 @@ fn validate_raster_rectangle(
 }
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
+fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> Result<Vec<u8>, CodecError> {
     if zstd_safe::get_dict_id_from_frame(pixels).is_some()
         || zstd_safe::find_frame_compressed_size(pixels).ok() != Some(pixels.len())
     {
@@ -1098,7 +1109,8 @@ fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
     decoder
         .by_ref()
         .take((expected + 1) as u64)
-        .read_to_end(&mut output)?;
+        .read_to_end(&mut output)
+        .map_err(|error| invalid("invalid zstd frame").with_source(error))?;
     if output.len() != expected {
         return Err(invalid(
             "zstd raster has wrong output size or trailing data",
@@ -1108,14 +1120,15 @@ fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
+fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> Result<Vec<u8>, CodecError> {
     let mut decoder = ruzstd::decoding::StreamingDecoder::new(pixels)
         .map_err(|_| invalid("invalid zstd frame"))?;
     let mut output = Vec::with_capacity(expected);
     decoder
         .by_ref()
         .take((expected + 1) as u64)
-        .read_to_end(&mut output)?;
+        .read_to_end(&mut output)
+        .map_err(|error| invalid("invalid zstd frame").with_source(error))?;
     if output.len() != expected
         || !decoder.decoder.is_finished()
         || u64::try_from(pixels.len()) != Ok(decoder.decoder.bytes_read_from_source())
@@ -1128,9 +1141,8 @@ fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(all(not(feature = "native"), not(target_arch = "wasm32")))]
-fn decode_zstd_pixels(_pixels: &[u8], _expected: usize) -> io::Result<Vec<u8>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
+fn decode_zstd_pixels(_pixels: &[u8], _expected: usize) -> Result<Vec<u8>, CodecError> {
+    Err(CodecError::unsupported(
         "zstd raster decoding requires either native support or wasm32",
     ))
 }
@@ -1167,8 +1179,8 @@ pub fn valid_audio_packetization(codec: &str, packetization: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when the codec and packetization are not a portable pair,
-/// `extradata` exceeds 64 KiB, or it fails the codec's own check: [`validate_opus_head`],
+/// Returns a malformed-input [`CodecError`] when the codec and packetization are not a portable
+/// pair, `extradata` exceeds 64 KiB, or it fails the codec's own check: [`validate_opus_head`],
 /// [`validate_vorbis_headers`], [`validate_flac_streaminfo`], or
 /// [`validate_aac_audio_specific_config`].
 pub fn validate_audio_initialization(
@@ -1177,7 +1189,7 @@ pub fn validate_audio_initialization(
     extradata: &[u8],
     sample_rate: u32,
     channels: u16,
-) -> io::Result<()> {
+) -> Result<(), CodecError> {
     if !valid_audio_packetization(codec, packetization) || extradata.len() > 65_536 {
         return Err(invalid("invalid portable audio initialization"));
     }
@@ -1200,14 +1212,14 @@ const AAC_SAMPLE_RATES: [u32; 13] = [
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `config` is truncated, has a null object type or
+/// Returns a malformed-input [`CodecError`] when `config` is truncated, has a null object type or
 /// invalid sampling frequency, carries an invalid or unsupported channel configuration, or
 /// disagrees with `sample_rate` or `channels`.
 pub fn validate_aac_audio_specific_config(
     config: &[u8],
     sample_rate: u32,
     channels: u16,
-) -> io::Result<()> {
+) -> Result<(), CodecError> {
     let mut reader = AscBitReader::new(config);
     let audio_object_type = reader
         .read_audio_object_type()
@@ -1364,10 +1376,10 @@ impl<'a> AscBitReader<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `sample_rate` is not 48 kHz, the header is short or
-/// lacks its signature, the version or channel count is unsupported, or the channel mapping is
+/// Returns a malformed-input [`CodecError`] when `sample_rate` is not 48 kHz, the header is short
+/// or lacks its signature, the version or channel count is unsupported, or the channel mapping is
 /// invalid for its family.
-pub fn validate_opus_head(head: &[u8], sample_rate: u32, channels: u16) -> io::Result<()> {
+pub fn validate_opus_head(head: &[u8], sample_rate: u32, channels: u16) -> Result<(), CodecError> {
     if sample_rate != 48_000 || head.len() < 19 || &head[..8] != b"OpusHead" {
         return Err(invalid(
             "invalid OpusHead signature, length, or decode rate",
@@ -1410,9 +1422,13 @@ pub fn validate_opus_head(head: &[u8], sample_rate: u32, channels: u16) -> io::R
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when the headers are not three-header Xiph lacing, are
+/// Returns a malformed-input [`CodecError`] when the headers are not three-header Xiph lacing, are
 /// truncated or overflow, have invalid signatures, or disagree with `sample_rate` or `channels`.
-pub fn validate_vorbis_headers(private: &[u8], sample_rate: u32, channels: u16) -> io::Result<()> {
+pub fn validate_vorbis_headers(
+    private: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<(), CodecError> {
     if private.first() != Some(&2) {
         return Err(invalid(
             "Vorbis initialization is not three-header Xiph lacing",
@@ -1495,7 +1511,7 @@ fn take_vorbis_length(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
     usize::try_from(length).ok()
 }
 
-fn xiph_laced_length(bytes: &[u8], cursor: &mut usize) -> io::Result<usize> {
+fn xiph_laced_length(bytes: &[u8], cursor: &mut usize) -> Result<usize, CodecError> {
     let mut length = 0_usize;
     loop {
         let value = *bytes
@@ -1515,14 +1531,14 @@ fn xiph_laced_length(bytes: &[u8], cursor: &mut usize) -> io::Result<usize> {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `streaminfo` is not 34 bytes, the block sizes are
+/// Returns a malformed-input [`CodecError`] when `streaminfo` is not 34 bytes, the block sizes are
 /// invalid, the sample rate is zero or differs from `sample_rate`, the channel count differs from
 /// `channels`, or the bit depth is outside 4 through 32.
 pub fn validate_flac_streaminfo(
     streaminfo: &[u8],
     sample_rate: u32,
     channels: u16,
-) -> io::Result<()> {
+) -> Result<(), CodecError> {
     if streaminfo.len() != 34 {
         return Err(invalid(
             "FLAC initialization is not a raw 34-byte STREAMINFO",
@@ -1550,13 +1566,13 @@ pub fn validate_flac_streaminfo(
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `data` is empty, the pair is not portable, an H.264
-/// or HEVC unit is not Annex B, or an AV1 unit sets the OBU forbidden bit.
+/// Returns a malformed-input [`CodecError`] when `data` is empty, the pair is not portable, an
+/// H.264 or HEVC unit is not Annex B, or an AV1 unit sets the OBU forbidden bit.
 pub fn validate_portable_packetization(
     codec: &str,
     packetization: &str,
     data: &[u8],
-) -> io::Result<()> {
+) -> Result<(), CodecError> {
     if data.is_empty() {
         return Err(invalid("portable access unit is empty"));
     }
@@ -1581,9 +1597,9 @@ pub fn validate_portable_packetization(
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `data` is empty or malformed for `codec`, or `codec`
-/// is not a portable codec.
-pub fn access_unit_is_key(codec: &str, data: &[u8]) -> io::Result<bool> {
+/// Returns a malformed-input [`CodecError`] when `data` is empty or malformed for `codec`, or
+/// `codec` is not a portable codec.
+pub fn access_unit_is_key(codec: &str, data: &[u8]) -> Result<bool, CodecError> {
     if data.is_empty() {
         return Err(invalid("portable access unit is empty"));
     }
@@ -1611,7 +1627,7 @@ pub fn access_unit_is_key(codec: &str, data: &[u8]) -> io::Result<bool> {
     }
 }
 
-fn annex_b_nal_headers(data: &[u8]) -> io::Result<impl Iterator<Item = u8> + '_> {
+fn annex_b_nal_headers(data: &[u8]) -> Result<impl Iterator<Item = u8> + '_, CodecError> {
     if !(data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])) {
         return Err(invalid("access unit is not Annex B"));
     }
@@ -1627,7 +1643,7 @@ fn annex_b_nal_headers(data: &[u8]) -> io::Result<impl Iterator<Item = u8> + '_>
     }))
 }
 
-fn av1_frame_is_key(data: &[u8]) -> io::Result<bool> {
+fn av1_frame_is_key(data: &[u8]) -> Result<bool, CodecError> {
     let mut offset = 0;
     while offset < data.len() {
         let header = *data
@@ -1663,7 +1679,7 @@ fn av1_frame_is_key(data: &[u8]) -> io::Result<bool> {
     Err(invalid("AV1 access unit has no frame header"))
 }
 
-fn read_leb128(data: &[u8]) -> io::Result<(usize, usize)> {
+fn read_leb128(data: &[u8]) -> Result<(usize, usize), CodecError> {
     let mut value = 0_u64;
     for (index, byte) in data.iter().copied().take(8).enumerate() {
         value |= u64::from(byte & 0x7f) << (index * 7);
@@ -1686,7 +1702,7 @@ impl<'a> BitReader<'a> {
         Self { data, bit: 0 }
     }
 
-    fn read(&mut self, count: usize) -> io::Result<u8> {
+    fn read(&mut self, count: usize) -> Result<u8, CodecError> {
         let mut value = 0_u8;
         for _ in 0..count {
             let byte = *self
@@ -1700,29 +1716,29 @@ impl<'a> BitReader<'a> {
     }
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> io::Result<u32> {
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CodecError> {
     bytes
         .get(offset..offset + 4)
         .map(|value| u32::from_be_bytes(value.try_into().unwrap()))
         .ok_or_else(|| invalid("truncated media field"))
 }
 
-fn read_u64(bytes: &[u8], offset: usize) -> io::Result<u64> {
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CodecError> {
     bytes
         .get(offset..offset + 8)
         .map(|value| u64::from_be_bytes(value.try_into().unwrap()))
         .ok_or_else(|| invalid("truncated media field"))
 }
 
-fn read_i64(bytes: &[u8], offset: usize) -> io::Result<i64> {
+fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, CodecError> {
     bytes
         .get(offset..offset + 8)
         .map(|value| i64::from_be_bytes(value.try_into().unwrap()))
         .ok_or_else(|| invalid("truncated media field"))
 }
 
-fn invalid(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn invalid(message: &'static str) -> CodecError {
+    CodecError::malformed(message)
 }
 
 fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
@@ -1751,8 +1767,8 @@ fn put_i64(bytes: &mut [u8], offset: usize, value: i64) {
 /// Largest decoder configuration accepted from an encoder.
 const MAX_H264_EXTRADATA: usize = 4096;
 
-fn annexb_invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("H.264: {message}"))
+fn annexb_invalid(message: &str) -> CodecError {
+    CodecError::malformed(format!("H.264: {message}"))
 }
 
 /// The immutable H.264 parameters a Vivid `VideoConfiguration` needs.
@@ -1775,9 +1791,9 @@ pub struct H264DecoderDescription {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `extradata` is neither a valid avcC configuration
+/// Returns a malformed-input [`CodecError`] when `extradata` is neither a valid avcC configuration
 /// nor Annex B parameter sets with an SPS and a PPS, or the configuration is oversized.
-pub fn h264_decoder_description(extradata: &[u8]) -> io::Result<H264DecoderDescription> {
+pub fn h264_decoder_description(extradata: &[u8]) -> Result<H264DecoderDescription, CodecError> {
     let avcc = if extradata.first() == Some(&1) {
         if extradata.len() < 7 || extradata.len() > MAX_H264_EXTRADATA {
             return Err(annexb_invalid("avcC decoder configuration is invalid"));
@@ -1806,9 +1822,9 @@ pub fn h264_decoder_description(extradata: &[u8]) -> io::Result<H264DecoderDescr
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `unit` is empty or is neither Annex B nor
+/// Returns a malformed-input [`CodecError`] when `unit` is empty or is neither Annex B nor
 /// well-formed length-prefixed NAL units.
-pub fn ensure_annexb(unit: &[u8]) -> io::Result<Cow<'_, [u8]>> {
+pub fn ensure_annexb(unit: &[u8]) -> Result<Cow<'_, [u8]>, CodecError> {
     if unit.is_empty() {
         return Err(annexb_invalid("access unit is empty"));
     }
@@ -1826,7 +1842,7 @@ fn starts_with_start_code(unit: &[u8]) -> bool {
 ///
 /// The buffer must be consumed exactly: a trailing remainder means the guess that this was AVCC
 /// was wrong, and continuing would emit a truncated access unit.
-fn annexb_from_length_prefixed(unit: &[u8]) -> io::Result<Vec<u8>> {
+fn annexb_from_length_prefixed(unit: &[u8]) -> Result<Vec<u8>, CodecError> {
     let mut annexb = Vec::with_capacity(unit.len());
     let mut cursor = 0_usize;
     while cursor < unit.len() {
@@ -1873,9 +1889,9 @@ pub fn with_parameter_sets(parameter_sets: &[u8], unit: &[u8]) -> Vec<u8> {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `avcc` is short, has the wrong version, or lacks a
+/// Returns a malformed-input [`CodecError`] when `avcc` is short, has the wrong version, or lacks a
 /// valid SPS or PPS.
-pub fn annexb_from_avcc(avcc: &[u8]) -> io::Result<Vec<u8>> {
+pub fn annexb_from_avcc(avcc: &[u8]) -> Result<Vec<u8>, CodecError> {
     if avcc.len() < 7 || avcc[0] != 1 {
         return Err(annexb_invalid("avcC decoder configuration is invalid"));
     }
@@ -1926,7 +1942,7 @@ pub fn annexb_from_avcc(avcc: &[u8]) -> io::Result<Vec<u8>> {
     Ok(annexb)
 }
 
-fn take_avcc_nal<'a>(avcc: &'a [u8], cursor: &mut usize) -> io::Result<&'a [u8]> {
+fn take_avcc_nal<'a>(avcc: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], CodecError> {
     let length_end = cursor
         .checked_add(2)
         .filter(|end| *end <= avcc.len())
@@ -1951,9 +1967,9 @@ fn take_avcc_nal<'a>(avcc: &'a [u8], cursor: &mut usize) -> io::Result<&'a [u8]>
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `extradata` lacks an SPS or a PPS, or the
+/// Returns a malformed-input [`CodecError`] when `extradata` lacks an SPS or a PPS, or the
 /// configuration would be oversized.
-pub fn avcc_from_annexb(extradata: &[u8]) -> io::Result<Vec<u8>> {
+pub fn avcc_from_annexb(extradata: &[u8]) -> Result<Vec<u8>, CodecError> {
     let nals = annexb_nals(extradata);
     let sps = nals
         .iter()
@@ -2462,6 +2478,25 @@ mod tests {
         body[68..72].copy_from_slice(&compressed_length.to_be_bytes());
         let parsed = parse_full_raster_frame(&body).unwrap();
         decode_raster_pixels(parsed).unwrap_err();
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn zstd_rejects_legacy_and_skippable_frames_before_decoding() {
+        let pixels = vec![7; 64];
+        let body = raster_frame_body_with_compression(1, 1, 4, 4, &pixels, true).unwrap();
+        let standard = parse_full_raster_frame(&body).unwrap();
+        assert_eq!(decode_raster_pixels(standard).unwrap(), pixels);
+
+        // zstd 0.7 legacy magic (0xFD2FB527) and a skippable frame (0x184D2A50), each followed by
+        // the bytes of an otherwise valid frame body.
+        for magic in [0xfd2f_b527_u32, 0x184d_2a50] {
+            let mut forged = body.clone();
+            forged[72..76].copy_from_slice(&magic.to_le_bytes());
+            let parsed = parse_full_raster_frame(&forged).unwrap();
+            let error = decode_raster_pixels(parsed).unwrap_err();
+            assert!(error.is_malformed(), "{error}");
+        }
     }
 
     #[test]

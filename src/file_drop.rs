@@ -1,9 +1,11 @@
 //! Consent-gated presenter-to-producer regular-file transfer schemas.
 
-use std::io;
+use std::fmt;
+
+use zeroize::Zeroize;
 
 use crate::{
-    HARD_MAX_RECORD_BODY, auth,
+    CodecError, HARD_MAX_RECORD_BODY, auth,
     cbor::{self, Value},
     messages::{
         MessageError, PayloadMap, StrictMap, invalid_value, require_nonzero, validate_header_object,
@@ -29,6 +31,7 @@ pub const FILE_DROP_RESULT_RETENTION_US: u64 = 60_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum FileDropDestination {
     ShellCwd = 1,
     DesktopFolder = 2,
@@ -52,6 +55,7 @@ impl TryFrom<u64> for FileDropDestination {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum FileDropBindingState {
     Disabled = 0,
     Enabled = 1,
@@ -959,7 +963,10 @@ impl FileDropAccepted {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The first record of a file-transfer connection, authenticated with the session channel key.
+///
+/// `Debug` redacts the authentication tag, and dropping the value zeroizes it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct FileTransferOpen {
     pub session_id: u64,
     pub context_id: u64,
@@ -976,6 +983,35 @@ pub struct FileTransferOpen {
     pub maximum_records: u64,
     pub client_nonce: [u8; FILE_TRANSFER_NONCE_BYTES],
     pub authentication_tag: [u8; FILE_TRANSFER_TAG_BYTES],
+}
+
+impl fmt::Debug for FileTransferOpen {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileTransferOpen")
+            .field("session_id", &self.session_id)
+            .field("context_id", &self.context_id)
+            .field("surface_id", &self.surface_id)
+            .field("producer_epoch", &self.producer_epoch)
+            .field("grant_generation", &self.grant_generation)
+            .field("surface_generation", &self.surface_generation)
+            .field("drop_id", &self.drop_id)
+            .field("transfer_id", &self.transfer_id)
+            .field("transfer_generation", &self.transfer_generation)
+            .field("resume_offset", &self.resume_offset)
+            .field("maximum_record_body", &self.maximum_record_body)
+            .field("maximum_body_bytes", &self.maximum_body_bytes)
+            .field("maximum_records", &self.maximum_records)
+            .field("client_nonce", &self.client_nonce)
+            .field("authentication_tag", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for FileTransferOpen {
+    fn drop(&mut self) {
+        self.authentication_tag.zeroize();
+    }
 }
 
 impl FileTransferOpen {
@@ -1245,6 +1281,7 @@ impl FileFinish {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum FileResultCode {
     Committed = 0,
     Rejected = 1,
@@ -1421,20 +1458,22 @@ pub struct ParsedFileData<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `data_length` is zero or does not fit in `u32`, or
-/// the record body would exceed [`crate::HARD_MAX_RECORD_BODY`].
+/// Returns an invalid-argument [`CodecError`] when `data_length` is zero or does not fit in `u32`,
+/// or the record body would exceed [`crate::HARD_MAX_RECORD_BODY`].
 pub fn file_data_prefix(
     offset: u64,
     data_length: usize,
-) -> io::Result<[u8; FILE_DATA_PREFIX_SIZE]> {
+) -> Result<[u8; FILE_DATA_PREFIX_SIZE], CodecError> {
     let data_length = u32::try_from(data_length)
         .ok()
         .filter(|length| *length != 0)
-        .ok_or_else(|| invalid_io("file data length is zero or exceeds u32"))?;
+        .ok_or_else(|| CodecError::invalid_argument("file data length is zero or exceeds u32"))?;
     data_length
         .checked_add(const { crate::const_u32(FILE_DATA_PREFIX_SIZE) })
         .filter(|length| *length <= HARD_MAX_RECORD_BODY)
-        .ok_or_else(|| invalid_io("file data body exceeds the hard record limit"))?;
+        .ok_or_else(|| {
+            CodecError::invalid_argument("file data body exceeds the hard record limit")
+        })?;
     let mut prefix = [0_u8; FILE_DATA_PREFIX_SIZE];
     prefix[..8].copy_from_slice(&offset.to_be_bytes());
     prefix[8..12].copy_from_slice(&data_length.to_be_bytes());
@@ -1445,11 +1484,13 @@ pub fn file_data_prefix(
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidData`] when `body` is shorter than the prefix, the reserved
+/// Returns a malformed-input [`CodecError`] when `body` is shorter than the prefix, the reserved
 /// bytes are nonzero, or the declared length is zero or differs from the data actually present.
-pub fn parse_file_data(body: &[u8]) -> io::Result<ParsedFileData<'_>> {
+pub fn parse_file_data(body: &[u8]) -> Result<ParsedFileData<'_>, CodecError> {
     if body.len() < FILE_DATA_PREFIX_SIZE {
-        return Err(invalid_io("file data is shorter than its prefix"));
+        return Err(CodecError::malformed(
+            "file data is shorter than its prefix",
+        ));
     }
     let offset = u64::from_be_bytes(crate::array_at(body, 0));
     let data_length = u32::from_be_bytes(crate::array_at(body, 8)) as usize;
@@ -1457,7 +1498,7 @@ pub fn parse_file_data(body: &[u8]) -> io::Result<ParsedFileData<'_>> {
         || data_length == 0
         || data_length != body.len() - FILE_DATA_PREFIX_SIZE
     {
-        return Err(invalid_io(
+        return Err(CodecError::malformed(
             "file data has invalid length or reserved fields",
         ));
     }
@@ -1858,10 +1899,6 @@ fn is_windows_reserved_name(name: &str) -> bool {
 
 fn encode_raw(payload: PayloadMap) -> Result<Vec<u8>, MessageError> {
     Ok(cbor::encode(&zeroize::Zeroizing::new(Value::Map(payload)))?)
-}
-
-fn invalid_io(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 #[cfg(test)]

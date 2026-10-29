@@ -120,7 +120,7 @@ fn required_endpoint(
 ) -> io::Result<Endpoint> {
     lookup(name)
         .ok_or_else(|| missing(name))
-        .and_then(|value| Endpoint::parse(&value))
+        .and_then(|value| Endpoint::parse(&value).map_err(io::Error::from))
 }
 
 fn optional_endpoint(
@@ -128,7 +128,7 @@ fn optional_endpoint(
     name: &'static str,
 ) -> io::Result<Option<Endpoint>> {
     lookup(name)
-        .map(|value| Endpoint::parse(&value))
+        .map(|value| Endpoint::parse(&value).map_err(io::Error::from))
         .transpose()
 }
 
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn debug_never_exposes_discovery_values() {
         let discovery = NativeDiscovery {
-            control: Endpoint::Tcp("127.0.0.1:1234".into()),
+            control: Endpoint::parse("tcp:127.0.0.1:1234").unwrap(),
             interactive: None,
             realtime: None,
             bulk: None,
@@ -181,11 +181,14 @@ mod tests {
             (ROOT_SECRET, &secret),
         ]))
         .unwrap();
-        assert_eq!(discovery.control(), &Endpoint::Tcp("127.0.0.1:1234".into()));
+        assert_eq!(
+            discovery.control(),
+            &Endpoint::parse("tcp:127.0.0.1:1234").unwrap()
+        );
         assert_eq!(discovery.interactive(), discovery.control());
         assert_eq!(
             discovery.track(LaneClass::Bulk).unwrap(),
-            &Endpoint::Tcp("127.0.0.1:5678".into())
+            &Endpoint::parse("tcp:127.0.0.1:5678").unwrap()
         );
         assert_eq!(
             discovery.root_secret().expose(),
@@ -215,10 +218,10 @@ mod tests {
     #[test]
     fn fallback_selects_values_without_inventing_endpoint_retries() {
         let discovery = NativeDiscovery {
-            control: Endpoint::Tcp("127.0.0.1:1234".into()),
+            control: Endpoint::parse("tcp:127.0.0.1:1234").unwrap(),
             interactive: None,
             realtime: None,
-            bulk: Some(Endpoint::Tcp("127.0.0.1:5678".into())),
+            bulk: Some(Endpoint::parse("tcp:127.0.0.1:5678").unwrap()),
             root_secret: Secret32::new([7; 32]),
         };
         assert_eq!(discovery.interactive(), discovery.control());

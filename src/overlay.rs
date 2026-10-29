@@ -27,6 +27,7 @@ pub const MAX_SEMANTIC_ACTIONS: usize = 7;
 /// A closed set rather than a platform role name: a host maps these onto whatever its toolkit
 /// offers, and an unknown role must fail rather than silently become a generic group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SemanticRole {
     #[default]
     Generic,
@@ -87,6 +88,7 @@ impl SemanticRole {
 /// an arbitrary number, is deliberately absent: a host cannot synthesize one from a gesture, and
 /// inventing a payload would be a guess about what the user meant.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AccessibleAction {
     /// The node's default action, which is a click for a button and a focus for most else.
     #[default]
@@ -292,6 +294,7 @@ pub struct Scroll {
 
 /// Whether a wheel delta came from a pixel-precise device and where it sits in a gesture.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScrollPhase {
     /// A device that reports no gesture boundaries, such as an ordinary detented wheel.
     #[default]
@@ -303,10 +306,22 @@ pub enum ScrollPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WindowMode {
     Floating,
     Popup,
     Modal,
+}
+
+impl WindowMode {
+    /// The value `SET_OVERLAY_WINDOW` key 5 carries for this mode.
+    pub const fn wire_value(self) -> u64 {
+        match self {
+            Self::Floating => 0,
+            Self::Popup => 1,
+            Self::Modal => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +364,7 @@ impl WindowOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DismissReason {
     Escape,
     OutsidePress,
@@ -358,6 +374,7 @@ pub enum DismissReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     Focus(bool),
     Pointer {

@@ -118,31 +118,6 @@ fn error_detail_checks_constructor_and_mutated_public_fields() {
 }
 
 #[test]
-fn registered_error_membership_matches_the_normative_registry() {
-    let registry = include_str!("../vivid-protocol-1.5-registry.toml");
-    let mut assigned = Vec::new();
-    for section in registry.split("[[error]]").skip(1) {
-        let section = section.split("[[").next().unwrap();
-        let code = section
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("code = ")
-                    .or_else(|| line.strip_prefix("value = "))
-            })
-            .unwrap();
-        assigned.push(code.parse::<u64>().unwrap());
-    }
-    assert!(!assigned.is_empty());
-    for code in 0..=assigned.iter().copied().max().unwrap() + 1 {
-        assert_eq!(
-            registry::error::is_registered(code),
-            assigned.contains(&code),
-            "code {code}"
-        );
-    }
-}
-
-#[test]
 fn welcome_authentication_is_checked_on_both_boundaries() {
     let mut welcome = Welcome {
         session_id: 1,

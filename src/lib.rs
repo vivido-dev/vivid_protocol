@@ -3,8 +3,17 @@
 //!
 //! This crate is transport- and renderer-independent. Producers and presenters share it to keep
 //! the Vivid version, numeric registries, validation limits, and binary layouts synchronized.
+//!
+//! Binary-layout codecs report [`CodecError`]; control-message codecs report
+//! [`messages::MessageError`]. Both convert into [`std::io::Error`] for callers that use `?` in
+//! I/O code.
 
 #![forbid(unsafe_code)]
+
+mod codec;
+
+#[doc(inline)]
+pub use codec::CodecError;
 
 pub mod anchor;
 pub mod audio_input;

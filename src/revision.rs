@@ -1,6 +1,72 @@
 //! Checked Vivid 1.5 revision and generation domains.
+//!
+//! Each domain is its own type, so a surface revision cannot be passed where a track revision is
+//! expected. Values never wrap: [`advance`](SessionRevision::advance) fails at `u64::MAX`, and
+//! zero is reserved for "none yet", which [`require_nonzero`](SessionRevision::require_nonzero)
+//! rejects. Both return [`CounterError`].
 
-use std::{fmt, io};
+use std::backtrace::{Backtrace, BacktraceStatus};
+use std::{error::Error, fmt, io};
+
+/// A revision or generation that is exhausted or zero where a live value is required.
+#[derive(Debug)]
+pub struct CounterError {
+    domain: &'static str,
+    exhausted: bool,
+    backtrace: Backtrace,
+}
+
+impl CounterError {
+    fn new(domain: &'static str, exhausted: bool) -> Self {
+        Self {
+            domain,
+            exhausted,
+            backtrace: Backtrace::capture(),
+        }
+    }
+
+    /// Whether the counter was at `u64::MAX` and cannot advance.
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Whether the value was zero, which no live value may carry.
+    pub fn is_zero(&self) -> bool {
+        !self.exhausted
+    }
+
+    /// The domain that failed, such as `"surface revision"`.
+    pub fn domain(&self) -> &'static str {
+        self.domain
+    }
+
+    /// The backtrace captured when the error was created; usually disabled.
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
+    }
+}
+
+impl fmt::Display for CounterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.exhausted {
+            write!(formatter, "{} exhausted", self.domain)?;
+        } else {
+            write!(formatter, "{} must be nonzero", self.domain)?;
+        }
+        if self.backtrace.status() == BacktraceStatus::Captured {
+            write!(formatter, "\n\nbacktrace:\n{}", self.backtrace)?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for CounterError {}
+
+impl From<CounterError> for io::Error {
+    fn from(error: CounterError) -> Self {
+        io::Error::new(io::ErrorKind::InvalidData, error)
+    }
+}
 
 macro_rules! counter_type {
     ($name:ident, $label:literal) => {
@@ -23,26 +89,24 @@ macro_rules! counter_type {
             ///
             /// # Errors
             ///
-            /// Returns [`io::ErrorKind::InvalidData`] when the counter is at `u64::MAX`; a domain
+            /// Returns an exhausted [`CounterError`] when the counter is at `u64::MAX`; a domain
             /// never wraps.
-            pub fn advance(self) -> io::Result<Self> {
-                self.0.checked_add(1).map(Self).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, concat!($label, " exhausted"))
-                })
+            pub fn advance(self) -> Result<Self, CounterError> {
+                self.0
+                    .checked_add(1)
+                    .map(Self)
+                    .ok_or_else(|| CounterError::new($label, true))
             }
 
             /// Returns `self` when it is a valid live value.
             ///
             /// # Errors
             ///
-            /// Returns [`io::ErrorKind::InvalidData`] for zero, which no live value in this domain
-            /// may carry.
-            pub fn require_nonzero(self) -> io::Result<Self> {
+            /// Returns a zero [`CounterError`] for zero, which no live value in this domain may
+            /// carry.
+            pub fn require_nonzero(self) -> Result<Self, CounterError> {
                 if self.0 == 0 {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        concat!($label, " must be nonzero"),
-                    ))
+                    Err(CounterError::new($label, false))
                 } else {
                     Ok(self)
                 }
@@ -93,13 +157,18 @@ mod tests {
     }
 
     #[test]
-    fn exhaustion_is_an_error() {
-        assert_eq!(
-            ChannelGeneration::new(u64::MAX)
-                .advance()
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
+    fn exhaustion_and_zero_are_distinct_errors() {
+        let exhausted = ChannelGeneration::new(u64::MAX).advance().unwrap_err();
+        assert!(exhausted.is_exhausted() && !exhausted.is_zero());
+        assert_eq!(exhausted.domain(), "channel generation");
+        assert!(
+            exhausted
+                .to_string()
+                .starts_with("channel generation exhausted")
         );
+
+        let zero = SurfaceGeneration::ZERO.require_nonzero().unwrap_err();
+        assert!(zero.is_zero() && !zero.is_exhausted());
+        assert_eq!(io::Error::from(zero).kind(), io::ErrorKind::InvalidData);
     }
 }

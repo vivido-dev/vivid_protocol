@@ -7,6 +7,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
+use crate::CodecError;
+
 pub mod conpty;
 
 const AUTH_LABEL: &[u8] = b"VIVID-ANCHOR-3";
@@ -62,22 +64,24 @@ pub fn authenticator(
 ///
 /// # Errors
 ///
-/// Returns an error message when `context_id` or `anchor_id` is zero, or the marker would exceed
-/// [`MAX_MARKER_BYTES`].
+/// Returns an invalid-argument [`CodecError`] when `context_id` or `anchor_id` is zero, or the
+/// marker would exceed [`MAX_MARKER_BYTES`].
 pub fn encode_marker(
     key: &AnchorKey,
     session_tag: &[u8; 16],
     context_id: u64,
     anchor_id: u64,
-) -> Result<String, &'static str> {
+) -> Result<String, CodecError> {
     if context_id == 0 || anchor_id == 0 {
-        return Err("context and anchor IDs must be nonzero");
+        return Err(CodecError::invalid_argument(
+            "context and anchor IDs must be nonzero",
+        ));
     }
     let tag = URL_SAFE_NO_PAD.encode(session_tag);
     let auth = URL_SAFE_NO_PAD.encode(authenticator(key, session_tag, context_id, anchor_id));
     let marker = format!("\x1b_VIVID;3;A;{tag};{context_id:016x};{anchor_id:016x};{auth}\x1b\\");
     if marker.len() > MAX_MARKER_BYTES {
-        return Err("anchor marker is oversized");
+        return Err(CodecError::invalid_argument("anchor marker is oversized"));
     }
     Ok(marker)
 }
@@ -86,19 +90,19 @@ pub fn encode_marker(
 ///
 /// # Errors
 ///
-/// Returns an error message when [`encode_marker`] fails or the `ConPTY` form would exceed
-/// [`MAX_MARKER_BYTES`].
+/// Returns an invalid-argument [`CodecError`] when [`encode_marker`] fails or the `ConPTY` form
+/// would exceed [`MAX_MARKER_BYTES`].
 pub fn encode_conpty_marker(
     key: &AnchorKey,
     session_tag: &[u8; 16],
     context_id: u64,
     anchor_id: u64,
-) -> Result<String, &'static str> {
+) -> Result<String, CodecError> {
     let apc = encode_marker(key, session_tag, context_id, anchor_id)?;
     let body = &apc[2..apc.len() - 2];
     let marker = format!("{body};VIVID-END");
     if marker.len() > MAX_MARKER_BYTES {
-        return Err("anchor marker is oversized");
+        return Err(CodecError::invalid_argument("anchor marker is oversized"));
     }
     Ok(marker)
 }
@@ -107,20 +111,28 @@ pub fn encode_conpty_marker(
 ///
 /// # Errors
 ///
-/// Returns an error message when `marker` is oversized or non-ASCII, is not a Vivid anchor-v3
-/// marker, lacks a field, or has a field of the wrong length or encoding.
-pub fn parse_marker(marker: &str) -> Result<AnchorMarker, &'static str> {
+/// Returns a malformed-input [`CodecError`] when `marker` is oversized or non-ASCII, is not a Vivid
+/// anchor-v3 marker, lacks a field, or has a field of the wrong length or encoding.
+pub fn parse_marker(marker: &str) -> Result<AnchorMarker, CodecError> {
     if marker.len() > MAX_MARKER_BYTES - 4 || !marker.is_ascii() {
-        return Err("anchor marker is oversized or non-ASCII");
+        return Err(malformed("anchor marker is oversized or non-ASCII"));
     }
     let mut fields = marker.split(';');
     if fields.next() != Some("VIVID") || fields.next() != Some("3") || fields.next() != Some("A") {
-        return Err("not a Vivid anchor-v3 marker");
+        return Err(malformed("not a Vivid anchor-v3 marker"));
     }
-    let tag = fields.next().ok_or("missing session tag")?;
-    let context_id = fields.next().ok_or("missing context ID")?;
-    let anchor_id = fields.next().ok_or("missing anchor ID")?;
-    let auth = fields.next().ok_or("missing anchor authenticator")?;
+    let tag = fields
+        .next()
+        .ok_or_else(|| malformed("missing session tag"))?;
+    let context_id = fields
+        .next()
+        .ok_or_else(|| malformed("missing context ID"))?;
+    let anchor_id = fields
+        .next()
+        .ok_or_else(|| malformed("missing anchor ID"))?;
+    let auth = fields
+        .next()
+        .ok_or_else(|| malformed("missing anchor authenticator"))?;
     if fields.next().is_some()
         || tag.len() != 22
         || context_id.len() != 16
@@ -129,26 +141,30 @@ pub fn parse_marker(marker: &str) -> Result<AnchorMarker, &'static str> {
         || !anchor_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         || auth.len() != 22
     {
-        return Err("invalid anchor marker field length");
+        return Err(malformed("invalid anchor marker field length"));
     }
     let tag = URL_SAFE_NO_PAD
         .decode(tag)
-        .map_err(|_| "invalid session tag")?;
+        .map_err(|_| malformed("invalid session tag"))?;
     let auth = URL_SAFE_NO_PAD
         .decode(auth)
-        .map_err(|_| "invalid anchor authenticator")?;
-    let context_id = u64::from_str_radix(context_id, 16).map_err(|_| "invalid context ID")?;
-    let anchor_id = u64::from_str_radix(anchor_id, 16).map_err(|_| "invalid anchor ID")?;
+        .map_err(|_| malformed("invalid anchor authenticator"))?;
+    let context_id =
+        u64::from_str_radix(context_id, 16).map_err(|_| malformed("invalid context ID"))?;
+    let anchor_id =
+        u64::from_str_radix(anchor_id, 16).map_err(|_| malformed("invalid anchor ID"))?;
     if context_id == 0 || anchor_id == 0 {
-        return Err("context and anchor IDs must be nonzero");
+        return Err(malformed("context and anchor IDs must be nonzero"));
     }
     Ok(AnchorMarker {
-        session_tag: tag.try_into().map_err(|_| "invalid session tag length")?,
+        session_tag: tag
+            .try_into()
+            .map_err(|_| malformed("invalid session tag length"))?,
         context_id,
         anchor_id,
         authenticator: auth
             .try_into()
-            .map_err(|_| "invalid authenticator length")?,
+            .map_err(|_| malformed("invalid authenticator length"))?,
     })
 }
 
@@ -156,11 +172,11 @@ pub fn parse_marker(marker: &str) -> Result<AnchorMarker, &'static str> {
 ///
 /// # Errors
 ///
-/// Returns an error message when `marker` exceeds [`MAX_MARKER_BYTES`], lacks the `;VIVID-END`
-/// suffix, or fails [`parse_marker`].
-pub fn parse_conpty_marker(marker: &str) -> Result<AnchorMarker, &'static str> {
+/// Returns a malformed-input [`CodecError`] when `marker` exceeds [`MAX_MARKER_BYTES`], lacks the
+/// `;VIVID-END` suffix, or fails [`parse_marker`].
+pub fn parse_conpty_marker(marker: &str) -> Result<AnchorMarker, CodecError> {
     if marker.len() > MAX_MARKER_BYTES || !marker.ends_with(";VIVID-END") {
-        return Err("not a bounded Vivid ConPTY anchor-v3 marker");
+        return Err(malformed("not a bounded Vivid ConPTY anchor-v3 marker"));
     }
     parse_marker(&marker[..marker.len() - ";VIVID-END".len()])
 }
@@ -174,6 +190,10 @@ pub fn verify_marker(key: &AnchorKey, marker: &AnchorMarker) -> bool {
     )
     .ct_eq(&marker.authenticator)
     .into()
+}
+
+fn malformed(message: &'static str) -> CodecError {
+    CodecError::malformed(message)
 }
 
 #[cfg(test)]

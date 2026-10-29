@@ -162,6 +162,7 @@ impl ChannelOpenState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum TrackMode {
     Live = 1,
     Timed = 2,
@@ -663,6 +664,7 @@ impl VectorConfiguration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KindConfiguration {
     Video(VideoConfiguration),
     Audio(AudioConfiguration),

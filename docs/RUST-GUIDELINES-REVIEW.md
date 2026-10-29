@@ -15,34 +15,24 @@ A follow-up raised `rust-version` to 1.95 to match `vivid_sdk` and `vivido`. Nea
 consumer already needed 1.95 through the SDK.
 
 The open findings follow, most important first. Guideline IDs such as `M-INIT-CASCADED` name the
-rule each one comes from. `Cargo.toml` opts out of `map_err_ignore` until typed errors land, and
-each `#[expect]` reason in the source points back here.
+rule each one comes from, and each `#[expect]` reason in the source points back here.
 
-## Errors are `io::Error` with string messages (M-ERRORS-CANONICAL-STRUCTS)
+## Errors (M-ERRORS-CANONICAL-STRUCTS)
 
-Pure codecs report malformed input as `io::Error` with `InvalidData` and a formatted message:
-about 117 signatures in `media`, `file_drop`, `timed`, `revision`, `audio_input`, and `wire`.
-Callers can only tell causes apart by matching strings.
+Version 1.5.12 replaced the string-message errors:
 
-`io::Error` is right for `wire`, which does real I/O. The codecs should return typed errors
-instead. Every public error type now implements `Display` and `Error`; `CompletionError` and
-`LeaseTransitionError` were the last two. The remaining gaps all break callers, so they wait for
-the next semver-major release:
+- Binary-layout codecs (`media`, `audio_input`, `file_drop` file data, `anchor` markers, and
+  `wire` preface and first-record checks) return `CodecError`: a struct with a private kind,
+  `is_malformed`, `is_invalid_argument`, and `is_unsupported`, an optional source, and a
+  backtrace. It converts into `io::Error` with the kinds callers saw before.
+- Revision and generation counters return `revision::CounterError`.
+- `timed` decoders return `MessageError`, like every other control-message codec.
+- `MessageError` chains its CBOR and resource-contract causes through `source()`, and error
+  enums are `#[non_exhaustive]`. `SizeError` renders sentences.
 
-- **Typed codec errors.** Replacing `io::Result` changes every signature that `vivid_sdk`,
-  `vivid_gateway`, and `vivido` call.
-- **`#[non_exhaustive]`.** `MessageError`, `AuthError`, `ResourceError`, `ProfileError`,
-  `SizeError`, `CompletionError`, and `LeaseTransitionError` lack it. Adding it breaks any
-  exhaustive `match`, so adding a variant later breaks callers too.
-- **`SizeError`'s `Display` prints the variant name** (`TooLarge`). `vivi` reports oversized
-  images through `io::Error::other(SizeError)` and its tests match on that text, which
-  `tests/errors.rs` pins. Change both together.
-- **`MessageError::Cbor` holds a `String`**, not the `cbor::DecodeError`, so `source()` cannot
-  chain to it.
-
-About 128 `map_err(|_| ...)` calls deliberately replace an integer-conversion error with a
-labelled protocol error, so `clippy::map_err_ignore` is allowed until this redesign. The change
-reaches every signature that `vivid_sdk`, `vivid_gateway`, and `vivido` call.
+`map_err(|_| ...)` stays where a codec replaces an integer-conversion or slice-length error with
+a message naming the field; the dropped error says only "out of range", so `Cargo.toml` keeps
+`clippy::map_err_ignore` allowed with that reason.
 
 ## Documentation (M-CANONICAL-DOCS)
 
@@ -80,11 +70,9 @@ instead. The same approach fits here: pass the decoded message or a small named-
 
 ## Smaller items
 
-- **Trace I/O is not mockable (M-MOCKABLE-SYSCALLS).** `trace.rs` opens files and reads
-  `Instant::now()` directly. It is diagnostics only, so this matters less than discovery did.
-- **`Endpoint::parse` echoes its input.** The unsupported-scheme error includes the rejected value
-  (`wire.rs`), while `NativeDiscovery`'s `Debug` redacts endpoints. Drop the value from the message
-  if endpoints are sensitive.
+- **The trace clock is not mockable (M-MOCKABLE-SYSCALLS).** `TraceGuard::callback` is an
+  I/O-free sink, but timestamps come from `Instant::now()` and `Connection::trace` takes only a
+  path. It is diagnostics only, so this matters less than discovery did.
 - **The record re-export list is manual.** `messages` re-exports the `registry::record` constants
   by name, so a new record type must be added in both places. A missing one fails to compile only
   where someone first uses `messages::NEW_RECORD`.

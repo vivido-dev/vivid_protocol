@@ -104,6 +104,25 @@ interoperability rules, read the normative multipart
 This crate implements Vivid Protocol 1.5 and requires Rust 1.95 or newer. Protocol support is
 negotiated by coherent named profiles; the preface selects the exact wire version.
 
+### Versioning
+
+The crate version follows the protocol: every 1.5.x release implements Vivid 1.5. The 1.5
+registries are append-only, so a 1.5.x release can grow wherever the protocol grows:
+
+- Error types, and enums that mirror a registry or profile value set (track kinds, lanes,
+  connection kinds, overlay and vector vocabularies), are `#[non_exhaustive]`. Match them with a
+  wildcard arm that rejects values you do not handle.
+- Wire structs are plain data with public fields. A release adds a field when the protocol
+  registers a new key, which breaks code that builds the struct with a literal.
+- Other public API can change in a 1.5.x release, as error types and `wire::Endpoint` did in
+  1.5.12.
+
+If a `cargo update` must never break your build, pin an exact version, such as
+`vivid_protocol = "=1.5.12"`.
+
+The `test-util` feature exposes helpers that only tests may use, such as a preface claiming
+another protocol version.
+
 ## Contributing
 
 New producers, presenters, transports, language bindings, and interoperability tests are welcome.

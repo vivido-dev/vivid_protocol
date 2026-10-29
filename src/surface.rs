@@ -20,6 +20,7 @@ pub const POLICY_KNOWN_MASK: u64 = (1 << 5) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum SurfaceRole {
     Unspecified = 0,
     Document = 1,
@@ -53,6 +54,7 @@ impl TryFrom<u64> for SurfaceRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum CoordinateModel {
     DesktopLogicalPixels = 1,
     Normalized = 2,

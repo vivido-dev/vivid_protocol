@@ -5,9 +5,11 @@ use vivid_protocol::{
     anchor::AnchorKey,
     auth::{self, Secret32},
     cbor::Value,
+    file_drop::FileTransferOpen,
     lease::{CleanupPolicy, LeaseMachine},
     media::{AudioPacket, VideoPacket},
     messages::{ChannelOpen, LaneClass, LaneOpen, StrictMap, TrackKind, WelcomeAuthentication},
+    revision::{FileDropEpoch, FileDropGrantGeneration, FileTransferGeneration, SurfaceGeneration},
     wire::{BorrowedRecord, Record},
 };
 
@@ -121,6 +123,29 @@ fn authentication_messages_hide_confirmations_and_tags() {
     let rendered = format!("{channel:?}");
     assert!(rendered.contains("[REDACTED]"));
     assert_redacted(&rendered, &channel_tag);
+
+    let transfer_tag = secret::<16>(23);
+    let transfer = FileTransferOpen {
+        session_id: 1,
+        context_id: 2,
+        surface_id: 3,
+        producer_epoch: FileDropEpoch::ONE,
+        grant_generation: FileDropGrantGeneration::ONE,
+        surface_generation: SurfaceGeneration::ONE,
+        drop_id: 4,
+        transfer_id: 5,
+        transfer_generation: FileTransferGeneration::ONE,
+        resume_offset: 0,
+        maximum_record_body: 1024,
+        maximum_body_bytes: 4096,
+        maximum_records: 4,
+        client_nonce: [0; 16],
+        authentication_tag: transfer_tag,
+    };
+    let rendered = format!("{transfer:?}");
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(rendered.contains("transfer_id: 5"), "{rendered}");
+    assert_redacted(&rendered, &transfer_tag);
 }
 
 #[test]

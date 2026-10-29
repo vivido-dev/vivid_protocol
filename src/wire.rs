@@ -14,14 +14,16 @@
 //! A receiver that rejects only the version answers with [`unsupported_version_record`]; malformed
 //! prefaces are closed silently, as the core specification requires.
 
-use std::{fmt, io};
+use std::fmt;
+
+use crate::CodecError;
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
 use crate::trace::{self, TraceComponent, TraceDirection, TraceGuard, TraceHop, TraceOutcome};
 #[cfg(any(feature = "native", feature = "native-transport"))]
-use std::io::{IoSlice, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 #[cfg(any(feature = "native", feature = "native-transport"))]
-use std::net::{Shutdown, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream};
 #[cfg(all(any(feature = "native", feature = "native-transport"), unix))]
 use std::os::unix::net::UnixStream;
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -63,6 +65,7 @@ pub enum FlushMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ConnectionKind {
     Control = 0,
     Lane = 1,
@@ -71,7 +74,7 @@ pub enum ConnectionKind {
 }
 
 impl TryFrom<u8> for ConnectionKind {
-    type Error = io::Error;
+    type Error = CodecError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -79,10 +82,9 @@ impl TryFrom<u8> for ConnectionKind {
             1 => Ok(Self::Lane),
             2 => Ok(Self::Track),
             3 => Ok(Self::FileTransfer),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown Vivid connection kind {value}"),
-            )),
+            _ => Err(CodecError::malformed(format!(
+                "unknown Vivid connection kind {value}"
+            ))),
         }
     }
 }
@@ -101,18 +103,16 @@ impl ConnectionKind {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when the record is not sequence 1, has the wrong
+    /// Returns a malformed-input [`CodecError`] when the record is not sequence 1, has the wrong
     /// record type for this kind, or is a control `HELLO` whose object ID is not zero.
-    pub fn validate_first_record(self, header: &RecordHeader) -> io::Result<()> {
+    pub fn validate_first_record(self, header: &RecordHeader) -> Result<(), CodecError> {
         if header.sequence != 1 || header.record_type != self.required_first_record() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(CodecError::malformed(
                 "first record does not match the Vivid connection kind",
             ));
         }
         if self == Self::Control && header.object_id != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(CodecError::malformed(
                 "HELLO must use session-level object ID zero",
             ));
         }
@@ -134,33 +134,25 @@ impl Preface {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] for wrong magic, nonzero reserved bytes or flags, a
+    /// Returns a malformed-input [`CodecError`] for wrong magic, nonzero reserved bytes or flags, a
     /// body limit of zero or above [`crate::HARD_MAX_RECORD_BODY`], or an unknown connection kind.
-    pub fn decode(bytes: [u8; PREFACE_SIZE]) -> io::Result<Self> {
+    pub fn decode(bytes: [u8; PREFACE_SIZE]) -> Result<Self, CodecError> {
         if &bytes[0..4] != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid Vivid magic",
-            ));
+            return Err(CodecError::malformed("invalid Vivid magic"));
         }
         if bytes[12..16] != [0; 4] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(CodecError::malformed(
                 "Vivid preface reserved bytes are nonzero",
             ));
         }
         if bytes[7] != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(CodecError::malformed(
                 "Vivid preface reserved flags are nonzero",
             ));
         }
         let initiator_tx_body_limit = u32::from_be_bytes(crate::array_at(&bytes, 8));
         if initiator_tx_body_limit == 0 || initiator_tx_body_limit > HARD_MAX_RECORD_BODY {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid Vivid maximum record size",
-            ));
+            return Err(CodecError::malformed("invalid Vivid maximum record size"));
         }
         Ok(Self {
             major: bytes[4],
@@ -177,7 +169,7 @@ impl Preface {
     ///
     /// Returns any error from [`Preface::decode`]; a well-formed preface of another version is not
     /// an error.
-    pub fn classify(bytes: [u8; PREFACE_SIZE]) -> io::Result<PrefaceClassification> {
+    pub fn classify(bytes: [u8; PREFACE_SIZE]) -> Result<PrefaceClassification, CodecError> {
         let preface = Self::decode(bytes)?;
         if (preface.major, preface.minor) == (VIVID_MAJOR, VIVID_MINOR) {
             Ok(PrefaceClassification::Accepted(preface))
@@ -243,11 +235,20 @@ pub fn accept_preface<W: Write + ?Sized>(
     }
 }
 
+/// A local Vivid endpoint: an absolute Unix-socket path or a loopback TCP port.
+///
+/// Native Vivid transport never leaves the host, and every constructor enforces that: a TCP
+/// endpoint is exactly `127.0.0.1` with a nonzero port, and a Unix endpoint is an absolute path.
+/// [`Connection::open`] can therefore only reach a local socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(any(feature = "native", feature = "native-transport"))]
-pub enum Endpoint {
+pub struct Endpoint(Address);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(feature = "native", feature = "native-transport"))]
+enum Address {
     Unix(PathBuf),
-    Tcp(String),
+    Tcp(SocketAddrV4),
 }
 
 #[cfg(any(feature = "native", feature = "native-transport"))]
@@ -307,55 +308,85 @@ impl Endpoint {
     /// Parses an endpoint from `unix:/absolute/path`, `tcp:127.0.0.1:PORT`, or a bare absolute
     /// path.
     ///
+    /// The error never repeats `value`, which may come from the environment and could carry a
+    /// credential if it was set to some other kind of URL.
+    ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidInput`] for an empty or relative Unix path, a TCP address
+    /// Returns an invalid-argument [`CodecError`] for an empty or relative Unix path, a TCP address
     /// other than `127.0.0.1` with a nonzero port, or any other URL scheme.
-    pub fn parse(value: &str) -> io::Result<Self> {
+    pub fn parse(value: &str) -> Result<Self, CodecError> {
         if let Some(path) = value.strip_prefix("unix:") {
-            if path.is_empty() || !Path::new(path).is_absolute() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Unix endpoint is empty or not absolute",
-                ));
-            }
-            return Ok(Self::Unix(PathBuf::from(path)));
+            return Self::unix(path);
         }
         if let Some(address) = value.strip_prefix("tcp:") {
-            let parsed = address.parse::<std::net::SocketAddrV4>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "native TCP endpoint is not an IPv4 socket address",
-                )
+            let address = address.parse::<SocketAddrV4>().map_err(|_| {
+                CodecError::invalid_argument("native TCP endpoint is not an IPv4 socket address")
             })?;
-            if *parsed.ip() != std::net::Ipv4Addr::LOCALHOST || parsed.port() == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "native TCP endpoint must use exact 127.0.0.1 and a nonzero port",
-                ));
-            }
-            return Ok(Self::Tcp(parsed.to_string()));
+            return Self::tcp(address.into());
         }
         if value.contains("://") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unsupported Vivid endpoint scheme in {value:?}"),
+            return Err(CodecError::invalid_argument(
+                "unsupported Vivid endpoint scheme",
             ));
         }
-        let path = PathBuf::from(value);
-        if !path.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unix endpoint is not absolute",
+        Self::unix(value)
+    }
+
+    /// Builds a Unix-socket endpoint at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-argument [`CodecError`] when `path` is empty or not absolute.
+    pub fn unix(path: impl Into<PathBuf>) -> Result<Self, CodecError> {
+        let path = path.into();
+        if path.as_os_str().is_empty() || !path.is_absolute() {
+            return Err(CodecError::invalid_argument(
+                "Unix endpoint is empty or not absolute",
             ));
         }
-        Ok(Self::Unix(path))
+        Ok(Self(Address::Unix(path)))
+    }
+
+    /// Builds a TCP endpoint at `address`, which must be `127.0.0.1` with a nonzero port.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-argument [`CodecError`] for an IPv6 address, any IPv4 address other
+    /// than `127.0.0.1`, or port zero.
+    pub fn tcp(address: SocketAddr) -> Result<Self, CodecError> {
+        match address {
+            SocketAddr::V4(address)
+                if *address.ip() == Ipv4Addr::LOCALHOST && address.port() != 0 =>
+            {
+                Ok(Self(Address::Tcp(address)))
+            }
+            _ => Err(CodecError::invalid_argument(
+                "native TCP endpoint must use exact 127.0.0.1 and a nonzero port",
+            )),
+        }
+    }
+
+    /// The socket path, when this is a Unix-socket endpoint.
+    pub fn as_unix(&self) -> Option<&Path> {
+        match &self.0 {
+            Address::Unix(path) => Some(path),
+            Address::Tcp(_) => None,
+        }
+    }
+
+    /// The loopback socket address, when this is a TCP endpoint.
+    pub fn as_tcp(&self) -> Option<SocketAddrV4> {
+        match self.0 {
+            Address::Tcp(address) => Some(address),
+            Address::Unix(_) => None,
+        }
     }
 
     fn connect(&self) -> io::Result<ConnectedIo> {
-        match self {
-            Self::Unix(path) => connect_unix(path),
-            Self::Tcp(address) => {
+        match &self.0 {
+            Address::Unix(path) => connect_unix(path),
+            Address::Tcp(address) => {
                 let stream = TcpStream::connect(address)?;
                 stream.set_read_timeout(Some(Duration::from_secs(30)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -939,23 +970,8 @@ impl Connection {
     /// Returns any error from connecting to `endpoint` or writing the preface, including
     /// [`io::ErrorKind::Unsupported`] for a Unix endpoint on a platform without Unix sockets.
     pub fn open(endpoint: &Endpoint, kind: ConnectionKind) -> io::Result<Self> {
-        Self::open_version(endpoint, kind, VIVID_MAJOR, VIVID_MINOR)
-    }
-
-    /// Open a fresh connection using a version the caller has explicitly selected.
-    ///
-    /// # Errors
-    ///
-    /// Returns any error from connecting to `endpoint` or writing the preface, including
-    /// [`io::ErrorKind::Unsupported`] for a Unix endpoint on a platform without Unix sockets.
-    pub fn open_version(
-        endpoint: &Endpoint,
-        kind: ConnectionKind,
-        major: u8,
-        minor: u8,
-    ) -> io::Result<Self> {
         let ConnectedIo { reader, writer } = endpoint.connect()?;
-        Self::new_version(Some(reader), writer, kind, major, minor)
+        Self::new(Some(reader), writer, kind)
     }
 
     /// Start an initiator-side Vivid connection over an already authenticated transport.
@@ -997,16 +1013,6 @@ impl Connection {
     }
 
     fn new(reader: Option<ReaderIo>, io: WriterIo, kind: ConnectionKind) -> io::Result<Self> {
-        Self::new_version(reader, io, kind, VIVID_MAJOR, VIVID_MINOR)
-    }
-
-    fn new_version(
-        reader: Option<ReaderIo>,
-        io: WriterIo,
-        kind: ConnectionKind,
-        major: u8,
-        minor: u8,
-    ) -> io::Result<Self> {
         let body_limit = if kind == ConnectionKind::Control {
             super::CONTROL_MAX_RECORD_BODY
         } else {
@@ -1024,7 +1030,7 @@ impl Connection {
                 unflushed_records: 0,
             })),
         };
-        writer.write_raw_preface(&encode_preface_version(kind, body_limit, major, minor))?;
+        writer.write_raw_preface(&encode_preface(kind, body_limit))?;
         Ok(Self {
             reader: reader.map(|io| ConnectionReader {
                 io,
@@ -1505,15 +1511,25 @@ impl RecordHeader {
 }
 
 pub fn encode_preface(kind: ConnectionKind, maximum: u32) -> [u8; PREFACE_SIZE] {
-    encode_preface_version(kind, maximum, VIVID_MAJOR, VIVID_MINOR)
+    preface_bytes(kind, maximum, VIVID_MAJOR, VIVID_MINOR)
 }
 
+/// Encodes a preface claiming protocol version `major.minor`, to test a peer's version rejection.
+///
+/// Production code sends [`encode_preface`]; Vivid 1.5 never downgrades. This exists only behind
+/// the `test-util` feature so an implementation can check that it answers another version with
+/// [`unsupported_version_record`] and closes.
+#[cfg(feature = "test-util")]
 pub fn encode_preface_version(
     kind: ConnectionKind,
     maximum: u32,
     major: u8,
     minor: u8,
 ) -> [u8; PREFACE_SIZE] {
+    preface_bytes(kind, maximum, major, minor)
+}
+
+fn preface_bytes(kind: ConnectionKind, maximum: u32, major: u8, minor: u8) -> [u8; PREFACE_SIZE] {
     let mut bytes = [0_u8; PREFACE_SIZE];
     bytes[0..4].copy_from_slice(MAGIC);
     bytes[4] = major;
@@ -1743,7 +1759,7 @@ mod tests {
     fn native_shutdown_and_subsequent_writes_do_not_wait_for_writer_lock() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let connection = Connection::open(
-            &Endpoint::Tcp(listener.local_addr().unwrap().to_string()),
+            &Endpoint::tcp(listener.local_addr().unwrap()).unwrap(),
             ConnectionKind::Track,
         )
         .unwrap();
@@ -1788,7 +1804,7 @@ mod tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         // Keep a second owner alive through cancellation, reusing object ID 1 below.
         let neighbor = Connection::open(
-            &Endpoint::Tcp(listener.local_addr().unwrap().to_string()),
+            &Endpoint::tcp(listener.local_addr().unwrap()).unwrap(),
             ConnectionKind::Track,
         )
         .unwrap();
@@ -1801,12 +1817,10 @@ mod tests {
             let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (peer, _) = listener.accept().unwrap();
             let mut filling = stream.try_clone().unwrap();
-            let connection = Connection::new_version(
+            let connection = Connection::new(
                 Some(ReaderIo::Tcp(stream.try_clone().unwrap())),
                 WriterIo::Tcp(stream),
                 ConnectionKind::Track,
-                VIVID_MAJOR,
-                VIVID_MINOR,
             )
             .unwrap();
             let (_reader, writer) = connection.split().unwrap();
@@ -1881,12 +1895,10 @@ mod tests {
         let (mut peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let writer_stream = stream.try_clone().unwrap();
-        let connection = Connection::new_version(
+        let connection = Connection::new(
             Some(ReaderIo::Tcp(stream)),
             WriterIo::Tcp(writer_stream),
             ConnectionKind::Track,
-            VIVID_MAJOR,
-            VIVID_MINOR,
         )
         .unwrap();
         let (_reader, writer) = connection.split().unwrap();
@@ -1917,12 +1929,10 @@ mod tests {
         writer
             .set_write_timeout(Some(Duration::from_secs(30)))
             .unwrap();
-        let connection = Connection::new_version(
+        let connection = Connection::new(
             Some(ReaderIo::Unix(stream)),
             WriterIo::Unix(writer),
             ConnectionKind::Control,
-            VIVID_MAJOR,
-            VIVID_MINOR,
         )
         .unwrap();
 
@@ -1951,12 +1961,10 @@ mod tests {
         writer
             .set_write_timeout(Some(Duration::from_secs(30)))
             .unwrap();
-        let connection = Connection::new_version(
+        let connection = Connection::new(
             Some(ReaderIo::Tcp(stream)),
             WriterIo::Tcp(writer),
             ConnectionKind::Control,
-            VIVID_MAJOR,
-            VIVID_MINOR,
         )
         .unwrap();
 
@@ -2181,20 +2189,63 @@ mod tests {
     fn endpoint_parser_accepts_explicit_and_bare_unix_paths() {
         assert_eq!(
             Endpoint::parse("unix:/tmp/vivid.sock").unwrap(),
-            Endpoint::Unix(PathBuf::from("/tmp/vivid.sock"))
+            Endpoint::unix("/tmp/vivid.sock").unwrap()
         );
         assert_eq!(
             Endpoint::parse("/tmp/vivid.sock").unwrap(),
-            Endpoint::Unix(PathBuf::from("/tmp/vivid.sock"))
+            Endpoint::unix("/tmp/vivid.sock").unwrap()
         );
     }
 
     #[test]
     #[cfg(any(feature = "native", feature = "native-transport"))]
     fn endpoint_parser_accepts_tcp() {
+        let endpoint = Endpoint::parse("tcp:127.0.0.1:12345").unwrap();
         assert_eq!(
-            Endpoint::parse("tcp:127.0.0.1:12345").unwrap(),
-            Endpoint::Tcp("127.0.0.1:12345".into())
+            endpoint.as_tcp(),
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345))
         );
+        assert_eq!(endpoint.as_unix(), None);
+        assert_eq!(
+            Endpoint::tcp("127.0.0.1:12345".parse().unwrap()).unwrap(),
+            endpoint
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
+    fn endpoint_constructors_refuse_anything_but_a_local_socket() {
+        for address in [
+            "192.0.2.1:80",
+            "0.0.0.0:7000",
+            "127.0.0.2:7000",
+            "127.0.0.1:0",
+            "[::1]:7000",
+        ] {
+            let error = Endpoint::tcp(address.parse().unwrap()).unwrap_err();
+            assert!(error.is_invalid_argument(), "{address}: {error}");
+        }
+        for value in [
+            "tcp:localhost:7000",
+            "tcp:192.0.2.1:80",
+            "unix:",
+            "unix:relative",
+            "relative",
+        ] {
+            Endpoint::parse(value).unwrap_err();
+        }
+        Endpoint::unix("relative/vivid.sock").unwrap_err();
+        Endpoint::unix("").unwrap_err();
+    }
+
+    #[test]
+    #[cfg(any(feature = "native", feature = "native-transport"))]
+    fn endpoint_errors_never_repeat_the_rejected_value() {
+        let secret = "wss://relay.example/attach?ticket=0123456789abcdef";
+        let error = Endpoint::parse(secret).unwrap_err();
+        let mut rendered = format!("{error} {error:?}");
+        rendered.push_str(&io::Error::from(error).to_string());
+        assert!(!rendered.contains("ticket"), "{rendered}");
+        assert!(!rendered.contains("relay.example"), "{rendered}");
     }
 }

@@ -8,6 +8,7 @@ pub const RESOURCE_COUNT: usize = 33;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum Resource {
     Surfaces = 0,
     Tracks = 1,
@@ -45,6 +46,7 @@ pub enum Resource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResourceError {
     NotAMap,
     MissingKey(u64),

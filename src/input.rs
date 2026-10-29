@@ -160,6 +160,7 @@ impl InputTuple {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InputEvent {
     Key {
         binding: InputTuple,
@@ -397,6 +398,7 @@ pub enum BindingOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InjectionRejection {
     NoActiveGrant,
     StaleTuple,

@@ -14,6 +14,7 @@ pub const MAX_TEXT_RUNS: usize = 64;
 pub const MAX_RETAINED_LAYOUTS: usize = 128;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TextOverflow {
     #[default]
     Clip,
@@ -93,6 +94,7 @@ impl Typography {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TextAlignment {
     #[default]
     Start,

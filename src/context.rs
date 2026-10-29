@@ -6,7 +6,7 @@ use crate::{
     messages::{
         MessageError, PayloadMap, StrictMap, invalid_value, require_nonzero, validate_header_object,
     },
-    resource::{ReservationLedger, ResourceContract, ResourceError},
+    resource::{ReservationLedger, ResourceContract},
     revision::ContextRevision,
 };
 
@@ -90,8 +90,7 @@ impl ContextDefinition {
             operation_classes: map.required_u64(2)?,
             label: map.required_text(3)?.to_owned(),
             lifetime_us: map.required_u64(4)?,
-            requested_contract: ResourceContract::from_value(map.required(5)?)
-                .map_err(|error| MessageError::Cbor(error.to_string()))?,
+            requested_contract: ResourceContract::from_value(map.required(5)?)?,
         };
         definition.validate(header_object_id)?;
         Ok(definition)
@@ -161,8 +160,7 @@ impl ContextState {
     ///
     /// Returns [`MessageError::InvalidValue`] when this context is not active, is not the child's
     /// parent, or lacks delegation authority, or the context revision is exhausted. Returns
-    /// [`MessageError::Cbor`] carrying the [`crate::resource::ResourceError`] text when resource
-    /// accounting overflows.
+    /// [`MessageError::Resource`] when resource accounting overflows.
     pub fn reserve_child(
         &mut self,
         definition: &ContextDefinition,
@@ -181,8 +179,7 @@ impl ContextState {
         let classes = definition.operation_classes & self.operation_classes;
         let contract = self
             .reservations
-            .reserve(&definition.requested_contract, policy)
-            .map_err(resource_error)?;
+            .reserve(&definition.requested_contract, policy)?;
         self.advance_revision()?;
         Ok((classes, contract))
     }
@@ -195,13 +192,10 @@ impl ContextState {
     ///
     /// # Errors
     ///
-    /// Returns [`MessageError::Cbor`] carrying the [`crate::resource::ResourceError`] text when
-    /// `contract` exceeds what is reserved here, and [`MessageError::InvalidValue`] when the
-    /// context revision is exhausted.
+    /// Returns [`MessageError::Resource`] when `contract` exceeds what is reserved here, and
+    /// [`MessageError::InvalidValue`] when the context revision is exhausted.
     pub fn release_child(&mut self, contract: &ResourceContract) -> Result<(), MessageError> {
-        self.reservations
-            .release(contract)
-            .map_err(resource_error)?;
+        self.reservations.release(contract)?;
         self.advance_revision()
     }
 
@@ -226,10 +220,6 @@ impl ContextState {
             .map_err(|_| invalid_value("context", 0, "exhausted its revision"))?;
         Ok(())
     }
-}
-
-fn resource_error(error: ResourceError) -> MessageError {
-    MessageError::Cbor(error.to_string())
 }
 
 #[cfg(test)]

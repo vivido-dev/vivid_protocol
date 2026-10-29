@@ -1,6 +1,6 @@
 [package]
 name = "vivid_protocol"
-version = "1.5.11"
+version = "1.5.12"
 edition = "2024"
 rust-version = "1.95.0"
 license = "Apache-2.0"
@@ -22,8 +22,12 @@ include = [
 
 [features]
 default = ["native"]
+# Native zstd raster compression and decompression, plus everything in `native-transport`.
 native = ["native-transport", "dep:zstd", "dep:zstd-safe"]
+# Blocking TCP and Unix-socket `wire::Connection`, endpoint discovery, and protocol tracing.
 native-transport = []
+# Helpers only tests may use, such as a preface that claims another protocol version.
+test-util = []
 
 [dependencies]
 base64 = "0.23"
@@ -31,11 +35,15 @@ hmac = "0.13"
 sha2 = "0.11"
 subtle = "2.6"
 zeroize = { version = "1.9", features = ["derive"] }
-zstd = { version = "0.14", optional = true }
-zstd-safe = { version = "8", optional = true }
+# Default features are off: they enable legacy (pre-1.0) frame decoding and dictionary building,
+# which peer-supplied rasters must never reach. The floors exclude RUSTSEC-2026-0391 and
+# RUSTSEC-2026-0395 through -0406.
+zstd = { version = "0.14.3", default-features = false, optional = true }
+zstd-safe = { version = "8.2", default-features = false, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-ruzstd = "0.9"
+# 0.9.1 fixes the RUSTSEC-2026-0344 decompression bomb.
+ruzstd = "0.9.1"
 
 [[bench]]
 name = "stage0"
@@ -88,8 +96,8 @@ unused_result_ok = "warn"
 too_long_first_doc_paragraph = "warn"
 # May cause issues with structured logging otherwise.
 literal_string_with_formatting_args = "allow"
-# Open typed-error finding (docs/RUST-GUIDELINES-REVIEW.md): codecs report malformed input as a
-# fresh, labelled error and deliberately drop the integer-conversion error that detected it.
+# Codecs report malformed input as a labelled error naming the field, and deliberately drop the
+# integer-conversion or slice-length error that detected it: that error says only "out of range".
 map_err_ignore = "allow"
 # `Result`-returning APIs are already `#[must_use]`; marking every pure accessor adds noise
 # without catching real misuse in a codec crate.

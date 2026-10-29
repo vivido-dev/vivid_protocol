@@ -13,6 +13,7 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum Fit {
     Fill = 1,
     Contain = 2,

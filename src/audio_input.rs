@@ -1,10 +1,10 @@
 //! Portable, bounded PCM microphone packets for `audio-input-v1`.
+use crate::CodecError;
 use crate::media::{self, AudioPacket};
 use crate::messages::LaneClass;
 use crate::track::{
     AudioConfiguration, KindConfiguration, TrackConfiguration, TrackDirection, TrackMode,
 };
-use std::io;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const SAMPLES: usize = 960;
@@ -63,10 +63,10 @@ impl InputPacket {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when `body` is not a valid audio packet, or its
+    /// Returns a malformed-input [`CodecError`] when `body` is not a valid audio packet, or its
     /// epoch, packet ID, timestamps, duration, trim, or PCM length do not match the fixed
     /// microphone format.
-    pub fn decode(body: &[u8]) -> io::Result<Self> {
+    pub fn decode(body: &[u8]) -> Result<Self, CodecError> {
         let packet = media::parse_audio_packet(body)?;
         if packet.epoch == 0
             || packet.packet_id == 0
@@ -76,16 +76,10 @@ impl InputPacket {
             || packet.trim_start_samples != 0
             || packet.trim_end_samples != 0
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid microphone packet",
-            ));
+            return Err(CodecError::malformed("invalid microphone packet"));
         }
         let pcm = packet.data.try_into().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "microphone packet must contain 960 mono s16le samples",
-            )
+            CodecError::malformed("microphone packet must contain 960 mono s16le samples")
         })?;
         Ok(Self {
             epoch: packet.epoch,
@@ -99,9 +93,9 @@ impl InputPacket {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when the packet does not match the fixed microphone
-    /// format, and [`io::ErrorKind::InvalidInput`] when the body would be too large.
-    pub fn encode(&self) -> io::Result<Vec<u8>> {
+    /// Returns a malformed-input [`CodecError`] when the packet does not match the fixed microphone
+    /// format, and an invalid-argument [`CodecError`] when the body would be too large.
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
         let body = media::audio_packet_body(AudioPacket {
             epoch: self.epoch,
             packet_id: self.packet_id,

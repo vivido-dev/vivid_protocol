@@ -313,8 +313,25 @@ impl ImageAsset {
     }
 }
 
+/// A vector scene, limit set, or value that fails its bounds.
+///
+/// This crate's codecs return it, and a presenter that enforces the same scene rules while
+/// rendering can report its own violations with [`InvalidScene::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidScene(pub &'static str);
+pub struct InvalidScene(pub(crate) &'static str);
+
+impl InvalidScene {
+    /// Reports that a scene broke `reason`, a short rule such as `"clip nesting limit exceeded"`.
+    pub const fn new(reason: &'static str) -> Self {
+        Self(reason)
+    }
+
+    /// The rule the scene broke, such as `"scene epoch and revision must be nonzero"`.
+    pub const fn reason(&self) -> &'static str {
+        self.0
+    }
+}
+
 impl fmt::Display for InvalidScene {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.0)
@@ -467,6 +484,7 @@ impl Transform {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Segment {
     Move(Point),
     Line(Point),
@@ -852,6 +870,7 @@ impl Corners {
 
 /// How gradient stops interpolate, and therefore how the transition looks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColorSpace {
     #[default]
     Srgb,
@@ -860,6 +879,7 @@ pub enum ColorSpace {
 
 /// How an image brush samples outside its own extent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Extend {
     #[default]
     Pad,
@@ -872,6 +892,7 @@ pub struct GradientStop {
     pub color: Color,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Brush {
     Solid(Color),
     Linear {
@@ -976,6 +997,7 @@ impl Shadow {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Cap {
     #[default]
     Butt,
@@ -984,6 +1006,7 @@ pub enum Cap {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Join {
     #[default]
     Miter,
@@ -1062,6 +1085,7 @@ impl StrokeStyle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HitRole {
     Input,
     Drag,
@@ -1074,6 +1098,7 @@ pub enum HitRole {
 /// A closed set rather than a platform cursor name: a host maps these onto whatever its
 /// platform offers, and an unknown shape must fail rather than silently become an arrow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CursorShape {
     #[default]
     Default,
@@ -1140,6 +1165,7 @@ pub struct HitRegion {
     pub cursor: Option<CursorShape>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Command {
     Fill(Path, Brush),
     Stroke(Path, Brush, Scalar),

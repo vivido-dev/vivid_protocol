@@ -57,6 +57,7 @@ impl fmt::Debug for Secret32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthError {
     InvalidSecretEncoding,
     InvalidLength,

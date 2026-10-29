@@ -1,10 +1,9 @@
 //! Negotiated synchronized timed playback. Positions are clock observations, never ingress ACKs.
 use crate::{
     cbor::Value,
-    messages::{PayloadMap, StrictMap},
+    messages::{MessageError, PayloadMap, StrictMap, invalid_value},
     track::TrackAddress,
 };
-use std::io;
 
 pub const PRESENTATION_RESUMED: u64 = 6;
 pub const HOLD_NOT_VISIBLE: u64 = 1;
@@ -26,9 +25,10 @@ impl NeedKeyframe {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when `value` is not a strict `NEED_KEYFRAME` map, or
-    /// a field is missing, has the wrong type, or does not fit its integer type.
-    pub fn decode(value: &Value) -> io::Result<Self> {
+    /// Returns [`MessageError`] when `value` is not a strict `NEED_KEYFRAME` map, a field is
+    /// missing, has the wrong type, or does not fit its integer type, an ID is zero, or the reason
+    /// disagrees with its correlation fields.
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("NEED_KEYFRAME", value, &[0, 1, 2, 3, 4, 5, 6, 7, 8])?;
         map.optional_u64(6)?;
         let request = Self {
@@ -42,7 +42,10 @@ impl NeedKeyframe {
             reason: map.required_u64(5)?,
             presentation_pts_us: map
                 .optional(7)
-                .map(|v| v.as_i64().ok_or_else(|| invalid("invalid recovery PTS")))
+                .map(|v| {
+                    v.as_i64()
+                        .ok_or_else(|| invalid_value("NEED_KEYFRAME", 7, "is not a signed PTS"))
+                })
                 .transpose()?,
             hold_serial: map.optional_u64(8)?,
         };
@@ -50,19 +53,31 @@ impl NeedKeyframe {
             || request.address.surface_id == 0
             || request.address.track_id == 0
             || request.address.channel_generation.get() == 0
-            || !(1..=PRESENTATION_RESUMED).contains(&request.reason)
+        {
+            return Err(invalid_value(
+                "NEED_KEYFRAME",
+                0,
+                "IDs and the channel generation must be nonzero",
+            ));
+        }
+        if !(1..=PRESENTATION_RESUMED).contains(&request.reason)
             || request.hold_serial == Some(0)
             || (request.reason == PRESENTATION_RESUMED && request.hold_serial.is_none())
             || (request.reason != PRESENTATION_RESUMED
                 && (request.hold_serial.is_some() || request.presentation_pts_us.is_some()))
         {
-            return Err(invalid("invalid recovery reason or correlation"));
+            return Err(invalid_value(
+                "NEED_KEYFRAME",
+                5,
+                "is unknown or disagrees with its correlation fields",
+            ));
         }
         Ok(request)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum StartPolicy {
     #[default]
     AfterMinimumBuffer,
@@ -84,10 +99,10 @@ impl PlayOptions {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when `value` is not a strict `PLAY` map, a field is
-    /// missing or has the wrong type, the rate, late policy, or loop count is not the single
-    /// supported value, or the start policy is unknown.
-    pub fn decode(value: &Value) -> io::Result<(TrackAddress, Self)> {
+    /// Returns [`MessageError`] when `value` is not a strict `PLAY` map, a field is missing or has
+    /// the wrong type, the rate, late policy, or loop count is not the single supported value, the
+    /// start policy is unknown, or the options fail [`PlayOptions::payload`].
+    pub fn decode(value: &Value) -> Result<(TrackAddress, Self), MessageError> {
         let map = StrictMap::new("PLAY", value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])?;
         let address = TrackAddress {
             context_id: map.required_u64(0)?,
@@ -97,19 +112,23 @@ impl PlayOptions {
         };
         if map.required_u64(6)? != 1 << 32 || map.required_u64(7)? != 1 || map.required_u64(8)? != 0
         {
-            return Err(invalid("unsupported PLAY rate, late policy or loop count"));
+            return Err(invalid_value(
+                "PLAY",
+                6,
+                "rate, late policy, or loop count is not the supported value",
+            ));
         }
         let options = Self {
             start_pts_us: map
                 .required(3)?
                 .as_i64()
-                .ok_or_else(|| invalid("invalid PLAY PTS"))?,
+                .ok_or_else(|| invalid_value("PLAY", 3, "is not a signed PTS"))?,
             minimum_buffer_us: map.required_u64(4)?,
             maximum_latency_us: map.required_u64(5)?,
             start_policy: match map.required_u64(9)? {
                 1 => StartPolicy::AfterMinimumBuffer,
                 2 => StartPolicy::Synchronized,
-                _ => return Err(invalid("unsupported PLAY start policy")),
+                _ => return Err(invalid_value("PLAY", 9, "is not a known start policy")),
             },
             hold_serial: map.optional_u64(11)?,
         };
@@ -121,18 +140,32 @@ impl PlayOptions {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when an ID or the channel generation in `address` is
-    /// zero, or the options are inconsistent, such as a minimum buffer above the maximum latency.
-    pub fn payload(self, address: TrackAddress) -> io::Result<PayloadMap> {
+    /// Returns [`MessageError`] when an ID or the channel generation in `address` is zero, the
+    /// minimum buffer exceeds the maximum latency, or a hold serial is zero or comes without the
+    /// synchronized start policy.
+    pub fn payload(self, address: TrackAddress) -> Result<PayloadMap, MessageError> {
         if address.context_id == 0
             || address.surface_id == 0
             || address.track_id == 0
             || address.channel_generation.get() == 0
-            || self.minimum_buffer_us > self.maximum_latency_us
-            || self.hold_serial == Some(0)
+        {
+            return Err(invalid_value(
+                "PLAY",
+                0,
+                "IDs and the channel generation must be nonzero",
+            ));
+        }
+        if self.minimum_buffer_us > self.maximum_latency_us {
+            return Err(invalid_value("PLAY", 4, "exceeds the maximum latency"));
+        }
+        if self.hold_serial == Some(0)
             || (self.hold_serial.is_some() && self.start_policy != StartPolicy::Synchronized)
         {
-            return Err(invalid("invalid timed playback options"));
+            return Err(invalid_value(
+                "PLAY",
+                11,
+                "must be nonzero and needs the synchronized start policy",
+            ));
         }
         let mut fields = vec![
             (0, Value::Unsigned(address.context_id)),
@@ -189,20 +222,33 @@ impl PlaybackHold {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when the context, surface, or serial is zero, the
-    /// reason mask has unknown bits, or the held state and reasons disagree.
-    pub fn payload(&self) -> io::Result<PayloadMap> {
-        if self.context_id == 0
-            || self.surface_id == 0
-            || self.serial == 0
-            || self.reasons & !15 != 0
-            || (self.held && self.reasons == 0)
-            || (!self.held && self.reasons != 0)
-            || self
-                .position
-                .is_some_and(|p| p.track_id == 0 || p.channel_generation == 0)
+    /// Returns [`MessageError`] when the context, surface, or serial is zero, the reason mask has
+    /// unknown bits, the held state and reasons disagree, or the held position names a zero track
+    /// or channel generation.
+    pub fn payload(&self) -> Result<PayloadMap, MessageError> {
+        if self.context_id == 0 || self.surface_id == 0 || self.serial == 0 {
+            return Err(invalid_value(
+                "PLAYBACK_HOLD",
+                0,
+                "context, surface, and serial must be nonzero",
+            ));
+        }
+        if self.reasons & !15 != 0 || self.held == (self.reasons == 0) {
+            return Err(invalid_value(
+                "PLAYBACK_HOLD",
+                4,
+                "has unknown bits or disagrees with the held state",
+            ));
+        }
+        if self
+            .position
+            .is_some_and(|p| p.track_id == 0 || p.channel_generation == 0)
         {
-            return Err(invalid("invalid playback hold"));
+            return Err(invalid_value(
+                "PLAYBACK_HOLD",
+                7,
+                "names a zero track or channel generation",
+            ));
         }
         let mut fields = vec![
             (0, Value::Unsigned(self.context_id)),
@@ -232,27 +278,25 @@ impl PlaybackHold {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when `value` or its held position is not a strict
-    /// map, a field is missing or has the wrong type, or the hold fails the rules of
-    /// [`PlaybackHold::payload`].
-    pub fn decode(value: &Value) -> io::Result<Self> {
+    /// Returns [`MessageError`] when `value` or its held position is not a strict map, a field is
+    /// missing or has the wrong type, or the hold fails the rules of [`PlaybackHold::payload`].
+    pub fn decode(value: &Value) -> Result<Self, MessageError> {
         let map = StrictMap::new("PLAYBACK_HOLD", value, &[0, 1, 2, 3, 4, 5, 6, 7])?;
-        let position = map
-            .optional(7)
-            .map(|value| -> io::Result<_> {
-                let p = StrictMap::new("held position", value, &[0, 1, 2, 3, 4])?;
-                Ok(HeldPosition {
-                    track_id: p.required_u64(0)?,
-                    channel_generation: p.required_u64(1)?,
-                    epoch: p.required_u32(2)?,
-                    pts_us: p
-                        .required(3)?
-                        .as_i64()
-                        .ok_or_else(|| invalid("invalid held PTS"))?,
-                    estimated: p.required_bool(4)?,
+        let position =
+            map.optional(7)
+                .map(|value| -> Result<_, MessageError> {
+                    let p = StrictMap::new("held position", value, &[0, 1, 2, 3, 4])?;
+                    Ok(HeldPosition {
+                        track_id: p.required_u64(0)?,
+                        channel_generation: p.required_u64(1)?,
+                        epoch: p.required_u32(2)?,
+                        pts_us: p.required(3)?.as_i64().ok_or_else(|| {
+                            invalid_value("held position", 3, "is not a signed PTS")
+                        })?,
+                        estimated: p.required_bool(4)?,
+                    })
                 })
-            })
-            .transpose()?;
+                .transpose()?;
         let hold = Self {
             context_id: map.required_u64(0)?,
             surface_id: map.required_u64(1)?,
@@ -273,10 +317,6 @@ fn signed(value: i64) -> Value {
         Ok(value) => Value::Unsigned(value),
         Err(_) => Value::Negative(value),
     }
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 #[cfg(test)]
