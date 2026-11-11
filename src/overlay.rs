@@ -3,6 +3,7 @@
 //! Geometry and hit-test compilation are supplied by the presenter. This state machine never
 //! performs OS input injection and never treats a surface ID without its owner as an identity.
 
+// Rust guideline compliant 2026-10-07
 use crate::identity::{SessionIdentity, SurfaceIdentity};
 use crate::vector::{CursorShape, HitRegion, HitRole, InvalidScene, Point, Rect, Scalar};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -632,17 +633,38 @@ pub struct Windows {
     focus: Option<SurfaceIdentity>,
     hover: Option<Hover>,
     focus_history: Vec<SurfaceIdentity>,
-    swallowed_buttons: BTreeSet<u16>,
-    swallowed_escape: bool,
+    swallowed_buttons: BTreeMap<u16, SessionIdentity>,
+    swallowed_escape: Option<SessionIdentity>,
     capture: Option<Capture>,
     events: BTreeMap<SessionIdentity, VecDeque<WindowEvent>>,
     overflowed: BTreeSet<SessionIdentity>,
+    input_revoked: BTreeSet<SessionIdentity>,
+    pane_inactive: bool,
+    focus_generation: u64,
+    focus_poisoned: bool,
 }
 
 impl Windows {
     /// Returns the window `id`, if it exists.
     pub fn get(&self, id: SurfaceIdentity) -> Option<&Window> {
         self.entries.get(&id)
+    }
+    /// Returns the number of retained windows, including hidden windows.
+    pub fn window_count(&self) -> usize {
+        self.entries.len()
+    }
+    /// Returns the number of registered owner reservations and overflow records.
+    pub fn owner_count(&self) -> usize {
+        self.events.len()
+            + self
+                .overflowed
+                .iter()
+                .filter(|owner| !self.events.contains_key(owner))
+                .count()
+    }
+    /// Returns this pane's checked focus-transition generation.
+    pub fn focus_generation(&self) -> u64 {
+        self.focus_generation
     }
     /// Returns the focused window, if any.
     pub fn focus(&self) -> Option<SurfaceIdentity> {
@@ -654,15 +676,129 @@ impl Windows {
     /// only that pane's business if the window that comes back is one of its own, and after a loss
     /// [`focus`](Self::focus) is `None`, so there is otherwise nothing left to ask.
     pub fn restorable_focus(&self) -> Option<SurfaceIdentity> {
-        self.focus_candidate()
+        self.focus_history
+            .iter()
+            .rev()
+            .copied()
+            .find(|id| self.window_eligible(*id))
     }
     /// Returns whether a window holds pointer capture.
     pub fn has_pointer_capture(&self) -> bool {
         self.capture.is_some()
     }
+
+    /// Returns the complete identity of the window holding pointer capture.
+    pub fn captured_window(&self) -> Option<SurfaceIdentity> {
+        self.capture.map(|capture| capture.window)
+    }
+
+    /// Reports whether visibility and modal policy currently allow this window's input.
+    pub fn input_eligible(&self, id: SurfaceIdentity) -> bool {
+        self.eligible(id)
+    }
+
+    /// Returns the owner whose dismissal consumes this button's release.
+    pub fn swallowed_button_owner(&self, button: u16) -> Option<SessionIdentity> {
+        self.swallowed_buttons.get(&button).copied()
+    }
+
+    /// Returns the owner whose dismissal consumes the Escape key's release.
+    pub fn swallowed_escape_owner(&self) -> Option<SessionIdentity> {
+        self.swallowed_escape
+    }
+    /// Reports whether this owner has registered window or event state.
+    pub fn has_owner(&self, owner: SessionIdentity) -> bool {
+        self.events.contains_key(&owner) || self.input_revoked.contains(&owner)
+    }
+
+    /// Changes an owner's input eligibility while retaining its window pixels.
+    ///
+    /// Disabling clears that owner's capture, focus, hover and swallowed releases.
+    /// Disabled modals do not block other owners. Reenabling floating windows
+    /// requires an explicit focus request; an active modal restores modal policy.
+    ///
+    /// # Errors
+    /// Returns [`InvalidScene`] for owner/focus exhaustion or a conflicting active modal.
+    pub fn set_owner_input(
+        &mut self,
+        owner: SessionIdentity,
+        enabled: bool,
+    ) -> Result<(), InvalidScene> {
+        if enabled {
+            if self.focus_poisoned {
+                return Err(InvalidScene("pane focus generation exhausted"));
+            }
+            if self.input_revoked.contains(&owner)
+                && self
+                    .top_modal()
+                    .is_some_and(|modal| modal.context.session != owner)
+                && self.visible().any(|window| {
+                    window.identity.context.session == owner
+                        && window.options.mode == WindowMode::Modal
+                })
+            {
+                return Err(InvalidScene("another owner holds modal focus"));
+            }
+            if !self.input_revoked.remove(&owner) {
+                return Ok(());
+            }
+            if self.focus.is_some_and(|id| !self.eligible(id)) {
+                let focused = self.focus;
+                if let Some(capture) = self.capture.take()
+                    && Some(capture.window) != focused
+                {
+                    self.emit(capture.window, Event::Cancel);
+                }
+                self.change_focus(None);
+            }
+            if self.focus.is_none()
+                && let Some(modal) = self.top_modal()
+            {
+                self.request_focus(modal)?;
+            }
+            return Ok(());
+        }
+        if self.input_revoked.contains(&owner) {
+            return Ok(());
+        }
+        if !self.events.contains_key(&owner)
+            && self.events.len() + self.overflowed.len() >= MAX_OWNERS
+        {
+            return Err(InvalidScene("overlay owner limit exceeded"));
+        }
+        self.events.entry(owner).or_default();
+        self.input_revoked.insert(owner);
+        self.swallowed_buttons
+            .retain(|_, swallowed| *swallowed != owner);
+        if self.swallowed_escape == Some(owner) {
+            self.swallowed_escape = None;
+        }
+        if self
+            .hover
+            .is_some_and(|hover| hover.window.context.session == owner)
+        {
+            self.set_hover(None);
+        }
+        let focused = self.focus.filter(|id| id.context.session == owner);
+        if self
+            .capture
+            .is_some_and(|capture| capture.window.context.session == owner)
+            && let Some(capture) = self.capture.take()
+            && Some(capture.window) != focused
+        {
+            self.emit(capture.window, Event::Cancel);
+        }
+        self.focus_history.retain(|id| id.context.session != owner);
+        if focused.is_some() {
+            self.change_focus(None);
+            self.restore_focus();
+        }
+        Ok(())
+    }
     /// Native pane focus loss cancels gestures and held input without destroying window state.
     /// Focus restoration follows the same modal eligibility rules as closing a child window.
     pub fn set_pane_focus(&mut self, focused: bool) {
+        self.pane_inactive = !focused;
         if focused {
             self.restore_focus();
         } else {
@@ -670,8 +806,9 @@ impl Windows {
                 self.emit(capture.window, Event::Cancel);
             }
             self.change_focus(None);
+            self.set_hover(None);
             self.swallowed_buttons.clear();
-            self.swallowed_escape = false;
+            self.swallowed_escape = None;
         }
     }
     /// Returns the effectively visible windows, bottom to top.
@@ -696,6 +833,9 @@ impl Windows {
         options: WindowOptions,
     ) -> Result<(), InvalidScene> {
         options.validate()?;
+        if self.focus_poisoned {
+            return Err(InvalidScene("pane focus generation exhausted"));
+        }
         if generation == 0 || id.context.context_id == 0 || id.surface_id == 0 {
             return Err(InvalidScene(
                 "window identity and generation must be nonzero",
@@ -728,6 +868,7 @@ impl Windows {
             return Err(InvalidScene("invalid parent owner or lifecycle"));
         }
         if options.visible
+            && !self.input_revoked.contains(&id.context.session)
             && options.mode == WindowMode::Modal
             && self
                 .top_modal()
@@ -735,8 +876,11 @@ impl Windows {
         {
             return Err(InvalidScene("another owner holds the modal focus"));
         }
-        let take_focus = options.visible && options.mode != WindowMode::Floating;
+        let take_focus = options.visible
+            && options.mode != WindowMode::Floating
+            && !self.input_revoked.contains(&id.context.session);
         if take_focus
+            && !self.input_revoked.contains(&id.context.session)
             && options.mode == WindowMode::Popup
             && self
                 .top_modal()
@@ -921,6 +1065,7 @@ impl Windows {
             return Err(InvalidScene("window parent and mode are immutable"));
         }
         if options.visible
+            && !self.input_revoked.contains(&id.context.session)
             && options.mode == WindowMode::Modal
             && self
                 .top_modal()
@@ -929,6 +1074,7 @@ impl Windows {
             return Err(InvalidScene("another owner holds modal focus"));
         }
         if options.visible
+            && !self.input_revoked.contains(&id.context.session)
             && options.mode == WindowMode::Popup
             && self
                 .top_modal()
@@ -966,14 +1112,17 @@ impl Windows {
                 self.restore_focus();
             }
         }
-        if showing {
+        if showing && !self.input_revoked.contains(&id.context.session) {
             self.request_focus(id)?;
         }
         Ok(next)
     }
     fn top_modal(&self) -> Option<SurfaceIdentity> {
         self.visible()
-            .filter(|w| w.options.mode == WindowMode::Modal)
+            .filter(|w| {
+                w.options.mode == WindowMode::Modal
+                    && !self.input_revoked.contains(&w.identity.context.session)
+            })
             .last()
             .map(|w| w.identity)
     }
@@ -1005,29 +1154,55 @@ impl Windows {
         false
     }
     fn eligible(&self, id: SurfaceIdentity) -> bool {
-        self.effectively_visible(id)
+        !self.pane_inactive && self.window_eligible(id)
+    }
+    fn window_eligible(&self, id: SurfaceIdentity) -> bool {
+        !self.focus_poisoned
+            && !self.input_revoked.contains(&id.context.session)
+            && self.effectively_visible(id)
             && self
                 .top_modal()
                 .is_none_or(|modal| self.descendant(id, modal))
     }
-    /// Focuses window `id` and raises its group.
+    /// Requests window focus and raises its group.
+    ///
+    /// An inactive pane remembers the request until host activation.
     ///
     /// # Errors
     ///
     /// Returns [`InvalidScene`] when the window is hidden or blocked by a modal.
     pub fn request_focus(&mut self, id: SurfaceIdentity) -> Result<(), InvalidScene> {
-        if !self.eligible(id) {
+        if !self.window_eligible(id) {
             return Err(InvalidScene("window is hidden or blocked by a modal"));
         }
         self.raise_group(id);
         self.focus_history.retain(|key| *key != id);
         self.focus_history.push(id);
-        self.change_focus(Some(id));
+        if !self.pane_inactive {
+            self.change_focus(Some(id));
+        }
+        if self.focus_poisoned {
+            return Err(InvalidScene("pane focus generation exhausted"));
+        }
         Ok(())
     }
-    fn change_focus(&mut self, next: Option<SurfaceIdentity>) {
+    /// Clears only this window's focus without changing native pane activation.
+    pub fn clear_focus(&mut self, id: SurfaceIdentity) {
+        if self.focus == Some(id) {
+            self.change_focus(None);
+            self.focus_history.retain(|window| *window != id);
+        }
+    }
+    fn change_focus(&mut self, mut next: Option<SurfaceIdentity>) {
         if self.focus == next {
             return;
+        }
+        if let Some(generation) = self.focus_generation.checked_add(1) {
+            self.focus_generation = generation;
+        } else {
+            self.focus_poisoned = true;
+            self.capture = None;
+            next = None;
         }
         if let Some(old) = self.focus.take() {
             self.emit(old, Event::Cancel);
@@ -1081,6 +1256,12 @@ impl Windows {
     }
     /// Removes every window and queued event that belongs to `owner`.
     pub fn revoke_owner(&mut self, owner: SessionIdentity) {
+        self.input_revoked.remove(&owner);
+        self.swallowed_buttons
+            .retain(|_, swallowed| *swallowed != owner);
+        if self.swallowed_escape == Some(owner) {
+            self.swallowed_escape = None;
+        }
         self.overflowed.remove(&owner);
         let ids: Vec<_> = self
             .stack
@@ -1102,7 +1283,7 @@ impl Windows {
             self.capture = None;
         }
         if self.focus.is_some_and(|id| id.context.session == owner) {
-            self.focus = None;
+            self.change_focus(None);
             self.restore_focus();
         }
     }
@@ -1165,7 +1346,10 @@ impl Windows {
     pub fn take_event(&mut self, owner: SessionIdentity) -> Option<WindowEvent> {
         let queue = self.events.get_mut(&owner)?;
         let event = queue.pop_front();
-        if queue.is_empty() && !self.entries.keys().any(|key| key.context.session == owner) {
+        if queue.is_empty()
+            && !self.input_revoked.contains(&owner)
+            && !self.entries.keys().any(|key| key.context.session == owner)
+        {
             self.events.remove(&owner);
         }
         event
@@ -1215,9 +1399,12 @@ impl Windows {
     }
     /// Route ordinary keys only after the host has handled its reserved application shortcuts.
     pub fn keyboard(&mut self, event: Event, escape: bool) -> bool {
-        if escape && self.swallowed_escape {
+        if self.pane_inactive || self.focus_poisoned {
+            return false;
+        }
+        if escape && self.swallowed_escape.is_some() {
             if matches!(event, Event::Key { down: false, .. }) {
-                self.swallowed_escape = false;
+                self.swallowed_escape = None;
             }
             return true;
         }
@@ -1238,7 +1425,7 @@ impl Windows {
                 .get(&id)
                 .is_some_and(|w| w.options.mode != WindowMode::Floating)
         {
-            self.swallowed_escape = true;
+            self.swallowed_escape = Some(id.context.session);
             self.close(id, DismissReason::Escape);
             return true;
         }
@@ -1253,6 +1440,9 @@ impl Windows {
         modifiers: u32,
         hit: impl Fn(SurfaceIdentity, Point) -> Option<(u64, HitRole)>,
     ) -> bool {
+        if self.pane_inactive || self.focus_poisoned {
+            return false;
+        }
         let target = self
             .stack
             .iter()
@@ -1287,11 +1477,16 @@ impl Windows {
     }
     /// Hit-test callback uses the same compiled paths, transforms and clips as the draw scene.
     /// None is input-transparent; a default rectangular hit is the compiler's responsibility.
+    /// A settled placement change clears hover until the host calls [`Self::refresh_hover`]
+    /// with newly displayed geometry.
     pub fn pointer(
         &mut self,
         report: PointerReport,
         hit: impl Fn(SurfaceIdentity, Point) -> Option<HitRegion>,
     ) -> bool {
+        if self.pane_inactive || self.focus_poisoned {
+            return false;
+        }
         let PointerReport {
             position,
             button,
@@ -1300,7 +1495,7 @@ impl Windows {
             pressure,
         } = report;
         if let Some((button_id, down)) = button
-            && self.swallowed_buttons.contains(&button_id)
+            && self.swallowed_buttons.contains_key(&button_id)
         {
             if !down {
                 self.swallowed_buttons.remove(&button_id);
@@ -1312,6 +1507,10 @@ impl Windows {
                 self.cancel_capture(capture.window);
                 return self.top_modal().is_some();
             }
+            let placement = self
+                .entries
+                .get(&capture.window)
+                .map(|window| window.revision);
             if matches!(capture.role, HitRole::Drag | HitRole::Resize(_)) {
                 self.gesture(capture, position, button.is_some_and(|(_, down)| !down));
             } else if let Some(local) = self.local(capture.window, position) {
@@ -1331,7 +1530,18 @@ impl Windows {
                 self.capture = None;
                 // A drag deliberately does not retrigger hover as it passes over regions, so
                 // the release is where the pointer's hover is finally re-evaluated.
-                self.refresh_hover(position, &hit);
+                if self
+                    .entries
+                    .get(&capture.window)
+                    .map(|window| window.revision)
+                    == placement
+                {
+                    self.refresh_hover(position, &hit);
+                } else {
+                    // The hit callback describes the placement admitted before this report.
+                    // A changed placement needs fresh display proof before hover can return.
+                    self.set_hover(None);
+                }
             }
             return true;
         }
@@ -1346,7 +1556,7 @@ impl Windows {
             && !bounds.contains(position)
         {
             if let Some((button_id, _)) = button {
-                self.swallowed_buttons.insert(button_id);
+                self.swallowed_buttons.insert(button_id, id.context.session);
             }
             self.close(id, DismissReason::OutsidePress);
             return true;
@@ -1362,7 +1572,9 @@ impl Windows {
             return blocked;
         };
         if button.is_some_and(|(_, down)| down) {
-            let _ = self.request_focus(id);
+            if self.request_focus(id).is_err() {
+                return false;
+            }
             if matches!(target.role, HitRole::Drag | HitRole::Resize(_))
                 && let Some(w) = self.entries.get(&id)
             {
@@ -1586,6 +1798,101 @@ fn valid_event(event: &Event) -> bool {
 mod tests {
     use super::*;
     use crate::identity::PresenterInstanceId;
+    #[test]
+    fn input_only_revocation_retains_pixels_and_releases_only_its_owners_blockade() {
+        let mut windows = Windows::default();
+        let a = key(1, 1);
+        let b = key(2, 1);
+        windows.create(b, 1, options(WindowMode::Floating)).unwrap();
+        windows.request_focus(b).unwrap();
+        windows.create(a, 1, options(WindowMode::Modal)).unwrap();
+        windows.capture_pointer(a, Point::default()).unwrap();
+        windows.set_owner_input(a.context.session, false).unwrap();
+        assert_eq!(windows.visible().count(), 2);
+        assert_eq!(windows.captured_window(), None);
+        assert_eq!(windows.focus(), Some(b));
+        assert!(windows.input_eligible(b));
+        assert!(!windows.input_eligible(a));
+        assert!(windows.request_focus(a).is_err());
+        assert_eq!(windows.get(a).unwrap().revision, 1);
+        assert_eq!(windows.get(b).unwrap().revision, 1);
+        windows.capture_pointer(b, Point::default()).unwrap();
+        windows.set_owner_input(a.context.session, false).unwrap();
+        assert_eq!(windows.captured_window(), Some(b));
+        windows.set_owner_input(a.context.session, true).unwrap();
+        assert_eq!(windows.focus(), Some(a));
+        assert_eq!(windows.captured_window(), None);
+        assert!(!windows.input_eligible(b));
+        windows.revoke_owner(a.context.session);
+        assert!(windows.get(b).is_some());
+        assert!(windows.input_eligible(b));
+    }
+
+    #[test]
+    fn inactive_modal_creation_cannot_block_or_steal_an_authenticated_modal() {
+        let mut windows = Windows::default();
+        let a = key(1, 1);
+        let b = key(2, 1);
+        windows.create(b, 1, options(WindowMode::Modal)).unwrap();
+        windows.set_owner_input(a.context.session, false).unwrap();
+        windows.create(a, 1, options(WindowMode::Modal)).unwrap();
+        assert_eq!(windows.focus(), Some(b));
+        assert!(windows.input_eligible(b));
+        assert!(windows.set_owner_input(a.context.session, true).is_err());
+        assert!(!windows.input_eligible(a));
+        windows.revoke_owner(b.context.session);
+        windows.set_owner_input(a.context.session, true).unwrap();
+        assert!(windows.input_eligible(a));
+        assert_eq!(windows.focus(), Some(a));
+    }
+
+    #[test]
+    fn inactive_pane_remembers_focus_requests_without_granting_input() {
+        let mut windows = Windows::default();
+        let a = key(1, 1);
+        let b = key(1, 2);
+        windows.create(a, 1, options(WindowMode::Floating)).unwrap();
+        windows.request_focus(a).unwrap();
+        while windows.take_event(a.context.session).is_some() {}
+        windows.set_pane_focus(false);
+        let generation = windows.focus_generation();
+        windows.create(b, 1, options(WindowMode::Popup)).unwrap();
+        windows.request_focus(b).unwrap();
+        assert_eq!(windows.focus(), None);
+        assert_eq!(windows.restorable_focus(), Some(b));
+        assert_eq!(windows.focus_generation(), generation);
+        assert!(!windows.keyboard(Event::Text("bad".into()), false));
+        assert!(!windows.pointer(press(20., 20.), |_, _| Some(region(7, HitRole::Input))));
+        while let Some(event) = windows.take_event(a.context.session) {
+            assert!(!matches!(
+                event.event,
+                Event::Focus(true) | Event::Pointer { .. } | Event::Text(_)
+            ));
+        }
+        windows.set_pane_focus(true);
+        assert_eq!(windows.focus(), Some(b));
+        assert!(windows.focus_generation() > generation);
+    }
+
+    #[test]
+    fn focus_generation_exhaustion_never_wraps_or_delivers_another_grant() {
+        let mut windows = Windows::default();
+        let a = key(1, 1);
+        let b = key(2, 1);
+        windows.create(a, 1, options(WindowMode::Floating)).unwrap();
+        windows.create(b, 1, options(WindowMode::Floating)).unwrap();
+        windows.request_focus(a).unwrap();
+        windows.focus_generation = u64::MAX;
+        assert!(windows.request_focus(b).is_err());
+        assert_eq!(windows.focus(), None);
+        assert_eq!(windows.focus_generation(), u64::MAX);
+        assert!(!windows.keyboard(Event::Text("bad".into()), false));
+        assert!(!windows.pointer(press(20., 20.), |_, _| Some(region(7, HitRole::Input))));
+        windows.set_pane_focus(true);
+        assert!(windows.request_focus(a).is_err());
+        assert_eq!(windows.visible().count(), 2);
+    }
+
     #[test]
     fn pane_focus_loss_cancels_capture_and_overflow_is_observable_once() {
         let mut windows = Windows::default();
@@ -1957,6 +2264,32 @@ mod tests {
     }
 
     #[test]
+    fn a_settled_drag_waits_for_hover_geometry_from_its_new_placement() {
+        let a = key(1, 1);
+        let mut windows = Windows::default();
+        windows.create(a, 1, options(WindowMode::Floating)).unwrap();
+        let hit = |_, _| {
+            Some(HitRegion {
+                id: 7,
+                role: HitRole::Drag,
+                cursor: Some(CursorShape::Move),
+            })
+        };
+        windows.pointer(press(10., 10.), hit);
+        assert_eq!(windows.cursor(), Some(CursorShape::Move));
+        windows.pointer(
+            PointerReport {
+                button: Some((0, false)),
+                ..at(20., 10.)
+            },
+            hit,
+        );
+        assert_eq!(windows.cursor(), None);
+        windows.refresh_hover(Point::new(20., 10.).unwrap(), &hit);
+        assert_eq!(windows.cursor(), Some(CursorShape::Move));
+    }
+
+    #[test]
     fn closing_a_window_ends_its_hover() {
         let a = key(1, 1);
         let mut s = Windows::default();
@@ -2174,6 +2507,45 @@ mod tests {
         assert!(s.get(a).is_none());
         assert!(s.get(b).is_some());
         assert_eq!(s.focus(), Some(b));
+    }
+    #[test]
+    fn dismissal_and_capture_cleanup_preserve_another_owner_with_reused_ids() {
+        let a = key(1, 1);
+        let b = key(2, 1);
+        let mut windows = Windows::default();
+        windows.create(a, 1, options(WindowMode::Floating)).unwrap();
+        windows.create(b, 1, options(WindowMode::Popup)).unwrap();
+        assert!(windows.pointer(press(0., 0.), |_, _| None));
+        assert_eq!(windows.swallowed_button_owner(0), Some(b.context.session));
+        windows.revoke_owner(a.context.session);
+        assert_eq!(windows.swallowed_button_owner(0), Some(b.context.session));
+        windows.revoke_owner(b.context.session);
+        assert_eq!(windows.swallowed_button_owner(0), None);
+        windows.create(a, 1, options(WindowMode::Floating)).unwrap();
+        windows.create(b, 1, options(WindowMode::Popup)).unwrap();
+        let escape = Event::Key {
+            physical: 0x29,
+            down: true,
+            repeat: false,
+            modifiers: 0,
+        };
+        windows.request_focus(b).unwrap();
+        assert!(windows.keyboard(escape, true));
+        assert_eq!(windows.swallowed_escape_owner(), Some(b.context.session));
+        windows.revoke_owner(a.context.session);
+        assert_eq!(windows.swallowed_escape_owner(), Some(b.context.session));
+        windows.revoke_owner(b.context.session);
+        assert_eq!(windows.swallowed_escape_owner(), None);
+        windows.create(a, 1, options(WindowMode::Floating)).unwrap();
+        windows.create(b, 1, options(WindowMode::Floating)).unwrap();
+        windows.request_focus(b).unwrap();
+        windows.capture_pointer(b, Point::default()).unwrap();
+        assert!(windows.input_eligible(b));
+        assert_eq!(windows.captured_window(), Some(b));
+        windows.revoke_owner(a.context.session);
+        assert_eq!(windows.captured_window(), Some(b));
+        windows.revoke_owner(b.context.session);
+        assert_eq!(windows.captured_window(), None);
     }
     #[test]
     fn popup_dismissal_does_not_click_through() {

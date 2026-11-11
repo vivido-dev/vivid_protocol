@@ -15,7 +15,7 @@
 //!
 //! - **Connections:** [`wire`] framing and transport, `discovery` of endpoints, and [`cbor`].
 //! - **Sessions:** [`messages`] control records, [`auth`] proofs and keys, [`lease`], [`context`],
-//!   [`resource`] contracts, and the [`registry`] of numeric assignments.
+//!   [`resource`] contracts, [`session_status`] reconciliation, and the [`registry`] of numeric assignments.
 //! - **Presentation:** [`target`], [`surface`], [`scene`], [`geometry`], and terminal [`anchor`]s.
 //! - **Media:** [`track`], [`media`] record layouts, [`timed`] playback, [`audio_input`], and
 //!   [`vector`] display lists.
@@ -136,6 +136,7 @@ pub mod registry;
 pub mod resource;
 pub mod revision;
 pub mod scene;
+pub mod session_status;
 pub mod surface;
 pub mod target;
 pub mod time;

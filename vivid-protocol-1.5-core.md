@@ -791,6 +791,40 @@ alter accepted profiles or existing object syntax.
 The query accepts a cursor and maximum entries. A cursor is bound to one session revision. A
 revision change returns `PRECONDITION_FAILED` and the caller restarts.
 
+`QUERY_SESSION` uses object ID zero. Its payload has optional key 0 (bytes: the
+prior continuation cursor, 1–64 bytes) and optional key 1 (uint: maximum entries,
+1–256, default 64). The initial request omits the cursor. An empty payload is a
+default initial query. Replies use object ID zero. The presenter may return fewer
+entries to fit the negotiated control-body limit, but MUST either make progress
+or return `LIMIT_EXCEEDED`; it MUST NOT silently truncate a complete snapshot.
+Key 7 is absent on the final page. A syntactically valid but invalid, foreign, or
+stale continuation cursor returns `PRECONDITION_FAILED`. Malformed query fields
+return `BAD_MESSAGE`. Cursors never select a different owner.
+
+Key 6 contains flat summaries in ascending `(kind, context, surface, object)`
+order, without duplicates. Flat entries keep one surface with many tracks from
+becoming an indivisible oversized page. Each summary has exactly these keys:
+
+| Key | Type | Meaning |
+|---:|---|---|
+| 0 | uint | Kind: context (`0`), surface (`1`), track (`2`), active slot (`3`) |
+| 1 | uint | Nonzero owning context ID |
+| 2 | uint | Surface ID, or zero for a context |
+| 3 | uint | Track ID or slot number; zero for a context or surface |
+| 4 | uint | Context/surface/track revision; slots use their surface revision |
+| 5 | uint | Surface/channel generation; slots use the surface generation; zero for contexts |
+| 6 | uint | Object lifecycle; zero for slots |
+| 7 | uint | Track milestones or the slot's active track ID; zero otherwise |
+
+The session root context is included even in an empty scene. Track and slot
+entries contain the complete context/surface identity. Scene revision is reported
+at page key 1; scene nodes remain reconcilable with `QUERY_SCENE`. Page key 8 is a
+map with current owned surface count (0), track count (1), and scene-node count
+(2). All pages at one session revision have identical keys 0–5 and 8. Revision
+counters never wrap or move backward, including after delete/recreate or resume.
+Media/channel, input, target, and object changes affecting a summary invalidate
+old cursors. A changed unrelated owner MUST NOT invalidate a session's cursor.
+
 Waits are one-shot, bounded pending operations. Core defines their lifecycle; media defines
 `WAIT_TRACK` conditions. A wait never blocks the control reader. `CANCEL_WAIT` succeeds even if the
 wait is already complete.
