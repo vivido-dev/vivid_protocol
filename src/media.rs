@@ -1,9 +1,4 @@
-use std::{borrow::Cow, io};
-
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-use std::io::Cursor;
-#[cfg(any(feature = "native", target_arch = "wasm32"))]
-use std::io::Read;
+use std::{borrow::Cow, cell::RefCell, io};
 
 use crate::HARD_MAX_RECORD_BODY;
 
@@ -21,6 +16,8 @@ const AUDIO_PACKET_PREFIX_SIZE: usize = 48;
 const RASTER_FRAME_PREFIX_SIZE: usize = 48;
 const RASTER_RECT_SIZE: usize = 24;
 const RASTER_DELTA_OPERATION_SIZE: usize = 32;
+/// zrip's fast strategy, comparable to C zstd level 1.
+const RASTER_ZSTD_LEVEL: i32 = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedVideoPacket<'a> {
@@ -382,22 +379,10 @@ pub fn raster_frame_body_with_compression(
             ),
         ));
     }
-    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     let compressed;
     let pixels = if compress {
-        #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-        {
-            compressed = zstd::bulk::compress(rgba, 1)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            compressed.as_slice()
-        }
-        #[cfg(any(not(feature = "native"), target_arch = "wasm32"))]
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "zstd raster compression requires the native feature",
-            ));
-        }
+        compressed = encode_zstd_pixels(rgba)?;
+        compressed.as_slice()
     } else {
         rgba
     };
@@ -488,24 +473,11 @@ pub fn raster_delta_frame_body(
                         "delta overwrite RGBA length does not match its rectangle",
                     ));
                 }
-                let payload =
-                    if compress {
-                        #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-                        {
-                            Cow::Owned(zstd::bulk::compress(rgba, 1).map_err(|error| {
-                                io::Error::new(io::ErrorKind::InvalidData, error)
-                            })?)
-                        }
-                        #[cfg(any(not(feature = "native"), target_arch = "wasm32"))]
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Unsupported,
-                                "zstd raster compression requires the native feature",
-                            ));
-                        }
-                    } else {
-                        Cow::Borrowed(*rgba)
-                    };
+                let payload = if compress {
+                    Cow::Owned(encode_zstd_pixels(rgba)?)
+                } else {
+                    Cow::Borrowed(*rgba)
+                };
                 let encoded_length = u32::try_from(payload.len()).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "delta overwrite is too large")
                 })?;
@@ -903,58 +875,62 @@ fn validate_raster_rectangle(
     Ok(())
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+thread_local! {
+    /// zstd contexts reused across raster frames, so each frame skips
+    /// allocating and clearing match tables and decoder workspace.
+    static ZSTD_ENCODER: RefCell<Option<zrip::CompressContext>> = const { RefCell::new(None) };
+    static ZSTD_DECODER: RefCell<Option<zrip::DecompressContext>> = const { RefCell::new(None) };
+}
+
+/// Compresses one raster payload into a single zstd frame. Like the C zstd
+/// encoder used before, it omits the content checksum.
+fn encode_zstd_pixels(rgba: &[u8]) -> io::Result<Vec<u8>> {
+    let to_io = |error| io::Error::new(io::ErrorKind::InvalidData, error);
+    ZSTD_ENCODER.with_borrow_mut(|slot| {
+        let context = match slot {
+            Some(context) => context,
+            None => {
+                let mut context = zrip::CompressContext::new(RASTER_ZSTD_LEVEL).map_err(to_io)?;
+                context.set_content_checksum(false);
+                slot.insert(context)
+            }
+        };
+        Ok(context.compress(rgba).map_err(to_io)?.into_owned())
+    })
+}
+
+/// Decodes exactly one zstd frame that spans `pixels` and expands to
+/// `expected` bytes. Output past `expected` is rejected, not buffered.
 fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
-    if zstd_safe::get_dict_id_from_frame(pixels).is_some()
-        || zstd_safe::find_frame_compressed_size(pixels).ok() != Some(pixels.len())
+    let header = zrip::frame::header::parse_frame_header(pixels)
+        .map_err(|_| invalid("invalid zstd frame"))?;
+    if header.dict_id.is_some()
+        || zrip::frame::find_frame_compressed_size(pixels) != Ok(pixels.len())
     {
         return Err(invalid(
             "zstd dictionaries and trailing frames are forbidden",
         ));
     }
-    let cursor = Cursor::new(pixels);
-    let mut decoder = zstd::stream::read::Decoder::new(cursor)
-        .map_err(|_| invalid("invalid zstd frame"))?
-        .single_frame();
-    let mut output = Vec::with_capacity(expected);
-    decoder
-        .by_ref()
-        .take((expected + 1) as u64)
-        .read_to_end(&mut output)?;
+    // The decoder reserves the declared content size, already checked
+    // against `expected` by the limit.
+    let mut output = Vec::new();
+    ZSTD_DECODER
+        .with_borrow_mut(|slot| {
+            slot.get_or_insert_with(zrip::DecompressContext::new)
+                .decompress_into_with_limit(pixels, &mut output, expected)
+        })
+        .map_err(|error| match error {
+            zrip::DecompressError::OutputTooSmall => {
+                invalid("zstd raster has wrong output size or trailing data")
+            }
+            _ => invalid("invalid zstd frame"),
+        })?;
     if output.len() != expected {
         return Err(invalid(
             "zstd raster has wrong output size or trailing data",
         ));
     }
     Ok(output)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn decode_zstd_pixels(pixels: &[u8], expected: usize) -> io::Result<Vec<u8>> {
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(pixels)
-        .map_err(|_| invalid("invalid zstd frame"))?;
-    let mut output = Vec::with_capacity(expected);
-    decoder
-        .by_ref()
-        .take((expected + 1) as u64)
-        .read_to_end(&mut output)?;
-    if output.len() != expected
-        || !decoder.decoder.is_finished()
-        || decoder.decoder.bytes_read_from_source() as usize != pixels.len()
-    {
-        return Err(invalid(
-            "zstd raster has wrong output size or trailing data",
-        ));
-    }
-    Ok(output)
-}
-
-#[cfg(all(not(feature = "native"), not(target_arch = "wasm32")))]
-fn decode_zstd_pixels(_pixels: &[u8], _expected: usize) -> io::Result<Vec<u8>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "zstd raster decoding requires either native support or wasm32",
-    ))
 }
 
 pub fn is_portable_packetization(codec: &str, packetization: &str) -> bool {
@@ -2062,7 +2038,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
     fn raster_delta_zstd_validates_and_decodes_each_overwrite_frame() {
         let body = mixed_delta_body(true);
         let parsed = parse_delta_raster_frame(&body, 4, 3, 2).unwrap();
@@ -2076,7 +2051,7 @@ mod tests {
         }
 
         let mut concatenated = body;
-        let second = zstd::bulk::compress(&[7; 16], 1).unwrap();
+        let second = zrip::compress(&[7; 16], 1).unwrap();
         concatenated.extend_from_slice(&second);
         let length = u32::from_be_bytes(concatenated[108..112].try_into().unwrap())
             + u32::try_from(second.len()).unwrap();
@@ -2203,7 +2178,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
     fn zstd_raster_round_trip() {
         let pixels = vec![7; 64];
         let body = raster_frame_body_with_compression(1, 1, 4, 4, &pixels, true).unwrap();
@@ -2213,15 +2187,68 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native")]
     fn zstd_rejects_concatenated_frames() {
         let pixels = vec![7; 64];
         let mut body = raster_frame_body_with_compression(1, 1, 4, 4, &pixels, true).unwrap();
-        body.extend_from_slice(&zstd::bulk::compress(&pixels, 1).unwrap());
+        body.extend_from_slice(&zrip::compress(&pixels, 1).unwrap());
         let compressed_length = u32::try_from(body.len() - 72).unwrap();
         body[68..72].copy_from_slice(&compressed_length.to_be_bytes());
         let parsed = parse_full_raster_frame(&body).unwrap();
         assert!(decode_raster_pixels(parsed).is_err());
+    }
+
+    fn zstd_raster_body(width: u32, height: u32, payload: &[u8]) -> Vec<u8> {
+        let pixels = vec![0; rgba8_pixel_len(width, height).unwrap() as usize];
+        let mut body =
+            raster_frame_body_with_compression(1, 1, width, height, &pixels, true).unwrap();
+        body.truncate(72);
+        body.extend_from_slice(payload);
+        let length = u32::try_from(payload.len()).unwrap();
+        body[68..72].copy_from_slice(&length.to_be_bytes());
+        body
+    }
+
+    #[test]
+    fn zstd_raster_round_trip_spans_blocks_and_checksums() {
+        let pixels: Vec<u8> = (0..256 * 256 * 4)
+            .map(|i: u32| ((i / 4 % 251) ^ (i / 1024 % 7)) as u8)
+            .collect();
+        let body = raster_frame_body_with_compression(1, 1, 256, 256, &pixels, true).unwrap();
+        let parsed = parse_full_raster_frame(&body).unwrap();
+        assert_eq!(decode_raster_pixels(parsed).unwrap(), pixels);
+
+        let checksummed = zstd_raster_body(256, 256, &zrip::compress(&pixels, 1).unwrap());
+        let parsed = parse_full_raster_frame(&checksummed).unwrap();
+        assert_eq!(decode_raster_pixels(parsed).unwrap(), pixels);
+    }
+
+    #[test]
+    fn zstd_rejects_trailing_empty_and_skippable_frames() {
+        let pixels = vec![7; 64];
+        let frame = zrip::compress(&pixels, 1).unwrap();
+        let trailers = [
+            zrip::compress(&[], 1).unwrap(),
+            vec![0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0],
+            vec![0],
+        ];
+        for trailer in trailers {
+            let mut payload = frame.clone();
+            payload.extend_from_slice(&trailer);
+            let body = zstd_raster_body(4, 4, &payload);
+            let parsed = parse_full_raster_frame(&body).unwrap();
+            assert!(decode_raster_pixels(parsed).is_err());
+        }
+    }
+
+    #[test]
+    fn zstd_rejects_truncated_frames_and_wrong_sizes() {
+        let frame = zrip::compress(&[7; 64], 1).unwrap();
+        for length in [4, frame.len() / 2, frame.len() - 1] {
+            assert!(decode_zstd_pixels(&frame[..length], 64).is_err());
+        }
+        assert!(decode_zstd_pixels(&frame, 63).is_err());
+        assert!(decode_zstd_pixels(&frame, 65).is_err());
+        assert_eq!(decode_zstd_pixels(&frame, 64).unwrap(), vec![7; 64]);
     }
 
     #[test]
